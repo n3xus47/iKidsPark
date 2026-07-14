@@ -16,16 +16,16 @@ from urllib.parse import parse_qs, urlencode, urlparse
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 DB_PATH = Path(__file__).with_name("reservations.db")
 LOGO_PATH = Path(__file__).with_name("logo ikids.png")
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8000
 
 PARTY_ROOMS = [
-    "Loża 1 - Biały Dom",
-    "Loża 2 - Magiczny Las",
-    "Loża 3 - Wróżki",
-    "Loża 4 - Kosmos",
-    "Loża 5 - Zima",
-    "Loża 6 - Football",
+    "1. Biały Dom",
+    "2. Magiczny Las",
+    "3. Wróżki",
+    "4. Kosmos",
+    "5. Zima",
+    "6. Football",
 ]
 
 TABLE_NUMBERS = tuple(range(7, 78))
@@ -48,8 +48,26 @@ ADULT_LOCATION_GROUPS = {
 ADULT_LOCATIONS = [location for locations in ADULT_LOCATION_GROUPS.values() for location in locations]
 LOCATION_GROUPS = {"Loże tematyczne": PARTY_ROOMS, **ADULT_LOCATION_GROUPS}
 
+
+def format_table_range(numbers: list[int]) -> str:
+    if not numbers:
+        return ""
+    sorted_numbers = sorted(numbers)
+    ranges: list[str] = []
+    range_start = sorted_numbers[0]
+    range_end = sorted_numbers[0]
+    for number in sorted_numbers[1:]:
+        if number == range_end + 1:
+            range_end = number
+            continue
+        ranges.append(f"{range_start}–{range_end}" if range_start != range_end else str(range_start))
+        range_start = range_end = number
+    ranges.append(f"{range_start}–{range_end}" if range_start != range_end else str(range_start))
+    return ", ".join(ranges)
+
 ALL_LOCATIONS = PARTY_ROOMS + ADULT_LOCATIONS
 LOCATION_SEPARATOR = " | "
+EMPTY_LOCATION = "Brak"
 
 ANIMATION_GROUPS = {
     "Animacje tematyczne": [
@@ -78,12 +96,12 @@ WORKSHOP_TYPES = ["Pizza", "Burger", "Piernik", "Shake"]
 MASCOT_TYPES = ["Lew", "Pan Królik", "Pani Królik", "Miś"]
 
 ROOM_LAYOUT = [
-    ("Loża 1 - Biały Dom", 92, 410, 86, 48),
-    ("Loża 2 - Magiczny Las", 184, 410, 86, 48),
-    ("Loża 3 - Wróżki", 276, 410, 86, 48),
-    ("Loża 4 - Kosmos", 368, 410, 86, 48),
-    ("Loża 5 - Zima", 460, 410, 86, 48),
-    ("Loża 6 - Football", 552, 410, 86, 48),
+    ("1. Biały Dom", 92, 410, 86, 48),
+    ("2. Magiczny Las", 184, 410, 86, 48),
+    ("3. Wróżki", 276, 410, 86, 48),
+    ("4. Kosmos", 368, 410, 86, 48),
+    ("5. Zima", 460, 410, 86, 48),
+    ("6. Football", 552, 410, 86, 48),
 ]
 
 ADULT_ZONE_LAYOUT = [
@@ -115,18 +133,24 @@ TABLE_LAYOUT = [
 ]
 
 LEGACY_CHILD_LOCATION_RENAMES = {
-    "Salka Piłka Nożna": "Loża 6 - Football",
-    "Salka Dżungla": "Loża 2 - Magiczny Las",
-    "Salka Kosmos": "Loża 4 - Kosmos",
-    "Salka Księżniczki": "Loża 3 - Wróżki",
-    "Salka Piraci": "Loża 1 - Biały Dom",
-    "Salka Kreatywna": "Loża 5 - Zima",
-    "Sala 1 - Biały Dom": "Loża 1 - Biały Dom",
-    "Sala 2 - Magiczny Las": "Loża 2 - Magiczny Las",
-    "Sala 3 - Wróżki": "Loża 3 - Wróżki",
-    "Sala 4 - Kosmos": "Loża 4 - Kosmos",
-    "Sala 5 - Zima": "Loża 5 - Zima",
-    "Sala 6 - Piłka nożna": "Loża 6 - Football",
+    "Salka Piłka Nożna": "6. Football",
+    "Salka Dżungla": "2. Magiczny Las",
+    "Salka Kosmos": "4. Kosmos",
+    "Salka Księżniczki": "3. Wróżki",
+    "Salka Piraci": "1. Biały Dom",
+    "Salka Kreatywna": "5. Zima",
+    "Sala 1 - Biały Dom": "1. Biały Dom",
+    "Sala 2 - Magiczny Las": "2. Magiczny Las",
+    "Sala 3 - Wróżki": "3. Wróżki",
+    "Sala 4 - Kosmos": "4. Kosmos",
+    "Sala 5 - Zima": "5. Zima",
+    "Sala 6 - Piłka nożna": "6. Football",
+    "Loża 1 - Biały Dom": "1. Biały Dom",
+    "Loża 2 - Magiczny Las": "2. Magiczny Las",
+    "Loża 3 - Wróżki": "3. Wróżki",
+    "Loża 4 - Kosmos": "4. Kosmos",
+    "Loża 5 - Zima": "5. Zima",
+    "Loża 6 - Football": "6. Football",
 }
 
 LEGACY_ADULT_LOCATION_RENAMES = {
@@ -162,6 +186,10 @@ DAY_FILTERS = {
     "tomorrow": ("Jutro", 1),
     "after_tomorrow": ("Pojutrze", 2),
 }
+
+WEEKDAY_LABELS = ("Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Ndz")
+
+SERVICE_OVERLAP_MESSAGE = "Godziny dodatków w tej rezerwacji nie mogą się nakładać."
 
 STATUS_LABELS = {
     "active": "Aktywna",
@@ -278,12 +306,12 @@ def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
 
     legacy_rows = conn.execute(f"SELECT * FROM {backup_name}").fetchall()
     legacy_room_map = {
-        "Dżungla": "Loża 2 - Magiczny Las",
-        "Kosmos": "Loża 4 - Kosmos",
-        "Księżniczki": "Loża 3 - Wróżki",
-        "Piraci": "Loża 1 - Biały Dom",
-        "Superbohaterowie": "Loża 6 - Football",
-        "Sala kreatywna": "Loża 5 - Zima",
+        "Dżungla": "2. Magiczny Las",
+        "Kosmos": "4. Kosmos",
+        "Księżniczki": "3. Wróżki",
+        "Piraci": "1. Biały Dom",
+        "Superbohaterowie": "6. Football",
+        "Sala kreatywna": "5. Zima",
     }
 
     for row in legacy_rows:
@@ -357,6 +385,18 @@ def ensure_current_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reservations ADD COLUMN mascot_type TEXT")
     if "mascot_at" not in columns:
         conn.execute("ALTER TABLE reservations ADD COLUMN mascot_at TEXT")
+    if "birthday_children_json" not in columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN birthday_children_json TEXT")
+        conn.execute(
+            """
+            UPDATE reservations
+            SET birthday_children_json = json_array(
+                json_object('name', birthday_child_name, 'age', birthday_child_age)
+            )
+            WHERE birthday_children_json IS NULL
+              AND birthday_child_name IS NOT NULL
+            """
+        )
 
     conn.execute(
         """
@@ -419,12 +459,181 @@ def normalize_role(role: str | None) -> str:
 
 
 def normalize_day(day: str | None) -> str:
-    return day if day in DAY_FILTERS else "today"
+    if not day:
+        return "today"
+    if day in DAY_FILTERS:
+        return day
+    if parse_date_for_api(day) is not None:
+        return day
+    return "today"
 
 
 def selected_day(day_key: str) -> date:
-    _, offset = DAY_FILTERS[normalize_day(day_key)]
-    return date.today() + timedelta(days=offset)
+    if day_key in DAY_FILTERS:
+        _, offset = DAY_FILTERS[day_key]
+        return date.today() + timedelta(days=offset)
+    parsed = parse_date_for_api(day_key)
+    return parsed if parsed is not None else date.today()
+
+
+def week_start(target_day: date) -> date:
+    return target_day - timedelta(days=target_day.weekday())
+
+
+def week_dates(target_day: date) -> list[date]:
+    start = week_start(target_day)
+    return [start + timedelta(days=offset) for offset in range(7)]
+
+
+def day_query(target_day: date) -> str:
+    for key, (_, offset) in DAY_FILTERS.items():
+        if selected_day(key) == target_day:
+            return key
+    return target_day.isoformat()
+
+
+def parse_birthday_children(data: dict[str, object]) -> list[dict[str, object]]:
+    raw_names = data.get("birthday_child_name", "")
+    raw_ages = data.get("birthday_child_age", "")
+    names = [raw_names] if isinstance(raw_names, str) else [str(name) for name in raw_names]
+    ages = [raw_ages] if isinstance(raw_ages, str) else [str(age) for age in raw_ages]
+    length = max(len(names), len(ages))
+
+    children: list[dict[str, object]] = []
+    for index in range(length):
+        name = str(names[index] if index < len(names) else "").strip()
+        age_raw = str(ages[index] if index < len(ages) else "").strip()
+        if not name and not age_raw:
+            continue
+        try:
+            age = int(age_raw)
+        except (TypeError, ValueError):
+            age = None
+        children.append({"name": name, "age": age})
+    return children
+
+
+def birthday_children_from_row(row: sqlite3.Row | dict[str, object]) -> list[dict[str, object]]:
+    raw_json = row["birthday_children_json"] if "birthday_children_json" in row.keys() else None
+    if raw_json:
+        try:
+            parsed = json.loads(str(raw_json))
+            if isinstance(parsed, list) and parsed:
+                return [
+                    {"name": str(item.get("name", "")).strip(), "age": item.get("age")}
+                    for item in parsed
+                    if str(item.get("name", "")).strip()
+                ]
+        except json.JSONDecodeError:
+            pass
+    name = str(row.get("birthday_child_name", "") if isinstance(row, dict) else row["birthday_child_name"]).strip()
+    age = row.get("birthday_child_age") if isinstance(row, dict) else row["birthday_child_age"]
+    if name:
+        return [{"name": name, "age": age}]
+    return []
+
+
+def format_birthday_children(row: sqlite3.Row | dict[str, object]) -> str:
+    children = birthday_children_from_row(row)
+    if not children:
+        return "Brak solenizanta"
+    parts = []
+    for child in children:
+        name = escape(str(child["name"]))
+        age = child.get("age")
+        if age not in (None, ""):
+            parts.append(f"{name}, {escape(age)} lat")
+        else:
+            parts.append(name)
+    return ", ".join(parts)
+
+
+def banquet_info_title(row: sqlite3.Row | dict[str, object]) -> str:
+    if isinstance(row, dict):
+        parent = escape(str(row.get("parent_name", "")))
+        sala = escape(display_location(row.get("child_location", "")))
+        start_at = row.get("start_at", "")
+    else:
+        parent = escape(str(row["parent_name"]))
+        sala = escape(display_location(row["child_location"]))
+        start_at = row["start_at"]
+    return (
+        f"{format_birthday_children(row)} · sala {sala} · start {escape(format_time(start_at))} · rodzic {parent}"
+    )
+
+
+def render_banquet_header(row: sqlite3.Row | dict[str, object]) -> str:
+    if isinstance(row, dict):
+        parent = escape(str(row.get("parent_name", "")))
+        sala = escape(display_location(row.get("child_location", "")))
+        start_at = row.get("start_at", "")
+    else:
+        parent = escape(str(row["parent_name"]))
+        sala = escape(display_location(row["child_location"]))
+        start_at = row["start_at"]
+    start = escape(format_time(start_at))
+    solenizant = format_birthday_children(row)
+    return f"""
+      <div class="banquet-header">
+        <div class="banquet-header-item">
+          <span class="banquet-header-label">Solenizant</span>
+          <span class="banquet-header-value">{solenizant}</span>
+        </div>
+        <div class="banquet-header-item">
+          <span class="banquet-header-label">Sala</span>
+          <span class="banquet-header-value">{sala}</span>
+        </div>
+        <div class="banquet-header-item">
+          <span class="banquet-header-label">Start</span>
+          <span class="banquet-header-value">{start}</span>
+        </div>
+        <div class="banquet-header-item">
+          <span class="banquet-header-label">Rodzic</span>
+          <span class="banquet-header-value">{parent}</span>
+        </div>
+      </div>
+    """
+
+
+def birthday_children_json_value(children: list[dict[str, object]]) -> str:
+    payload = [{"name": child["name"], "age": child["age"]} for child in children]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def service_time_windows(values: dict[str, object]) -> list[tuple[str, time, time]]:
+    windows: list[tuple[str, time, time]] = []
+
+    def add_window(field: str, start: time | None, duration: int | None) -> None:
+        if start is None or duration is None:
+            return
+        end_dt = datetime.combine(date.today(), start) + timedelta(minutes=duration)
+        windows.append((field, start, end_dt.time()))
+
+    if values.get("animation_enabled"):
+        add_window("animation_at", parse_time_value(field_time(values, "animation_at")), SERVICE_DURATIONS["animation_at"])
+    if values.get("cake_enabled"):
+        add_window("cake_at", parse_time_value(field_time(values, "cake_at")), SERVICE_DURATIONS["cake_at"])
+    if values.get("culinary_workshops_enabled"):
+        add_window(
+            "culinary_workshops_at",
+            parse_time_value(field_time(values, "culinary_workshops_at")),
+            SERVICE_DURATIONS["culinary_workshops_at"],
+        )
+    if values.get("pinata_enabled"):
+        add_window("pinata_at", parse_time_value(field_time(values, "pinata_at")), SERVICE_DURATIONS["pinata_at"])
+    if values.get("mascot_enabled"):
+        add_window("mascot_at", parse_time_value(field_time(values, "mascot_at")), SERVICE_DURATIONS["mascot_at"])
+    return windows
+
+
+def find_internal_time_overlaps(values: dict[str, object]) -> list[str]:
+    windows = service_time_windows(values)
+    conflicts: list[str] = []
+    for index, (field_a, start_a, end_a) in enumerate(windows):
+        for field_b, start_b, end_b in windows[index + 1 :]:
+            if start_a < end_b and end_a > start_b:
+                conflicts.extend([field_a, field_b])
+    return sorted(set(conflicts))
 
 
 def day_bounds(target_day: date) -> tuple[str, str]:
@@ -549,9 +758,25 @@ def location_values(value: object) -> list[str]:
 
     locations: list[str] = []
     for candidate in candidates:
-        if candidate and candidate not in locations:
+        if candidate and candidate not in locations and candidate != EMPTY_LOCATION:
             locations.append(candidate)
     return locations
+
+
+def normalize_location(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        locations = location_values(value)
+        return joined_locations(locations) if locations else EMPTY_LOCATION
+    raw = str(value or "").strip()
+    if not raw or raw == EMPTY_LOCATION:
+        return EMPTY_LOCATION
+    locations = location_values(raw)
+    return joined_locations(locations) if locations else EMPTY_LOCATION
+
+
+def display_location(value: object) -> str:
+    normalized = normalize_location(value)
+    return normalized if normalized != EMPTY_LOCATION else EMPTY_LOCATION
 
 
 def joined_locations(values: object) -> str:
@@ -559,11 +784,18 @@ def joined_locations(values: object) -> str:
 
 
 def display_locations(value: object) -> str:
-    return ", ".join(location_values(value))
+    locations = location_values(value)
+    if not locations:
+        return EMPTY_LOCATION
+    return ", ".join(locations)
 
 
 def reservation_locations(row: sqlite3.Row | dict[str, object]) -> set[str]:
-    return {str(row["child_location"]), *location_values(row["adult_location"])}
+    locations = set(location_values(row["adult_location"]))
+    child = str(row["child_location"]).strip()
+    if child and child != EMPTY_LOCATION:
+        locations.add(child)
+    return locations
 
 
 def time_in_reservation_window(start_dt: datetime | None, end_dt: datetime | None, value: time | None) -> bool:
@@ -586,7 +818,12 @@ def find_conflicts(
         exclude_sql = "AND id != ?"
         params.append(exclude_id)
 
-    requested_locations = {child_location, *adult_locations}
+    requested_locations = set(adult_locations)
+    if child_location and child_location != EMPTY_LOCATION:
+        requested_locations.add(child_location)
+    if not requested_locations:
+        return []
+
     rows = db_rows(
         f"""
         SELECT id, start_at, end_at, parent_name, birthday_child_name, child_location, adult_location
@@ -616,17 +853,15 @@ def validate_reservation(
         else ""
     )
 
-    child_location = data.get("child_location", "").strip()
-    if child_location not in ALL_LOCATIONS:
+    child_location = normalize_location(data.get("child_location", ""))
+    if child_location != EMPTY_LOCATION and child_location not in ALL_LOCATIONS:
         errors["child_location"] = "Wybierz lokalizację dzieci z listy."
 
     adult_locations = location_values(data.get("adult_location", ""))
     invalid_adult_locations = [location for location in adult_locations if location not in ALL_LOCATIONS]
-    if not adult_locations:
-        errors["adult_location"] = "Wybierz lokalizację dorosłych z listy."
-    elif invalid_adult_locations:
+    if invalid_adult_locations:
         errors["adult_location"] = "Wybierz lokalizacje dorosłych z listy."
-    adult_location = joined_locations(adult_locations)
+    adult_location = joined_locations(adult_locations) if adult_locations else EMPTY_LOCATION
 
     animation_enabled = checked_bool(data, "animation_enabled")
     cake_enabled = checked_bool(data, "cake_enabled")
@@ -694,6 +929,37 @@ def validate_reservation(
         if overlaps_stage_block(value, duration):
             errors[field] = STAGE_BLOCK_MESSAGE
 
+    birthday_children = parse_birthday_children(data)
+    if not birthday_children:
+        errors["birthday_child_name"] = "Dodaj co najmniej jednego solenizanta."
+    for index, child in enumerate(birthday_children):
+        if not child["name"]:
+            errors["birthday_child_name"] = "Każdy solenizant musi mieć imię."
+        age = child.get("age")
+        if age is None:
+            errors["birthday_child_age"] = "Podaj wiek każdego solenizanta (1-18 lat)."
+        elif not isinstance(age, int) or age < 1 or age > 18:
+            errors["birthday_child_age"] = "Wiek solenizanta musi być w zakresie 1-18 lat."
+
+    primary_child = birthday_children[0] if birthday_children else {"name": "", "age": 1}
+
+    overlap_fields = find_internal_time_overlaps(
+        {
+            "animation_enabled": animation_enabled,
+            "animation_at": animation_time.strftime("%H:%M") if animation_time else "",
+            "cake_enabled": cake_enabled,
+            "cake_at": cake_time.strftime("%H:%M") if cake_time else "",
+            "culinary_workshops_enabled": culinary_workshops_enabled,
+            "culinary_workshops_at": workshops_time.strftime("%H:%M") if workshops_time else "",
+            "pinata_enabled": pinata_enabled,
+            "pinata_at": pinata_time.strftime("%H:%M") if pinata_time else "",
+            "mascot_enabled": mascot_enabled,
+            "mascot_at": mascot_time.strftime("%H:%M") if mascot_time else "",
+        }
+    )
+    for field in overlap_fields:
+        errors[field] = SERVICE_OVERLAP_MESSAGE
+
     status = data.get("status", "active").strip()
     if status not in STATUS_LABELS:
         errors["status"] = "Wybierz poprawny status rezerwacji."
@@ -713,8 +979,10 @@ def validate_reservation(
         "children_count": parse_int_field(data, errors, "children_count", "Liczba dzieci", 1, 120),
         "adults_count": parse_int_field(data, errors, "adults_count", "Liczba dorosłych", 0, 120),
         "parent_name": parse_text_field(data, errors, "parent_name", "Rodzic / osoba rezerwująca"),
-        "birthday_child_name": parse_text_field(data, errors, "birthday_child_name", "Imię solenizanta"),
-        "birthday_child_age": parse_int_field(data, errors, "birthday_child_age", "Wiek solenizanta", 1, 18),
+        "birthday_child_name": str(primary_child["name"]),
+        "birthday_child_age": int(primary_child["age"] or 1),
+        "birthday_children_json": birthday_children_json_value(birthday_children) if birthday_children else "[]",
+        "birthday_children": birthday_children,
         "child_location": child_location,
         "adult_location": adult_location,
         "animation_enabled": animation_enabled,
@@ -749,11 +1017,16 @@ def validate_reservation(
         status == "active"
         and start_at
         and end_at
-        and child_location in ALL_LOCATIONS
-        and adult_locations
         and not invalid_adult_locations
+        and (child_location != EMPTY_LOCATION or adult_locations)
     ):
-        conflicts = find_conflicts(start_at, end_at, child_location, adult_locations, exclude_id=reservation_id)
+        conflicts = find_conflicts(
+            start_at,
+            end_at,
+            child_location if child_location != EMPTY_LOCATION else "",
+            adult_locations,
+            exclude_id=reservation_id,
+        )
         if conflicts:
             conflict_lines = []
             for conflict in conflicts:
@@ -790,6 +1063,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["parent_name"],
         values["birthday_child_name"],
         values["birthday_child_age"],
+        values["birthday_children_json"],
         values["child_location"],
         values["adult_location"],
         values["animation_enabled"],
@@ -825,6 +1099,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             UPDATE reservations
             SET start_at = ?, end_at = ?, children_count = ?, adults_count = ?,
                 parent_name = ?, birthday_child_name = ?, birthday_child_age = ?,
+                birthday_children_json = ?,
                 child_location = ?, adult_location = ?, animation_enabled = ?, animation_type = ?,
                 animation_at = ?,
                 cake_enabled = ?, cake_theme = ?, cake_at = ?,
@@ -849,7 +1124,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         """
         INSERT INTO reservations (
             start_at, end_at, children_count, adults_count, parent_name,
-            birthday_child_name, birthday_child_age, child_location, adult_location,
+            birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
             animation_enabled, animation_type, animation_at, cake_enabled, cake_theme, cake_at,
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
             culinary_workshops_enabled, culinary_workshops_type, culinary_workshops_at,
@@ -858,7 +1133,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             notes, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -1155,6 +1430,615 @@ def page_template(
       display: grid;
       gap: 12px;
       margin-bottom: 18px;
+    }}
+
+    .week-nav {{
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }}
+
+    .week-days {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+
+    .week-day, .week-arrow {{
+      border: 1px solid var(--line);
+      min-height: 40px;
+      padding: 8px 12px;
+      background: var(--surface-strong);
+      color: var(--ink);
+      text-decoration: none;
+      font-weight: 800;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }}
+
+    .week-day.is-active, .week-day[aria-current="page"] {{
+      background: var(--brand);
+      border-color: var(--brand);
+      color: white;
+    }}
+
+    form {{
+      display: grid;
+      gap: 10px;
+    }}
+
+    .birthday-children-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }}
+
+    .birthday-child-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 120px auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px;
+      border: 1px solid var(--line);
+      background: var(--field-strong);
+    }}
+
+    .location-picker {{
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, var(--field-strong) 0%, var(--field) 100%);
+      border-radius: 10px;
+      transition: border-color 0.25s ease, box-shadow 0.25s ease;
+    }}
+
+    .location-picker.is-confirmed {{
+      border-color: rgba(179, 211, 22, 0.55);
+      box-shadow: 0 0 0 1px rgba(179, 211, 22, 0.18);
+    }}
+
+    .location-forms {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: stretch;
+    }}
+
+    .location-panel {{
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      border-radius: 8px;
+      min-width: 0;
+      min-height: 460px;
+    }}
+
+    .location-panel-body {{
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }}
+
+    .location-panel-header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }}
+
+    .location-form-title {{
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      font-weight: 900;
+    }}
+
+    .location-panel-badge {{
+      font-size: 0.72rem;
+      font-weight: 800;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(19, 155, 215, 0.14);
+      color: var(--brand);
+      border: 1px solid rgba(19, 155, 215, 0.28);
+      max-width: 58%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .location-panel-adult .location-panel-badge {{
+      background: rgba(245, 130, 18, 0.12);
+      color: var(--orange);
+      border-color: rgba(245, 130, 18, 0.28);
+    }}
+
+    .location-chips {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+
+    .location-chips-loft {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }}
+
+    .location-chips-tables {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
+      gap: 6px;
+    }}
+
+    .location-chip {{
+      display: grid;
+      gap: 2px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--field);
+      color: var(--ink);
+      cursor: pointer;
+      text-align: left;
+      font: inherit;
+      line-height: 1.15;
+      transition: border-color 0.18s ease, background 0.18s ease, transform 0.12s ease;
+      min-width: 0;
+    }}
+
+    .location-chip-loft {{
+      min-height: 58px;
+      align-content: center;
+      justify-items: start;
+    }}
+
+    .location-chip-loft.location-chip-none {{
+      justify-items: center;
+      text-align: center;
+    }}
+
+    .location-chip:hover:not(:disabled) {{
+      border-color: rgba(19, 155, 215, 0.55);
+      background: rgba(19, 155, 215, 0.08);
+    }}
+
+    .location-chip:active:not(:disabled) {{
+      transform: scale(0.98);
+    }}
+
+    .location-chip.is-selected {{
+      border-color: var(--brand);
+      background: rgba(19, 155, 215, 0.16);
+      box-shadow: inset 0 0 0 1px rgba(19, 155, 215, 0.35);
+    }}
+
+    .location-panel-adult .location-chip.is-selected {{
+      border-color: var(--orange);
+      background: rgba(245, 130, 18, 0.14);
+      box-shadow: inset 0 0 0 1px rgba(245, 130, 18, 0.35);
+    }}
+
+    .location-panel-adult .location-chip-adult-none {{
+      justify-items: center;
+      text-align: center;
+      font-weight: 800;
+    }}
+
+    .location-chip.is-busy {{
+      opacity: 0.45;
+      cursor: not-allowed;
+      text-decoration: line-through;
+    }}
+
+    .location-chip-main {{
+      font-size: 0.82rem;
+      font-weight: 800;
+    }}
+
+    .location-chip-sub {{
+      font-size: 0.72rem;
+      color: var(--muted);
+    }}
+
+    .location-chip-none {{
+      min-height: 58px;
+      align-content: center;
+    }}
+
+    .location-chip-table {{
+      min-height: 36px;
+      justify-items: center;
+      text-align: center;
+      padding: 6px 4px;
+    }}
+
+    .location-accordions {{
+      display: grid;
+      gap: 8px;
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding-right: 4px;
+    }}
+
+    .location-accordion-range {{
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--muted);
+    }}
+
+    .location-accordion {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--field-strong);
+      overflow: hidden;
+    }}
+
+    .location-accordion-head {{
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 0;
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      font-weight: 800;
+      font-size: 0.84rem;
+      cursor: pointer;
+      text-align: left;
+    }}
+
+    .location-accordion-head-main {{
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }}
+
+    .location-accordion-head:hover {{
+      background: rgba(255, 255, 255, 0.03);
+    }}
+
+    .location-accordion-label {{
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
+    .location-accordion-meta {{
+      font-size: 0.72rem;
+      font-weight: 800;
+      color: var(--muted);
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.04);
+    }}
+
+    .location-accordion-chevron {{
+      width: 18px;
+      height: 18px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      transition: transform 0.25s ease;
+    }}
+
+    .location-accordion-chevron::before {{
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid currentColor;
+      border-bottom: 2px solid currentColor;
+      transform: rotate(45deg) translate(-1px, -1px);
+      transition: transform 0.25s ease;
+    }}
+
+    .location-accordion.is-open .location-accordion-chevron::before {{
+      transform: rotate(-135deg) translate(-1px, -1px);
+    }}
+
+    .location-accordion-panel {{
+      display: grid;
+      grid-template-rows: 0fr;
+      transition: grid-template-rows 0.28s ease;
+    }}
+
+    .location-accordion.is-open .location-accordion-panel {{
+      grid-template-rows: 1fr;
+    }}
+
+    .location-accordion-body {{
+      overflow: hidden;
+      min-height: 0;
+    }}
+
+    .location-accordion.is-open .location-accordion-body {{
+      padding: 0 10px 10px;
+    }}
+
+    .location-range-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+      margin-bottom: 10px;
+      padding: 8px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.02);
+    }}
+
+    .location-range-row label {{
+      display: grid;
+      gap: 4px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }}
+
+    .location-range-row input {{
+      width: 100%;
+      min-height: 34px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--field);
+      color: var(--ink);
+      font: inherit;
+      font-weight: 700;
+    }}
+
+    .location-range-apply {{
+      min-height: 34px;
+      padding: 6px 10px;
+      font-size: 0.78rem;
+      white-space: nowrap;
+    }}
+
+    .location-none-row {{
+      margin-bottom: 8px;
+    }}
+
+    .location-none-row .location-chip {{
+      width: 100%;
+    }}
+
+    .location-confirm-bar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-strong);
+    }}
+
+    .location-summary {{
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      flex: 1 1 220px;
+    }}
+
+    .location-summary-label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      font-weight: 900;
+    }}
+
+    .location-summary-values {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.84rem;
+      font-weight: 700;
+      line-height: 1.35;
+    }}
+
+    .location-summary-item {{
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: var(--field);
+      border: 1px solid var(--line);
+    }}
+
+    .location-summary-item.is-empty {{
+      color: var(--muted);
+      font-weight: 600;
+    }}
+
+    .location-confirm-btn.is-confirmed {{
+      background: var(--ok);
+      border-color: var(--ok);
+      color: #10140a;
+    }}
+
+    .location-select-native {{
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }}
+
+    .overlap-hint, .overlap-notice {{
+      color: var(--danger);
+      font-size: 0.79rem;
+      font-weight: 800;
+      line-height: 1.35;
+    }}
+
+    .overlap-notice {{
+      padding: 0 12px 8px;
+    }}
+
+    .location-picker .plan-accordion {{
+      margin-top: 14px;
+      width: 100%;
+    }}
+
+    .plan-accordion {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden;
+      width: 100%;
+    }}
+
+    .plan-accordion .location-accordion-head-main {{
+      display: grid;
+      gap: 6px;
+    }}
+
+    .plan-accordion .location-accordion-head {{
+      grid-template-columns: minmax(0, 1fr) auto;
+    }}
+
+    .plan-accordion .location-accordion-body {{
+      padding: 0 10px 10px;
+    }}
+
+    .location-picker .plan-wrap {{
+      margin-top: 0;
+      padding: 0;
+    }}
+
+    .location-hint {{
+      padding: 0;
+      margin: 0;
+    }}
+
+    .service-catalog {{
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
+
+    .service-catalog-item {{
+      border: 1px solid var(--line);
+      background: var(--field-strong);
+      display: grid;
+      gap: 0;
+    }}
+
+    .service-catalog-head, .service-catalog-body {{
+      padding: 10px;
+      display: grid;
+      gap: 10px;
+    }}
+
+    .service-catalog-head {{
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+    }}
+
+    .service-catalog-body.is-hidden {{
+      display: none;
+    }}
+
+    .service-enabled-input {{
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+      width: 0;
+      height: 0;
+      min-height: 0;
+    }}
+
+    .reservation-details {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+
+    .reservation-block {{
+      display: grid;
+      gap: 4px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      background: var(--field);
+    }}
+
+    .reservation-label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      font-weight: 900;
+    }}
+
+    .reservation-list {{
+      margin: 0;
+      padding-left: 18px;
+    }}
+
+    .banquet-notes {{
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.86rem;
+    }}
+
+    .banquet-header-block .banquet-header {{
+      padding: 0;
+    }}
+
+    .banquet-header-block {{
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }}
+
+    .banquet-header-inline .banquet-header {{
+      padding: 0;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
+
+    @media (max-width: 1120px) {{
+      .banquet-header {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+    }}
+
+    .key-selected {{
+      background: #122a38;
+      border-color: var(--brand);
+    }}
+
+    .room-node.is-selected rect, .table-node.is-selected circle {{
+      fill: #122a38;
+      stroke: var(--brand);
+      stroke-width: 3;
+    }}
+
+    .table-node {{
+      cursor: pointer;
+    }}
+
+    .room-node {{
+      cursor: pointer;
     }}
 
     .tabs {{
@@ -1560,6 +2444,36 @@ def page_template(
       padding: 14px;
     }}
 
+    .kitchen-columns {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0;
+      border-top: 1px solid var(--line);
+    }}
+
+    .kitchen-column-cell {{
+      padding: 10px 12px;
+      border-right: 1px solid var(--line);
+      min-height: 72px;
+    }}
+
+    .kitchen-column-cell:last-child {{
+      border-right: 0;
+    }}
+
+    .kitchen-column-label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      font-weight: 900;
+      margin-bottom: 6px;
+    }}
+
+    .kitchen-cell-empty {{
+      color: var(--muted);
+    }}
+
     .banquet-card, .kitchen-column {{
       border: 1px solid var(--line);
       background: var(--field);
@@ -1568,13 +2482,39 @@ def page_template(
 
     .banquet-title, .kitchen-title {{
       margin: 0;
-      padding: 10px 12px;
+      padding: 0;
       border-bottom: 1px solid var(--line);
       background: #202531;
       color: #f7f9fc;
-      font-size: 0.86rem;
-      line-height: 1.25;
+    }}
+
+    .banquet-header {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px 18px;
+      padding: 12px 14px;
+    }}
+
+    .banquet-header-item {{
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }}
+
+    .banquet-header-label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      color: #aab3c2;
       font-weight: 900;
+    }}
+
+    .banquet-header-value {{
+      font-size: 0.95rem;
+      font-weight: 900;
+      line-height: 1.3;
+      color: #f7f9fc;
+      word-break: break-word;
     }}
 
     .banquet-tasks, .kitchen-orders {{
@@ -1625,7 +2565,12 @@ def page_template(
     }}
 
     .plan-wrap {{
-      padding: 14px;
+      padding: 0;
+      width: 100%;
+    }}
+
+    .plan-accordion .plan-wrap {{
+      padding: 0 4px 4px;
     }}
 
     .plan-legend {{
@@ -1637,6 +2582,16 @@ def page_template(
       color: var(--muted);
       font-size: 0.84rem;
       font-weight: 700;
+    }}
+
+    .plan-legend-compact {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--muted);
     }}
 
     .legend-key {{
@@ -1660,10 +2615,17 @@ def page_template(
 
     .room-plan {{
       width: 100%;
-      max-height: 620px;
+      height: auto;
+      min-height: 360px;
       border: 1px solid var(--line);
       background: #0d1016;
       display: block;
+    }}
+
+    @media (min-width: 900px) {{
+      .room-plan {{
+        min-height: 520px;
+      }}
     }}
 
     .plan-outline {{
@@ -1777,8 +2739,33 @@ def page_template(
         height: 48px;
       }}
 
-      .grid, .choice-grid, .metrics, .form-board, .category-fields, .category-fields.services {{
+      .grid, .choice-grid, .metrics, .form-board, .category-fields, .category-fields.services, .service-catalog, .reservation-details, .birthday-child-row, .kitchen-columns, .banquet-header, .location-forms {{
         grid-template-columns: 1fr;
+      }}
+
+      .location-panel {{
+        min-height: auto;
+      }}
+
+      .location-range-row {{
+        grid-template-columns: 1fr 1fr;
+      }}
+
+      .location-range-apply {{
+        grid-column: 1 / -1;
+      }}
+
+      .location-chips-loft {{
+        grid-template-columns: 1fr;
+      }}
+
+      .kitchen-column-cell {{
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }}
+
+      .kitchen-column-cell:last-child {{
+        border-bottom: 0;
       }}
 
       .section-head {{
@@ -1822,29 +2809,39 @@ def page_template(
 def render_nav(role: str, day: str) -> str:
     role = normalize_role(role)
     day = normalize_day(day)
+    target_day = selected_day(day)
     role_links = []
     for key, meta in ROLE_DEFS.items():
         role_links.append(
-            f'<a class="tab" href="{link_for(key, day)}" aria-current="page"'
+            f'<a class="tab" href="{link_for(key, day_query(target_day))}" aria-current="page"'
             f' title="{escape(meta["hint"])}">{escape(meta["label"])}</a>'
             if key == role
-            else f'<a class="tab" href="{link_for(key, day)}" title="{escape(meta["hint"])}">{escape(meta["label"])}</a>'
+            else f'<a class="tab" href="{link_for(key, day_query(target_day))}" title="{escape(meta["hint"])}">{escape(meta["label"])}</a>'
         )
 
+    week = week_dates(target_day)
+    prev_week = day_query(week[0] - timedelta(days=7))
+    next_week = day_query(week[0] + timedelta(days=7))
     day_links = []
-    for key, (label, _) in DAY_FILTERS.items():
-        target = selected_day(key)
-        text = f"{label} · {target.strftime('%d.%m')}"
+    for index, week_day in enumerate(week):
+        query = day_query(week_day)
+        weekday = WEEKDAY_LABELS[week_day.weekday()]
+        text = f"{weekday} · {week_day.strftime('%d.%m')}"
+        is_active = week_day == target_day
         day_links.append(
-            f'<a class="tab" href="{link_for(role, key)}" aria-current="page">{escape(text)}</a>'
-            if key == day
-            else f'<a class="tab" href="{link_for(role, key)}">{escape(text)}</a>'
+            f'<a class="week-day{" is-active" if is_active else ""}" href="{link_for(role, query)}" aria-current="page">{escape(text)}</a>'
+            if is_active
+            else f'<a class="week-day" href="{link_for(role, query)}">{escape(text)}</a>'
         )
 
     return f"""
 <div class="toolbar">
   <div class="tabs">{''.join(role_links)}</div>
-  <div class="tabs">{''.join(day_links)}</div>
+  <div class="week-nav">
+    <a class="week-arrow" href="{link_for(role, prev_week)}" aria-label="Poprzedni tydzień">◀</a>
+    <div class="week-days">{''.join(day_links)}</div>
+    <a class="week-arrow" href="{link_for(role, next_week)}" aria-label="Następny tydzień">▶</a>
+  </div>
 </div>
 """
 
@@ -1859,8 +2856,10 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "parent_name": "",
         "birthday_child_name": "",
         "birthday_child_age": "",
-        "child_location": PARTY_ROOMS[0],
-        "adult_location": PARTY_ROOMS[0],
+        "birthday_children": [{"name": "", "age": ""}],
+        "birthday_children_json": "[]",
+        "child_location": EMPTY_LOCATION,
+        "adult_location": EMPTY_LOCATION,
         "animation_enabled": 0,
         "animation_type": "",
         "animation_at": "",
@@ -1892,6 +2891,7 @@ def row_to_form_values(row: sqlite3.Row) -> dict[str, object]:
     values = dict(row)
     values["reservation_date"] = format_date(row["start_at"])
     values["party_start_time"] = format_time(row["start_at"])
+    values["birthday_children"] = birthday_children_from_row(row)
     for field in (
         "animation_at",
         "cake_at",
@@ -1921,6 +2921,260 @@ def render_grouped_options(groups: dict[str, list[str]], current: object) -> str
         )
         optgroups.append(f'<optgroup label="{escape(label)}">{option_markup}</optgroup>')
     return "\n".join(optgroups)
+
+
+def render_child_location_options(current: object) -> str:
+    current_value = normalize_location(current)
+    none_selected = " selected" if current_value == EMPTY_LOCATION else ""
+    options = f'<option value="{EMPTY_LOCATION}"{none_selected}>{EMPTY_LOCATION}</option>'
+    options += render_grouped_options({"Loże tematyczne": PARTY_ROOMS}, current)
+    return options
+
+
+def render_adult_location_options(current: object) -> str:
+    return render_grouped_options(ADULT_LOCATION_GROUPS, current)
+
+
+def render_child_location_chip(room: str, current: object) -> str:
+    current_value = normalize_location(current)
+    selected_class = " is-selected" if current_value == room else ""
+    if room == EMPTY_LOCATION:
+        return (
+            f'<button type="button" class="location-chip location-chip-loft location-chip-none{selected_class}" '
+            f'data-location="{escape(EMPTY_LOCATION)}">{EMPTY_LOCATION}</button>'
+        )
+    short, theme = room.split(" - ", 1) if " - " in room else (room, "")
+    if theme:
+        title = short
+        subtitle = theme
+    else:
+        title = room
+        subtitle = ""
+    subtitle_markup = f'<span class="location-chip-sub">{escape(subtitle)}</span>' if subtitle else ""
+    return (
+        f'<button type="button" class="location-chip location-chip-loft{selected_class}" data-location="{escape(room)}">'
+        f'<span class="location-chip-main">{escape(title)}</span>'
+        f"{subtitle_markup}"
+        f"</button>"
+    )
+
+
+def render_child_location_picker(current: object) -> str:
+    display_value = display_location(current)
+    room_chips = render_child_location_chip(EMPTY_LOCATION, current) + "".join(
+        render_child_location_chip(room, current) for room in PARTY_ROOMS
+    )
+    return f"""
+              <div class="location-panel location-panel-child">
+                <div class="location-panel-header">
+                  <span class="location-form-title">Sala dzieci</span>
+                  <span class="location-panel-badge" id="child-location-badge">{escape(display_value)}</span>
+                </div>
+                <div class="location-panel-body">
+                  <div class="location-accordion is-open" data-accordion="child-rooms">
+                    <button type="button" class="location-accordion-head" aria-expanded="true">
+                      <span class="location-accordion-head-main">
+                        <span class="location-accordion-label">Loże tematyczne</span>
+                        <span class="location-accordion-range">Brak lub 1. Biały Dom – 6. Football</span>
+                      </span>
+                      <span class="location-accordion-meta">7 opcji</span>
+                      <span class="location-accordion-chevron" aria-hidden="true"></span>
+                    </button>
+                    <div class="location-accordion-panel">
+                      <div class="location-accordion-body">
+                        <div class="location-chips location-chips-loft">{room_chips}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <select name="child_location" id="child_location" class="location-select-native" tabindex="-1" aria-hidden="true">
+                  {render_child_location_options(current)}
+                </select>
+              </div>
+"""
+
+
+def render_adult_zone_range_row(zone: str, numbers: list[int]) -> str:
+    range_label = format_table_range(numbers)
+    min_number = min(numbers)
+    max_number = max(numbers)
+    return f"""
+                      <div class="location-range-row" data-zone="{escape(zone)}">
+                        <label>
+                          Od
+                          <input type="number" class="location-range-from" min="{min_number}" max="{max_number}" placeholder="{min_number}">
+                        </label>
+                        <label>
+                          Do
+                          <input type="number" class="location-range-to" min="{min_number}" max="{max_number}" placeholder="{max_number}">
+                        </label>
+                        <button type="button" class="button secondary location-range-apply">Zaznacz {escape(range_label)}</button>
+                      </div>
+"""
+
+
+def render_adult_location_picker(current: object) -> str:
+    selected = set(location_values(current))
+    selected_count = len(selected)
+    badge = f"{selected_count} stol." if selected_count else EMPTY_LOCATION
+    none_selected = " is-selected" if not selected_count else ""
+    accordions = []
+    for index, (zone, tables) in enumerate(ADULT_LOCATION_GROUPS.items()):
+        numbers = TABLE_GROUP_NUMBERS[zone]
+        range_label = format_table_range(numbers)
+        zone_selected = sum(1 for table in tables if table in selected)
+        table_chips = []
+        for table in tables:
+            number = int(table.rsplit(" ", 1)[-1])
+            selected_class = " is-selected" if table in selected else ""
+            table_chips.append(
+                f'<button type="button" class="location-chip location-chip-table{selected_class}" '
+                f'data-location="{escape(table)}" data-table-number="{number}" title="{escape(table)}">'
+                f'<span class="location-chip-main">{number}</span>'
+                f"</button>"
+            )
+        open_class = " is-open" if index == 0 else ""
+        expanded = "true" if index == 0 else "false"
+        meta = f"{zone_selected}/{len(tables)}" if zone_selected else str(len(tables))
+        accordions.append(
+            f"""
+                <div class="location-accordion{open_class}" data-accordion="adult-{escape(zone)}" data-zone="{escape(zone)}">
+                  <button type="button" class="location-accordion-head" aria-expanded="{expanded}">
+                    <span class="location-accordion-head-main">
+                      <span class="location-accordion-label">{escape(zone)}</span>
+                      <span class="location-accordion-range">Stoliki {escape(range_label)}</span>
+                    </span>
+                    <span class="location-accordion-meta">{escape(meta)}</span>
+                    <span class="location-accordion-chevron" aria-hidden="true"></span>
+                  </button>
+                  <div class="location-accordion-panel">
+                    <div class="location-accordion-body">
+                      {render_adult_zone_range_row(zone, numbers)}
+                      <div class="location-chips location-chips-tables">{''.join(table_chips)}</div>
+                    </div>
+                  </div>
+                </div>
+"""
+        )
+    return f"""
+              <div class="location-panel location-panel-adult">
+                <div class="location-panel-header">
+                  <span class="location-form-title">Stoliki rodziców</span>
+                  <span class="location-panel-badge" id="adult-location-badge">{escape(badge)}</span>
+                </div>
+                <div class="location-panel-body">
+                  <div class="location-none-row">
+                    <button type="button" class="location-chip location-chip-none location-chip-adult-none{none_selected}" data-location="{escape(EMPTY_LOCATION)}">{EMPTY_LOCATION}</button>
+                  </div>
+                  <div class="location-accordions">{''.join(accordions)}</div>
+                </div>
+                <select name="adult_location" id="adult_location" class="location-select-native" multiple tabindex="-1" aria-hidden="true">
+                  {render_adult_location_options(current)}
+                </select>
+              </div>
+"""
+
+
+def render_birthday_children_fields(values: dict[str, object], errors: dict[str, str]) -> str:
+    children = values.get("birthday_children")
+    if not isinstance(children, list) or not children:
+        children = [{"name": values.get("birthday_child_name", ""), "age": values.get("birthday_child_age", "")}]
+    rows = []
+    for index, child in enumerate(children):
+        remove_button = (
+            '<button type="button" class="button secondary remove-birthday-child" aria-label="Usuń solenizanta">Usuń</button>'
+            if index > 0
+            else ""
+        )
+        rows.append(
+            f"""
+          <div class="birthday-child-row">
+            <label>
+              Imię solenizanta
+              <input name="birthday_child_name" value="{escape(child.get("name", ""))}" required>
+            </label>
+            <label>
+              Wiek
+              <input type="number" name="birthday_child_age" min="1" max="18" value="{escape(child.get("age", ""))}" required>
+            </label>
+            {remove_button}
+          </div>
+            """
+        )
+    return f"""
+        <div class="birthday-children-block full">
+          <div class="birthday-children-head">
+            <strong>Solenizanci</strong>
+            <button type="button" class="button secondary" id="add-birthday-child">+ Dodaj solenizanta</button>
+          </div>
+          <div id="birthday-children-list">{''.join(rows)}</div>
+          {error_for(errors, "birthday_child_name")}
+          {error_for(errors, "birthday_child_age")}
+        </div>
+"""
+
+
+def render_reservation_details(row: sqlite3.Row, include_notes: bool = True) -> str:
+    notes = (
+        f'<div class="reservation-block"><div class="reservation-label">Notatka</div><div>{escape(row["notes"])}</div></div>'
+        if include_notes and row["notes"]
+        else ""
+    )
+    animator_items = []
+    if is_enabled(row, "animation_enabled"):
+        label = row["animation_type"] or "Animacja"
+        animator_items.append(f"<li>{escape(label)} · {escape(format_service_window(row['animation_at'], SERVICE_DURATIONS['animation_at']))}</li>")
+    if is_enabled(row, "pinata_enabled"):
+        animator_items.append(f"<li>Piniata: {escape(row['pinata_theme'] or '(brak)')} · {escape(format_service_window(row['pinata_at'], SERVICE_DURATIONS['pinata_at']))}</li>")
+    if is_enabled(row, "mascot_enabled"):
+        animator_items.append(f"<li>Maskotka: {escape(row['mascot_type'] or '(brak)')} · {escape(format_service_window(row['mascot_at'], SERVICE_DURATIONS['mascot_at']))}</li>")
+
+    kitchen_items = []
+    if is_enabled(row, "fruit_enabled"):
+        plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "brak liczby talerzy"
+        kitchen_items.append(f"<li>Owoce · start imprezy {escape(format_time(row['start_at']))} · {escape(plates)}</li>")
+    if is_enabled(row, "cake_enabled"):
+        kitchen_items.append(f"<li>Tort: {escape(row['cake_theme'] or '(brak)')} · {escape(format_service_window(row['cake_at'], SERVICE_DURATIONS['cake_at']))}</li>")
+    if is_enabled(row, "culinary_workshops_enabled"):
+        kitchen_items.append(
+            f"<li>Warsztaty: {escape(row['culinary_workshops_type'] or '(brak)')} · {escape(format_service_window(row['culinary_workshops_at'], SERVICE_DURATIONS['culinary_workshops_at']))}</li>"
+        )
+
+    animator_block = (
+        f"""
+        <div class="reservation-block">
+          <div class="reservation-label">Animatorzy</div>
+          <ul class="reservation-list">{''.join(animator_items)}</ul>
+        </div>
+        """
+        if animator_items
+        else ""
+    )
+    kitchen_block = (
+        f"""
+        <div class="reservation-block">
+          <div class="reservation-label">Kuchnia</div>
+          <ul class="reservation-list">{''.join(kitchen_items)}</ul>
+        </div>
+        """
+        if kitchen_items
+        else ""
+    )
+
+    return f"""
+      <div class="reservation-details">
+        <div class="reservation-block full banquet-header-block">
+          {render_banquet_header(row)}
+        </div>
+        <div class="reservation-block">
+          <div class="reservation-label">Miejsce rodziców</div>
+          <div>{escape(display_locations(row["adult_location"]))}</div>
+        </div>
+        {animator_block}
+        {kitchen_block}
+        {notes}
+      </div>
+    """
 
 
 def render_animation_type_select(values: dict[str, object], errors: dict[str, str]) -> str:
@@ -2020,6 +3274,7 @@ def render_service_option(
     extra_markup: str = "",
     show_time: bool = True,
 ) -> str:
+    enabled = int(values.get(enabled_field) or 0) == 1
     duration = format_duration(duration_minutes)
     duration_label = f'<span class="service-duration">{escape(duration)}</span>' if duration else ""
     end_label = service_end_label(values, time_field, duration_minutes)
@@ -2030,19 +3285,25 @@ def render_service_option(
           <input type="text" inputmode="numeric" autocomplete="off" placeholder="00:00" maxlength="5" name="{escape(time_field)}" value="{escape(field_time(values, time_field))}" data-time-input="1" data-duration-minutes="{escape(duration_minutes or '')}" aria-label="{escape(label)} start">
           {end_markup}
         </div>
+        <div class="overlap-hint is-hidden">Godziny się pokrywają</div>
         {error_for(errors, time_field)}
 """
         if show_time
         else ""
     )
+    body_class = "" if enabled else "is-hidden"
     return f"""
-      <div class="service-option">
-        <label class="service-check">
+      <div class="service-catalog-item" data-service="{escape(enabled_field)}">
+        <div class="service-catalog-head">
           <span>{escape(label)}{duration_label}</span>
-          <input type="checkbox" name="{escape(enabled_field)}" value="1"{checked(values.get(enabled_field))}>
-        </label>
-        {time_markup}
-        {extra_markup}
+          <button type="button" class="button secondary service-add-btn" data-target="{escape(enabled_field)}">Dodaj</button>
+        </div>
+        <div class="service-catalog-body {body_class}">
+          <input type="checkbox" class="service-enabled-input" name="{escape(enabled_field)}" value="1"{checked(values.get(enabled_field))}>
+          {time_markup}
+          {extra_markup}
+          <button type="button" class="button secondary service-remove-btn">Usuń dodatek</button>
+        </div>
       </div>
 """
 
@@ -2106,40 +3367,43 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str]) -> str:
             f"""
     <g class="{' '.join(classes)}" data-location="{escape(location)}" aria-label="{escape(location)}">
       <title>{escape(status["label"])}</title>
-      <circle cx="{x}" cy="{y}" r="13"></circle>
-      <text text-anchor="middle" x="{x}" y="{y + 4}">{number}</text>
+      <circle cx="{x}" cy="{y}" r="16"></circle>
+      <text text-anchor="middle" x="{x}" y="{y + 5}" font-size="11">{number}</text>
     </g>
 """
         )
 
     return f"""
-<section>
-  <div class="section-head">
-    <div>
-      <h2>Plan sali i dostępność na żywo</h2>
-      <p class="subtitle">Mockup pokazuje zajęte sale i strefy kolorem pomarańczowym dla wybranej daty.</p>
+<div class="location-accordion plan-accordion is-open full" data-accordion="room-plan" id="room-plan-accordion">
+  <button type="button" class="location-accordion-head plan-accordion-head" aria-expanded="true">
+    <span class="location-accordion-head-main">
+      <span class="location-accordion-label">Plan sali i dostępność na żywo</span>
+      <span class="plan-legend-compact">
+        <span><span class="legend-key key-free"></span>wolne</span>
+        <span><span class="legend-key key-busy"></span>zajęte</span>
+        <span><span class="legend-key key-selected"></span>wybrane</span>
+      </span>
+    </span>
+    <span class="location-accordion-chevron" aria-hidden="true"></span>
+  </button>
+  <div class="location-accordion-panel">
+    <div class="location-accordion-body">
+      <div class="plan-wrap">
+        <svg class="room-plan" viewBox="0 0 940 560" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
+          <rect x="16" y="16" width="908" height="528" fill="none" stroke="#343944" stroke-width="2"></rect>
+          <path d="M40 252 H250 V338 H40 Z" class="plan-outline"></path>
+          <path d="M280 148 H592 V338 H280 Z" class="plan-outline"></path>
+          <path d="M628 76 H804 L880 164 V338 H628 Z" class="plan-outline"></path>
+          <path d="M736 338 H912 V532 H736 Z" class="plan-outline"></path>
+          <text x="92" y="392" font-size="13" font-weight="900" fill="#aab3c2">Pokoje / loże tematyczne</text>
+          {''.join(zones)}
+          {''.join(table_nodes)}
+          {''.join(room_nodes)}
+        </svg>
+      </div>
     </div>
   </div>
-  <div class="plan-wrap">
-    <div class="plan-legend">
-      <span><span class="legend-key key-free"></span>wolne</span>
-      <span><span class="legend-key key-busy"></span>zajęte</span>
-      <span class="muted">Bar, Scena, Trójkąt, Labirynt i loże tematyczne.</span>
-    </div>
-    {error_for(errors, "child_location")}
-    <svg class="room-plan" viewBox="0 0 940 560" aria-label="Plan sali iKids Park">
-      <rect x="16" y="16" width="908" height="528" fill="none" stroke="#343944" stroke-width="2"></rect>
-      <path d="M40 252 H250 V338 H40 Z" class="plan-outline"></path>
-      <path d="M280 148 H592 V338 H280 Z" class="plan-outline"></path>
-      <path d="M628 76 H804 L880 164 V338 H628 Z" class="plan-outline"></path>
-      <path d="M736 338 H912 V532 H736 Z" class="plan-outline"></path>
-      <text x="92" y="392" font-size="13" font-weight="900" fill="#aab3c2">Pokoje / loże tematyczne</text>
-      {''.join(zones)}
-      {''.join(table_nodes)}
-      {''.join(room_nodes)}
-    </svg>
-  </div>
-</section>
+</div>
 """
 
 
@@ -2158,6 +3422,10 @@ def format_service_window(start_value: object, duration_minutes: int | None = No
 
 def split_svg_label(label: str) -> list[str]:
     cleaned = label.replace("Sala główna - ", "").replace("Antresola - ", "Antresola ")
+    if ". " in cleaned:
+        number, name = cleaned.split(". ", 1)
+        if number.isdigit():
+            return [f"{number}.", name]
     if " - " in cleaned:
         return cleaned.split(" - ", 1)
     parts = cleaned.split()
@@ -2172,6 +3440,7 @@ def render_form(
     errors: dict[str, str],
     role: str,
     day: str,
+    include_plan: bool = False,
 ) -> str:
     reservation_id = str(values.get("id", "") or "")
     is_edit = reservation_id.isdigit()
@@ -2197,6 +3466,7 @@ def render_form(
         else ""
     )
     cancellation_class = "full" if values.get("status") == "cancelled" else "full is-hidden"
+    plan_markup = render_room_plan(values, errors) if include_plan else ""
 
     return f"""
 <section>
@@ -2244,42 +3514,41 @@ def render_form(
             <input name="parent_name" autocomplete="name" value="{escape(values.get("parent_name", ""))}" required>
             {error_for(errors, "parent_name")}
           </label>
-          <label>
-            Imię solenizanta
-            <input name="birthday_child_name" value="{escape(values.get("birthday_child_name", ""))}" required>
-            {error_for(errors, "birthday_child_name")}
-          </label>
-          <label>
-            Wiek solenizanta
-            <input type="number" name="birthday_child_age" min="1" max="18" value="{escape(values.get("birthday_child_age", ""))}" required>
-            {error_for(errors, "birthday_child_age")}
-          </label>
+          {render_birthday_children_fields(values, errors)}
         </div>
       </div>
 
       <div class="form-category">
         <h3 class="category-title">Lokalizacje</h3>
         <div class="category-fields single">
-          <label>
-            Lokalizacja dzieci
-            <select name="child_location" id="child_location" required>
-              {render_grouped_options(LOCATION_GROUPS, values.get("child_location"))}
-            </select>
+          <div class="location-picker full" id="location-picker">
+            <p class="subtitle location-hint">Wybierz lożę po lewej i stoliki po prawej (pojedynczo lub zakresem od–do), albo kliknij element na planie.</p>
+            <div class="location-forms">
+              {render_child_location_picker(values.get("child_location"))}
+              {render_adult_location_picker(values.get("adult_location"))}
+            </div>
+            <div class="location-confirm-bar">
+              <div class="location-summary">
+                <span class="location-summary-label">Podgląd wyboru</span>
+                <div class="location-summary-values">
+                  <span class="location-summary-item" id="location-summary-child">{escape(display_location(values.get("child_location")))}</span>
+                  <span class="location-summary-item" id="location-summary-adult">{escape(display_locations(values.get("adult_location")))}</span>
+                </div>
+              </div>
+              <button type="button" class="button location-confirm-btn" id="location-confirm-btn">Zatwierdź lokalizacje</button>
+            </div>
             {error_for(errors, "child_location")}
-          </label>
-          <label>
-            Lokalizacja dorosłych
-            <select name="adult_location" id="adult_location" size="8" multiple required>
-              {render_grouped_options(LOCATION_GROUPS, values.get("adult_location"))}
-            </select>
             {error_for(errors, "adult_location")}
-          </label>
+            {plan_markup}
+          </div>
         </div>
       </div>
 
       <div class="form-category wide">
         <h3 class="category-title">Atrakcje i dodatki</h3>
-        <div class="category-fields services">
+        <p class="subtitle location-hint">Przy każdej opcji kliknij „Dodaj”, wybierz godzinę i rodzaj.</p>
+        <div id="service-overlap-notice" class="overlap-notice is-hidden">Godziny się pokrywają</div>
+        <div class="category-fields services service-catalog">
           {render_service_option(values, errors, "animation_enabled", "animation_at", "Animacja", SERVICE_DURATIONS["animation_at"], render_animation_type_select(values, errors))}
           {render_service_option(values, errors, "cake_enabled", "cake_at", "Tort", SERVICE_DURATIONS["cake_at"], render_cake_theme_input(values, errors))}
           {render_service_option(values, errors, "fruit_enabled", "fruit_at", "Owoce", None, render_fruit_plates_input(values, errors), show_time=False)}
@@ -2394,14 +3663,10 @@ def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
             table_rows.append(
                 f"""
                 <tr>
-                  <td>
-                    <strong>{format_time(row["start_at"])} · {escape(row["birthday_child_name"])}, {escape(row["birthday_child_age"])} lat</strong>
-                    <br><span class="muted">{format_date(row["start_at"])} · {escape(row["parent_name"])}</span>
-                    <br><span class="muted">{escape(row["children_count"])} dzieci · {escape(row["adults_count"])} dorosłych</span>
+                  <td colspan="4">
+                    {render_reservation_details(row, include_notes=False)}
                     {notes}
                   </td>
-                  <td><strong>{escape(row["child_location"])}</strong><br><span class="muted">{escape(display_locations(row["adult_location"]))}</span></td>
-                  <td>{service_pills(row)}</td>
                   <td>
                     <span class="pill {status_class}">{escape(STATUS_LABELS[row["status"]])}</span>{cancellation}
                     <div class="inline-actions">
@@ -2420,9 +3685,7 @@ def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
           <table>
             <thead>
               <tr>
-                <th>Rezerwacja</th>
-                <th>Miejsca</th>
-                <th>Dodatki</th>
+                <th colspan="4">Szczegóły rezerwacji</th>
                 <th>Status i akcje</th>
               </tr>
             </thead>
@@ -2474,15 +3737,15 @@ def render_animator_view(rows: list[sqlite3.Row]) -> str:
 
         if task_items:
             task_items.sort(key=lambda item: (item[0], item[1]))
-            banquet_title = f"Bankiet: {row['birthday_child_name']} {row['birthday_child_age']} lat rodzic {row['parent_name']}"
-            banquets.append((task_items[0][0], banquet_title, task_items))
+            banquets.append((task_items[0][0], row, task_items, row["notes"]))
 
-    banquets.sort(key=lambda item: (item[0], item[1]))
+    banquets.sort(key=lambda item: (item[0], item[1]["child_location"]))
     if not banquets:
         return '<section><div class="empty">Brak animacji</div></section>'
 
     banquet_cards = []
-    for _, banquet_title, task_items in banquets:
+    for _, row, task_items, notes in banquets:
+        notes_markup = f'<div class="banquet-notes muted">{escape(notes)}</div>' if notes else ""
         task_markup = "".join(
             f"""
               <div class="banquet-task">
@@ -2495,13 +3758,14 @@ def render_animator_view(rows: list[sqlite3.Row]) -> str:
         banquet_cards.append(
             f"""
             <div class="banquet-card">
-              <h3 class="banquet-title">{escape(banquet_title)}</h3>
+              <div class="banquet-title">{render_banquet_header(row)}</div>
+              {notes_markup}
               <div class="banquet-tasks">{task_markup}</div>
             </div>
             """
         )
 
-    task_count = sum(len(task_items) for _, _, task_items in banquets)
+    task_count = sum(len(task_items) for _, _, task_items, _ in banquets)
     return f"""
 <section>
   <div class="section-head">
@@ -2520,73 +3784,83 @@ def render_animator_view(rows: list[sqlite3.Row]) -> str:
 
 def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
     active = [row for row in rows if row["status"] == "active"]
-
-    def banquet_label(row: sqlite3.Row) -> str:
-        return f"Bankiet: {row['birthday_child_name']} {row['birthday_child_age']} lat rodzic {row['parent_name']}"
-
-    def order_markup(title: str, detail: str, row: sqlite3.Row) -> str:
-        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
-        return f"""
-          <div class="kitchen-order">
-            <div class="schedule-title">{escape(title)}</div>
-            <div class="muted">{escape(detail)}</div>
-            <div class="muted">{escape(banquet_label(row))}</div>
-            {notes}
-          </div>
-        """
-
-    fruit_orders = []
-    cake_orders = []
-    workshop_orders = []
+    banquet_entries: list[tuple[str, str]] = []
 
     for row in active:
-        if is_enabled(row, "fruit_enabled"):
-            plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "liczba talerzy: brak"
-            fruit_orders.append(order_markup("Owoce", f"Start imprezy {format_time(row['start_at'])} · {plates}", row))
-        if is_enabled(row, "cake_enabled"):
-            cake_orders.append(
-                order_markup(
-                    f"Tort: {row['cake_theme'] or '(brak)'}",
-                    format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]),
-                    row,
-                )
+        has_fruit = is_enabled(row, "fruit_enabled")
+        has_cake = is_enabled(row, "cake_enabled")
+        has_workshops = is_enabled(row, "culinary_workshops_enabled")
+        if not (has_fruit or has_cake or has_workshops):
+            continue
+
+        fruit_body = '<span class="kitchen-cell-empty">Brak</span>'
+        if has_fruit:
+            plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "brak liczby talerzy"
+            fruit_body = (
+                f"<div>{escape(plates)}</div>"
+                f"<div class=\"muted\">{escape(format_time(row['start_at']))}</div>"
             )
-        if is_enabled(row, "culinary_workshops_enabled"):
+
+        cake_body = '<span class="kitchen-cell-empty">Brak</span>'
+        if has_cake:
+            cake_body = (
+                f"<div>{escape(row['cake_theme'] or '(brak)')}</div>"
+                f"<div class=\"muted\">{escape(format_service_window(row['cake_at'], SERVICE_DURATIONS['cake_at']))}</div>"
+            )
+
+        workshop_body = '<span class="kitchen-cell-empty">Brak</span>'
+        if has_workshops:
             workshop_name = row["culinary_workshops_type"] or "Warsztaty"
-            workshop_orders.append(
-                order_markup(
-                    f"Warsztaty: {workshop_name}",
-                    format_service_window(row["culinary_workshops_at"], SERVICE_DURATIONS["culinary_workshops_at"]),
-                    row,
-                )
+            workshop_body = (
+                f"<div>{escape(workshop_name)}</div>"
+                f"<div class=\"muted\">{escape(format_service_window(row['culinary_workshops_at'], SERVICE_DURATIONS['culinary_workshops_at']))}</div>"
             )
 
-    total_orders = len(fruit_orders) + len(cake_orders) + len(workshop_orders)
-
-    def column(title: str, orders: list[str]) -> str:
-        body = "".join(orders) if orders else '<div class="kitchen-order"><span class="muted">Brak</span></div>'
-        return (
-            f"""
-            <div class="kitchen-column">
-              <h3 class="kitchen-title">{escape(title)} ({len(orders)})</h3>
-              <div class="kitchen-orders">{body}</div>
+        notes_markup = f'<div class="banquet-notes muted">{escape(row["notes"])}</div>' if row["notes"] else ""
+        sort_time = format_time(row["cake_at"]) or format_time(row["start_at"])
+        banquet_entries.append(
+            (
+                sort_time,
+                f"""
+            <div class="banquet-card kitchen-card">
+              <div class="banquet-title">{render_banquet_header(row)}</div>
+              {notes_markup}
+              <div class="kitchen-columns">
+                <div class="kitchen-column-cell">
+                  <div class="kitchen-column-label">Owoce</div>
+                  {fruit_body}
+                </div>
+                <div class="kitchen-column-cell">
+                  <div class="kitchen-column-label">Tort</div>
+                  {cake_body}
+                </div>
+                <div class="kitchen-column-cell">
+                  <div class="kitchen-column-label">Warsztaty</div>
+                  {workshop_body}
+                </div>
+              </div>
             </div>
-            """
+            """,
+            )
         )
+
+    if not banquet_entries:
+        return '<section><div class="empty">Brak zamówień kuchennych</div></section>'
+
+    banquet_entries.sort(key=lambda item: item[0])
+    banquet_cards = [markup for _, markup in banquet_entries]
 
     return f"""
 <section>
   <div class="section-head">
     <div>
       <h2>Kuchnia</h2>
-      <p class="subtitle">Owoce, torty i warsztaty dla wybranego dnia.</p>
+      <p class="subtitle">Informacje o bankiecie i notatka w nagłówku, zamówienia w kolumnach poniżej.</p>
     </div>
-    <span class="count">{total_orders} zamówień</span>
+    <span class="count">{len(banquet_cards)} bankietów</span>
   </div>
-  <div class="kitchen-board">
-    {column("Owoce", fruit_orders)}
-    {column("Torty", cake_orders)}
-    {column("Warsztaty", workshop_orders)}
+  <div class="banquet-grid">
+    {''.join(banquet_cards)}
   </div>
 </section>
 """
@@ -2599,18 +3873,10 @@ def render_organizer_view(rows: list[sqlite3.Row]) -> str:
 
     table_rows = []
     for row in active:
-        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
         table_rows.append(
             f"""
             <tr>
-              <td>
-                <strong>{format_time(row["start_at"])} · {escape(row["birthday_child_name"])}, {escape(row["birthday_child_age"])} lat</strong>
-                <br><span class="muted">Rodzic: {escape(row["parent_name"])}</span>
-                <br><span class="muted">{escape(row["children_count"])} dzieci · {escape(row["adults_count"])} dorosłych</span>
-                {notes}
-              </td>
-              <td><strong>{escape(row["child_location"])}</strong><br><span class="muted">{escape(display_locations(row["adult_location"]))}</span></td>
-              <td>{service_pills(row)}</td>
+              <td colspan="2">{render_reservation_details(row)}</td>
             </tr>
             """
         )
@@ -2626,7 +3892,7 @@ def render_organizer_view(rows: list[sqlite3.Row]) -> str:
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Bankiet</th><th>Miejsca</th><th>Dodatki</th></tr></thead>
+      <thead><tr><th colspan="2">Rezerwacje</th></tr></thead>
       <tbody>{''.join(table_rows)}</tbody>
     </table>
   </div>
@@ -2718,15 +3984,10 @@ def render_home(
     elif role == "organizer":
         content += f"""
 <div class="stack">
-  {render_form(values, errors, role, day)}
+  {render_form(values, errors, role, day, include_plan=True)}
 </div>
-<div class="layout">
-  <div class="stack">
-    {render_room_plan(values, errors)}
-  </div>
-  <div class="stack">
-    {render_role_view(role, rows, day)}
-  </div>
+<div class="stack">
+  {render_role_view(role, rows, day)}
 </div>
 {room_plan_script()}
 """
@@ -2748,13 +4009,220 @@ def room_plan_script() -> str:
   if (!form) return;
 
   const dateInput = document.getElementById("reservation_date");
+  const childSelect = document.getElementById("child_location");
+  const adultSelect = document.getElementById("adult_location");
+  const locationPicker = document.getElementById("location-picker");
+  const locationConfirmBtn = document.getElementById("location-confirm-btn");
+  const childLocationBadge = document.getElementById("child-location-badge");
+  const adultLocationBadge = document.getElementById("adult-location-badge");
+  const locationSummaryChild = document.getElementById("location-summary-child");
+  const locationSummaryAdult = document.getElementById("location-summary-adult");
+  const locationChips = Array.from(document.querySelectorAll(".location-chip[data-location]"));
+  const locationAccordions = Array.from(document.querySelectorAll(".location-accordion"));
+  const EMPTY_LOCATION = "Brak";
   const statusSelect = document.getElementById("status");
   const cancellationReason = document.getElementById("cancellation_reason");
   const cancellationReasonField = document.getElementById("cancellation_reason_field");
-  const nodes = Array.from(document.querySelectorAll(".room-node, .table-node"));
-  const serviceOptions = Array.from(document.querySelectorAll(".service-option"));
+  const roomNodes = Array.from(document.querySelectorAll(".room-node"));
+  const tableNodes = Array.from(document.querySelectorAll(".table-node"));
+  const nodes = [...roomNodes, ...tableNodes];
+  const catalogItems = Array.from(document.querySelectorAll(".service-catalog-item"));
   const timeInputs = Array.from(document.querySelectorAll("[data-time-input]"));
+  const overlapNotice = document.getElementById("service-overlap-notice");
+  const birthdayList = document.getElementById("birthday-children-list");
+  const addBirthdayBtn = document.getElementById("add-birthday-child");
   let timer = null;
+
+  function getAdultSelectValues() {
+    return Array.from(adultSelect?.selectedOptions || []).map((option) => option.value);
+  }
+
+  function setAdultSelectValues(values) {
+    if (!adultSelect) return;
+    const wanted = new Set(values);
+    Array.from(adultSelect.options).forEach((option) => {
+      option.selected = wanted.has(option.value);
+    });
+  }
+
+  function toggleAdultTable(location) {
+    if (!location) return;
+    const values = getAdultSelectValues();
+    const index = values.indexOf(location);
+    if (index >= 0) values.splice(index, 1);
+    else values.push(location);
+    setAdultSelectValues(values);
+    paintSelectedLocations();
+  }
+
+  function setChildLocation(location) {
+    if (!childSelect || !location) return;
+    childSelect.value = location;
+    paintSelectedLocations();
+  }
+
+  function finalizeLocations() {
+    if (childSelect && (!childSelect.value || childSelect.value.trim() === "")) {
+      childSelect.value = EMPTY_LOCATION;
+    }
+  }
+
+  function paintSelectedLocations() {
+    const childValue = childSelect?.value;
+    const activeAdults = new Set(getAdultSelectValues());
+    roomNodes.forEach((node) => {
+      node.classList.toggle(
+        "is-selected",
+        childValue && childValue !== EMPTY_LOCATION && node.dataset.location === childValue
+      );
+    });
+    tableNodes.forEach((node) => {
+      node.classList.toggle("is-selected", activeAdults.has(node.dataset.location));
+    });
+    locationChips.forEach((chip) => {
+      const location = chip.dataset.location;
+      if (chip.classList.contains("location-chip-adult-none")) {
+        chip.classList.toggle("is-selected", activeAdults.size === 0);
+        return;
+      }
+      const isAdultPanel = chip.closest(".location-panel-adult");
+      if (isAdultPanel && chip.classList.contains("location-chip-table")) {
+        chip.classList.toggle("is-selected", activeAdults.has(location));
+        return;
+      }
+      if (!isAdultPanel) {
+        chip.classList.toggle("is-selected", childValue === location);
+      }
+    });
+    updateLocationSummary();
+  }
+
+  function shortChildLabel(value) {
+    if (!value || value === EMPTY_LOCATION) return EMPTY_LOCATION;
+    return value;
+  }
+
+  function updateAdultZoneMeta() {
+    const activeAdults = new Set(getAdultSelectValues());
+    locationAccordions.forEach((accordion) => {
+      const meta = accordion.querySelector(".location-accordion-meta");
+      const chips = Array.from(accordion.querySelectorAll(".location-chip-table"));
+      if (!meta || !chips.length) return;
+      const selectedCount = chips.filter((chip) => activeAdults.has(chip.dataset.location)).length;
+      meta.textContent = selectedCount ? `${selectedCount}/${chips.length}` : String(chips.length);
+    });
+  }
+
+  function updateLocationSummary() {
+    const childValue = childSelect?.value || EMPTY_LOCATION;
+    const adultValues = getAdultSelectValues();
+    const childLabel = childValue === EMPTY_LOCATION ? EMPTY_LOCATION : childValue;
+    const adultLabel = adultValues.length ? adultValues.join(", ") : EMPTY_LOCATION;
+
+    if (childLocationBadge) childLocationBadge.textContent = shortChildLabel(childValue);
+    if (adultLocationBadge) {
+      adultLocationBadge.textContent = adultValues.length ? `${adultValues.length} stol.` : EMPTY_LOCATION;
+    }
+    if (locationSummaryChild) {
+      locationSummaryChild.textContent = childLabel;
+      locationSummaryChild.classList.toggle("is-empty", childValue === EMPTY_LOCATION);
+    }
+    if (locationSummaryAdult) {
+      locationSummaryAdult.textContent = adultLabel;
+      locationSummaryAdult.classList.toggle("is-empty", !adultValues.length);
+    }
+    updateAdultZoneMeta();
+    if (locationPicker) locationPicker.classList.remove("is-confirmed");
+    if (locationConfirmBtn) {
+      locationConfirmBtn.classList.remove("is-confirmed");
+      locationConfirmBtn.textContent = "Zatwierdź lokalizacje";
+    }
+  }
+
+  function bindLocationAccordions() {
+    locationAccordions.forEach((accordion) => {
+      const head = accordion.querySelector(".location-accordion-head");
+      if (!head) return;
+      head.addEventListener("click", () => {
+        const willOpen = !accordion.classList.contains("is-open");
+        accordion.classList.toggle("is-open", willOpen);
+        head.setAttribute("aria-expanded", willOpen ? "true" : "false");
+      });
+    });
+  }
+
+  function bindLocationChips() {
+    locationChips.forEach((chip) => {
+      chip.addEventListener("click", () => {
+        if (chip.disabled || chip.classList.contains("is-busy")) {
+          window.alert("Ta lokalizacja jest zajęta w wybranym dniu.");
+          return;
+        }
+        const location = chip.dataset.location;
+        if (chip.classList.contains("location-chip-adult-none")) {
+          setAdultSelectValues([]);
+          paintSelectedLocations();
+          return;
+        }
+        if (chip.closest(".location-panel-adult")) {
+          toggleAdultTable(location);
+          return;
+        }
+        setChildLocation(location);
+      });
+    });
+  }
+
+  function bindLocationRanges() {
+    document.querySelectorAll(".location-range-row").forEach((row) => {
+      const applyBtn = row.querySelector(".location-range-apply");
+      const fromInput = row.querySelector(".location-range-from");
+      const toInput = row.querySelector(".location-range-to");
+      if (!applyBtn || !fromInput || !toInput) return;
+      applyBtn.addEventListener("click", () => {
+        const accordion = row.closest(".location-accordion");
+        if (!accordion) return;
+        const chips = Array.from(accordion.querySelectorAll(".location-chip-table"));
+        const numbers = chips
+          .map((chip) => Number(chip.dataset.tableNumber))
+          .filter((value) => !Number.isNaN(value));
+        if (!numbers.length) return;
+        let from = Number(fromInput.value);
+        let to = Number(toInput.value);
+        if (!from) from = Math.min(...numbers);
+        if (!to) to = Math.max(...numbers);
+        if (from > to) {
+          const swap = from;
+          from = to;
+          to = swap;
+        }
+        const values = new Set(getAdultSelectValues());
+        chips.forEach((chip) => {
+          const tableNumber = Number(chip.dataset.tableNumber);
+          if (
+            tableNumber >= from
+            && tableNumber <= to
+            && !chip.disabled
+            && !chip.classList.contains("is-busy")
+          ) {
+            values.add(chip.dataset.location);
+          }
+        });
+        setAdultSelectValues([...values]);
+        paintSelectedLocations();
+      });
+    });
+  }
+
+  function confirmLocations() {
+    finalizeLocations();
+    updateLocationSummary();
+    if (locationPicker) locationPicker.classList.add("is-confirmed");
+    if (locationConfirmBtn) {
+      locationConfirmBtn.classList.add("is-confirmed");
+      locationConfirmBtn.textContent = "Zatwierdzono ✓";
+    }
+  }
 
   function syncCancellationRequirement() {
     if (!statusSelect || !cancellationReason || !cancellationReasonField) return;
@@ -2774,7 +4242,6 @@ def room_plan_script() -> str:
   function normalizeClockText(value) {
     const raw = value.trim().replace(".", ":");
     if (!raw) return "";
-
     let hours = null;
     let minutes = 0;
     if (/^\\d{1,2}$/.test(raw)) {
@@ -2789,7 +4256,6 @@ def room_plan_script() -> str:
     } else {
       return value;
     }
-
     if (Number.isNaN(hours) || Number.isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
       return value;
     }
@@ -2801,32 +4267,83 @@ def room_plan_script() -> str:
     if (normalized !== input.value) input.value = normalized;
   }
 
-  function updateServiceOption(option) {
-    const checkbox = option.querySelector('input[type="checkbox"]');
-    const timeInput = option.querySelector("[data-time-input]");
-    const extraInputs = Array.from(option.querySelectorAll(".service-extra select, .service-extra input"));
-    const end = option.querySelector(".service-end");
-    if (!checkbox) return;
+  function toMinutes(value) {
+    const normalized = normalizeClockText(value);
+    if (!normalized) return null;
+    const [hours, minutes] = normalized.split(":").map(Number);
+    if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+    return hours * 60 + minutes;
+  }
 
-    if (timeInput) timeInput.disabled = !checkbox.checked;
-    extraInputs.forEach((input) => {
-      input.disabled = !checkbox.checked;
-    });
-    if (!checkbox.checked) {
+  function serviceWindow(input) {
+    if (!input || input.disabled || !input.value) return null;
+    const duration = Number(input.dataset.durationMinutes || 0);
+    const startMinutes = toMinutes(input.value);
+    if (startMinutes === null || !duration) return null;
+    return { startMinutes, endMinutes: startMinutes + duration, duration };
+  }
+
+  function windowsOverlap(a, b) {
+    if (!a || !b || !a.duration || !b.duration) return false;
+    return a.startMinutes < b.endMinutes && b.startMinutes < a.endMinutes;
+  }
+
+  function validateServiceOverlaps() {
+    const windows = timeInputs
+      .map((input) => serviceWindow(input))
+      .filter((windowValue) => windowValue && windowValue.duration);
+    timeInputs.forEach((input) => input.classList.remove("overlap-error"));
+    document.querySelectorAll(".overlap-hint").forEach((hint) => hint.classList.add("is-hidden"));
+    if (overlapNotice) overlapNotice.classList.add("is-hidden");
+
+    let hasOverlap = false;
+    for (let i = 0; i < windows.length; i += 1) {
+      for (let j = i + 1; j < windows.length; j += 1) {
+        if (windowsOverlap(windows[i], windows[j])) {
+          hasOverlap = true;
+        }
+      }
+    }
+
+    if (hasOverlap) {
+      if (overlapNotice) overlapNotice.classList.remove("is-hidden");
+      timeInputs.forEach((input) => {
+        const windowValue = serviceWindow(input);
+        if (!windowValue || !windowValue.duration) return;
+        const conflict = windows.some((other) => other !== windowValue && windowsOverlap(windowValue, other));
+        if (!conflict) return;
+        input.classList.add("overlap-error");
+        input.closest(".service-catalog-body")?.querySelector(".overlap-hint")?.classList.remove("is-hidden");
+      });
+    }
+    return !hasOverlap;
+  }
+
+  function updateCatalogItem(item) {
+    const checkbox = item.querySelector(".service-enabled-input");
+    const body = item.querySelector(".service-catalog-body");
+    const timeInput = item.querySelector("[data-time-input]");
+    const extraInputs = Array.from(item.querySelectorAll(".service-extra select, .service-extra input"));
+    const end = item.querySelector(".service-end");
+    const enabled = checkbox?.checked;
+    if (body) body.classList.toggle("is-hidden", !enabled);
+    if (timeInput) timeInput.disabled = !enabled;
+    extraInputs.forEach((input) => { input.disabled = !enabled; });
+    if (!enabled) {
       if (end) end.textContent = "";
       return;
     }
-    if (!timeInput) return;
-
+    if (!timeInput || !timeInput.value) {
+      if (end) end.textContent = "";
+      validateServiceOverlaps();
+      return;
+    }
     const duration = Number(timeInput.dataset.durationMinutes || 0);
-    if (!duration || !timeInput.value) {
-      if (end) end.textContent = "";
-      return;
-    }
-
+    if (!duration) return;
     const [hours, minutes] = timeInput.value.split(":").map(Number);
     if (Number.isNaN(hours) || Number.isNaN(minutes)) return;
     if (end) end.textContent = `koniec ${formatTime(hours * 60 + minutes + duration)}`;
+    validateServiceOverlaps();
   }
 
   function applyAvailability(locations) {
@@ -2836,13 +4353,21 @@ def room_plan_script() -> str:
       const title = node.querySelector("title");
       if (title) title.textContent = info.label;
     });
+    locationChips.forEach((chip) => {
+      const info = locations[chip.dataset.location] || { status: "free", label: "Wolne" };
+      const busy = info.status === "occupied";
+      chip.classList.toggle("is-busy", busy);
+      chip.disabled = busy;
+      chip.title = busy ? info.label : (chip.dataset.location || "");
+    });
+    paintSelectedLocations();
   }
 
   function refreshAvailability() {
-    if (!dateInput.value) return;
-    const params = new URLSearchParams({
-      date: dateInput.value,
-    });
+    if (!dateInput?.value) return;
+    const params = new URLSearchParams({ date: dateInput.value });
+    const reservationId = document.getElementById("reservation_id")?.value;
+    if (reservationId) params.set("exclude_id", reservationId);
     fetch(`/api/availability?${params.toString()}`)
       .then((response) => response.ok ? response.json() : null)
       .then((payload) => {
@@ -2856,31 +4381,124 @@ def room_plan_script() -> str:
     timer = window.setTimeout(refreshAvailability, 150);
   }
 
-  serviceOptions.forEach((option) => {
-    const checkbox = option.querySelector('input[type="checkbox"]');
-    const timeInput = option.querySelector("[data-time-input]");
-    if (checkbox) checkbox.addEventListener("change", () => updateServiceOption(option));
-    if (timeInput) timeInput.addEventListener("input", () => updateServiceOption(option));
-    updateServiceOption(option);
+  function bindBirthdayChildren() {
+    if (!birthdayList) return;
+    birthdayList.querySelectorAll(".remove-birthday-child").forEach((button) => {
+      button.addEventListener("click", () => {
+        button.closest(".birthday-child-row")?.remove();
+      });
+    });
+  }
+
+  if (addBirthdayBtn && birthdayList) {
+    addBirthdayBtn.addEventListener("click", () => {
+      const row = document.createElement("div");
+      row.className = "birthday-child-row";
+      row.innerHTML = `
+        <label>Imię solenizanta<input name="birthday_child_name" required></label>
+        <label>Wiek<input type="number" name="birthday_child_age" min="1" max="18" required></label>
+        <button type="button" class="button secondary remove-birthday-child" aria-label="Usuń solenizanta">Usuń</button>
+      `;
+      birthdayList.appendChild(row);
+      bindBirthdayChildren();
+    });
+    bindBirthdayChildren();
+  }
+
+  catalogItems.forEach((item) => {
+    const checkbox = item.querySelector(".service-enabled-input");
+    const addBtn = item.querySelector(".service-add-btn");
+    const removeBtn = item.querySelector(".service-remove-btn");
+    const timeInput = item.querySelector("[data-time-input]");
+    addBtn?.addEventListener("click", () => {
+      if (checkbox) checkbox.checked = true;
+      updateCatalogItem(item);
+      timeInput?.focus();
+    });
+    removeBtn?.addEventListener("click", () => {
+      if (checkbox) checkbox.checked = false;
+      if (timeInput) timeInput.value = "";
+      item.querySelectorAll(".service-extra input, .service-extra select").forEach((input) => {
+        if (input.tagName === "SELECT") input.selectedIndex = 0;
+        else input.value = "";
+      });
+      item.querySelector(".overlap-hint")?.classList.add("is-hidden");
+      updateCatalogItem(item);
+    });
+    checkbox?.addEventListener("change", () => updateCatalogItem(item));
+    timeInput?.addEventListener("input", () => updateCatalogItem(item));
+    updateCatalogItem(item);
   });
 
   timeInputs.forEach((input) => {
     input.addEventListener("blur", () => {
       normalizeTimeInput(input);
-      const option = input.closest(".service-option");
-      if (option) updateServiceOption(option);
+      const item = input.closest(".service-catalog-item");
+      if (item) updateCatalogItem(item);
     });
   });
 
-  form.addEventListener("submit", () => {
-    timeInputs.forEach(normalizeTimeInput);
+  roomNodes.forEach((node) => {
+    node.style.cursor = "pointer";
+    node.addEventListener("click", () => {
+      if (node.classList.contains("is-busy")) {
+        window.alert("Ta sala jest zajęta w wybranym dniu.");
+        return;
+      }
+      setChildLocation(node.dataset.location);
+    });
   });
 
-  dateInput.addEventListener("input", scheduleRefresh);
+  tableNodes.forEach((node) => {
+    node.style.cursor = "pointer";
+    node.addEventListener("click", () => {
+      if (node.classList.contains("is-busy")) {
+        window.alert("Ten stolik jest zajęty w wybranym dniu.");
+        return;
+      }
+      toggleAdultTable(node.dataset.location);
+    });
+  });
+
+  childSelect?.addEventListener("change", paintSelectedLocations);
+  adultSelect?.addEventListener("change", paintSelectedLocations);
+  locationConfirmBtn?.addEventListener("click", confirmLocations);
+  bindLocationAccordions();
+  bindLocationChips();
+  bindLocationRanges();
+
+  form.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && event.target.tagName !== "TEXTAREA") {
+      event.preventDefault();
+    }
+  });
+
+  form.addEventListener("submit", (event) => {
+    timeInputs.forEach(normalizeTimeInput);
+    finalizeLocations();
+    if (!validateServiceOverlaps()) {
+      event.preventDefault();
+      return;
+    }
+    const actionLabel = form.querySelector('button[type="submit"]')?.textContent?.trim() || "zapisać rezerwację";
+    if (!window.confirm(`Czy na pewno chcesz ${actionLabel.toLowerCase()}?`)) {
+      event.preventDefault();
+    }
+  });
+
+  paintSelectedLocations();
+  dateInput?.addEventListener("input", scheduleRefresh);
   if (statusSelect) statusSelect.addEventListener("change", syncCancellationRequirement);
   syncCancellationRequirement();
+  refreshAvailability();
 })();
 </script>
+<style>
+  input.overlap-error {
+    border-color: var(--danger);
+    outline-color: rgba(251, 113, 133, 0.35);
+  }
+</style>
 """
 
 
@@ -2993,7 +4611,7 @@ def render_history_page(reservation_id: int, role: str, day: str) -> bytes:
   <div class="section-head">
     <div>
       <h2>Historia rezerwacji</h2>
-      <p class="subtitle">{escape(row["birthday_child_name"])} · {format_date(row["start_at"])}</p>
+      <p class="subtitle banquet-header-inline">{render_banquet_header(row)}</p>
     </div>
     <a class="button secondary" href="{link_for(role, day, edit=reservation_id)}">Wróć do edycji</a>
   </div>
@@ -3007,7 +4625,7 @@ def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length).decode("utf-8")
     parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values if key == "adult_location" else values[-1] for key, values in parsed.items()}
+    return {key: values if key in {"adult_location", "birthday_child_name", "birthday_child_age"} else values[-1] for key, values in parsed.items()}
 
 
 def csv_response() -> bytes:
