@@ -49,6 +49,7 @@ ADULT_LOCATIONS = [location for locations in ADULT_LOCATION_GROUPS.values() for 
 LOCATION_GROUPS = {"Loże tematyczne": PARTY_ROOMS, **ADULT_LOCATION_GROUPS}
 
 ALL_LOCATIONS = PARTY_ROOMS + ADULT_LOCATIONS
+LOCATION_SEPARATOR = " | "
 
 ANIMATION_GROUPS = {
     "Animacje tematyczne": [
@@ -139,20 +140,20 @@ LEGACY_ADULT_LOCATION_RENAMES = {
 
 ROLE_DEFS = {
     "manager": {
-        "label": "Kierownik / Recepcja",
+        "label": "Kierownik zmiany / Recepcja",
         "hint": "Pełny widok, edycja, statusy i dostępność sal.",
     },
     "animators": {
         "label": "Animatorzy",
-        "hint": "Animacje, piniata, maskotka i dokładne godziny atrakcji.",
-    },
-    "bakery": {
-        "label": "Cukiernia",
-        "hint": "Torty, godzina podania, solenizant i uwagi.",
+        "hint": "Animacje, piniaty, maskotki.",
     },
     "kitchen": {
         "label": "Kuchnia",
-        "hint": "Owoce, napoje i warsztaty kulinarne z godzinami podania.",
+        "hint": "Owoce, torty i warsztaty.",
+    },
+    "organizer": {
+        "label": "Organizator urodzin",
+        "hint": "Podgląd bankietów, lokalizacji i dodatków.",
     },
 }
 
@@ -475,7 +476,7 @@ def parse_time_value(raw: str) -> time | None:
 
 
 def parse_time_field(
-    data: dict[str, str],
+    data: dict[str, object],
     errors: dict[str, str],
     field: str,
     label: str,
@@ -493,7 +494,7 @@ def parse_time_field(
 
 
 def parse_int_field(
-    data: dict[str, str],
+    data: dict[str, object],
     errors: dict[str, str],
     field: str,
     label: str,
@@ -511,14 +512,14 @@ def parse_int_field(
     return value
 
 
-def parse_text_field(data: dict[str, str], errors: dict[str, str], field: str, label: str) -> str:
+def parse_text_field(data: dict[str, object], errors: dict[str, str], field: str, label: str) -> str:
     value = data.get(field, "").strip()
     if not value:
         errors[field] = f"Pole \"{label}\" jest wymagane."
     return value
 
 
-def checked_bool(data: dict[str, str], field: str) -> int:
+def checked_bool(data: dict[str, object], field: str) -> int:
     return 1 if data.get(field) == "1" else 0
 
 
@@ -539,6 +540,32 @@ def combine_day_time(day: date | None, value: time | None) -> str | None:
     return datetime.combine(day, value).isoformat(timespec="minutes")
 
 
+def location_values(value: object) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        candidates = [str(item).strip() for item in value]
+    else:
+        raw = str(value or "").strip()
+        candidates = [part.strip() for part in raw.split(LOCATION_SEPARATOR)] if raw else []
+
+    locations: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in locations:
+            locations.append(candidate)
+    return locations
+
+
+def joined_locations(values: object) -> str:
+    return LOCATION_SEPARATOR.join(location_values(values))
+
+
+def display_locations(value: object) -> str:
+    return ", ".join(location_values(value))
+
+
+def reservation_locations(row: sqlite3.Row | dict[str, object]) -> set[str]:
+    return {str(row["child_location"]), *location_values(row["adult_location"])}
+
+
 def time_in_reservation_window(start_dt: datetime | None, end_dt: datetime | None, value: time | None) -> bool:
     if start_dt is None or end_dt is None or value is None:
         return True
@@ -550,35 +577,33 @@ def find_conflicts(
     start_at: str,
     end_at: str,
     child_location: str,
-    adult_location: str,
+    adult_locations: list[str],
     exclude_id: int | None = None,
 ) -> list[sqlite3.Row]:
-    params: list[object] = [end_at, start_at, child_location, adult_location, child_location, adult_location]
+    params: list[object] = [end_at, start_at]
     exclude_sql = ""
     if exclude_id:
         exclude_sql = "AND id != ?"
         params.append(exclude_id)
 
-    return db_rows(
+    requested_locations = {child_location, *adult_locations}
+    rows = db_rows(
         f"""
         SELECT id, start_at, end_at, parent_name, birthday_child_name, child_location, adult_location
         FROM reservations
         WHERE status = 'active'
           AND start_at < ?
           AND end_at > ?
-          AND (
-            child_location IN (?, ?)
-            OR adult_location IN (?, ?)
-          )
           {exclude_sql}
         ORDER BY start_at ASC
         """,
         tuple(params),
     )
+    return [row for row in rows if requested_locations & reservation_locations(row)]
 
 
 def validate_reservation(
-    data: dict[str, str],
+    data: dict[str, object],
     reservation_id: int | None = None,
 ) -> tuple[dict[str, object], dict[str, str]]:
     errors: dict[str, str] = {}
@@ -595,9 +620,13 @@ def validate_reservation(
     if child_location not in ALL_LOCATIONS:
         errors["child_location"] = "Wybierz lokalizację dzieci z listy."
 
-    adult_location = data.get("adult_location", "").strip()
-    if adult_location not in ALL_LOCATIONS:
+    adult_locations = location_values(data.get("adult_location", ""))
+    invalid_adult_locations = [location for location in adult_locations if location not in ALL_LOCATIONS]
+    if not adult_locations:
         errors["adult_location"] = "Wybierz lokalizację dorosłych z listy."
+    elif invalid_adult_locations:
+        errors["adult_location"] = "Wybierz lokalizacje dorosłych z listy."
+    adult_location = joined_locations(adult_locations)
 
     animation_enabled = checked_bool(data, "animation_enabled")
     cake_enabled = checked_bool(data, "cake_enabled")
@@ -643,7 +672,7 @@ def validate_reservation(
 
     animation_time = parse_time_field(data, errors, "animation_at", "Start animacji", bool(animation_enabled))
     cake_time = parse_time_field(data, errors, "cake_at", "Start tortu", bool(cake_enabled))
-    fruit_time = parse_time_field(data, errors, "fruit_at", "Godzina owoców", bool(fruit_enabled))
+    fruit_time = party_start_time
     drinks_time = None
     workshops_time = parse_time_field(
         data,
@@ -721,14 +750,15 @@ def validate_reservation(
         and start_at
         and end_at
         and child_location in ALL_LOCATIONS
-        and adult_location in ALL_LOCATIONS
+        and adult_locations
+        and not invalid_adult_locations
     ):
-        conflicts = find_conflicts(start_at, end_at, child_location, adult_location, exclude_id=reservation_id)
+        conflicts = find_conflicts(start_at, end_at, child_location, adult_locations, exclude_id=reservation_id)
         if conflicts:
             conflict_lines = []
             for conflict in conflicts:
                 conflict_lines.append(
-                    f"{conflict['birthday_child_name']} ({conflict['child_location']}, {conflict['adult_location']})"
+                    f"{conflict['birthday_child_name']} ({conflict['child_location']}, {display_locations(conflict['adult_location'])})"
                 )
             errors["child_location"] = "Wybrana sala lub stolik nakłada się z rezerwacją: " + "; ".join(conflict_lines)
 
@@ -919,7 +949,7 @@ def availability_for(
     )
     for row in rows:
         label = f"Zajęte: {row['birthday_child_name']}"
-        for location in (row["child_location"], row["adult_location"]):
+        for location in reservation_locations(row):
             if location in statuses:
                 statuses[location] = {"status": "occupied", "label": label}
     return statuses
@@ -971,7 +1001,7 @@ def is_enabled(row: sqlite3.Row | dict[str, object], field: str) -> bool:
 
 
 def selected(current: object, value: str) -> str:
-    return " selected" if str(current) == value else ""
+    return " selected" if value in location_values(current) else ""
 
 
 def checked(current: object) -> str:
@@ -1501,7 +1531,7 @@ def page_template(
 
     .metrics {{
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 10px;
     }}
 
@@ -1516,6 +1546,82 @@ def page_template(
       font-size: 1.35rem;
       line-height: 1;
       margin-bottom: 6px;
+    }}
+
+    .schedule-list {{
+      display: grid;
+      gap: 0;
+    }}
+
+    .banquet-grid, .kitchen-board {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      padding: 14px;
+    }}
+
+    .banquet-card, .kitchen-column {{
+      border: 1px solid var(--line);
+      background: var(--field);
+      min-width: 0;
+    }}
+
+    .banquet-title, .kitchen-title {{
+      margin: 0;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #202531;
+      color: #f7f9fc;
+      font-size: 0.86rem;
+      line-height: 1.25;
+      font-weight: 900;
+    }}
+
+    .banquet-tasks, .kitchen-orders {{
+      display: grid;
+      gap: 0;
+    }}
+
+    .banquet-task, .kitchen-order {{
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+    }}
+
+    .banquet-task:first-child, .kitchen-order:first-child {{
+      border-top: 0;
+    }}
+
+    .schedule-item {{
+      display: grid;
+      grid-template-columns: 90px minmax(0, 1fr);
+      gap: 14px;
+      padding: 14px 18px;
+      border-top: 1px solid var(--line);
+      align-items: start;
+    }}
+
+    .schedule-item:first-child {{
+      border-top: 0;
+    }}
+
+    .schedule-time {{
+      color: #f7f9fc;
+      font-size: 1.05rem;
+      font-weight: 900;
+      line-height: 1.2;
+    }}
+
+    .schedule-detail {{
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }}
+
+    .schedule-title {{
+      font-weight: 900;
+      line-height: 1.25;
     }}
 
     .plan-wrap {{
@@ -1692,7 +1798,7 @@ def page_template(
         <img class="logo" src="/logo.png" alt="iKids Park">
         <div>
           <h1>iKids Park Rezerwacje</h1>
-          <p class="subtitle">Wewnętrzny panel urodzin: recepcja, animatorzy, cukiernia i kuchnia.</p>
+          <p class="subtitle">Wewnętrzny panel urodzin: kierownik zmiany, recepcja, animatorzy, kuchnia i organizator.</p>
         </div>
       </div>
       <div class="tabs">
@@ -1912,32 +2018,38 @@ def render_service_option(
     label: str,
     duration_minutes: int | None = None,
     extra_markup: str = "",
+    show_time: bool = True,
 ) -> str:
     duration = format_duration(duration_minutes)
     duration_label = f'<span class="service-duration">{escape(duration)}</span>' if duration else ""
     end_label = service_end_label(values, time_field, duration_minutes)
     end_markup = f'<span class="service-end">{escape(end_label)}</span>' if end_label else '<span class="service-end"></span>'
+    time_markup = (
+        f"""
+        <div class="service-time">
+          <input type="text" inputmode="numeric" autocomplete="off" placeholder="00:00" maxlength="5" name="{escape(time_field)}" value="{escape(field_time(values, time_field))}" data-time-input="1" data-duration-minutes="{escape(duration_minutes or '')}" aria-label="{escape(label)} start">
+          {end_markup}
+        </div>
+        {error_for(errors, time_field)}
+"""
+        if show_time
+        else ""
+    )
     return f"""
       <div class="service-option">
         <label class="service-check">
           <span>{escape(label)}{duration_label}</span>
           <input type="checkbox" name="{escape(enabled_field)}" value="1"{checked(values.get(enabled_field))}>
         </label>
-        <div class="service-time">
-          <input type="text" inputmode="numeric" autocomplete="off" placeholder="00:00" maxlength="5" name="{escape(time_field)}" value="{escape(field_time(values, time_field))}" data-time-input="1" data-duration-minutes="{escape(duration_minutes or '')}" aria-label="{escape(label)} start">
-          {end_markup}
-        </div>
+        {time_markup}
         {extra_markup}
-        {error_for(errors, time_field)}
       </div>
 """
 
 
 def render_room_plan(values: dict[str, object], errors: dict[str, str]) -> str:
-    reservation_id = int(values["id"]) if str(values.get("id", "")).isdigit() else None
     statuses = availability_for(
         str(values.get("reservation_date", "")),
-        exclude_id=reservation_id,
     )
     room_nodes = []
     for name, x, y, width, height in ROOM_LAYOUT:
@@ -2157,7 +2269,7 @@ def render_form(
           </label>
           <label>
             Lokalizacja dorosłych
-            <select name="adult_location" id="adult_location" required>
+            <select name="adult_location" id="adult_location" size="8" multiple required>
               {render_grouped_options(LOCATION_GROUPS, values.get("adult_location"))}
             </select>
             {error_for(errors, "adult_location")}
@@ -2170,7 +2282,7 @@ def render_form(
         <div class="category-fields services">
           {render_service_option(values, errors, "animation_enabled", "animation_at", "Animacja", SERVICE_DURATIONS["animation_at"], render_animation_type_select(values, errors))}
           {render_service_option(values, errors, "cake_enabled", "cake_at", "Tort", SERVICE_DURATIONS["cake_at"], render_cake_theme_input(values, errors))}
-          {render_service_option(values, errors, "fruit_enabled", "fruit_at", "Owoce", None, render_fruit_plates_input(values, errors))}
+          {render_service_option(values, errors, "fruit_enabled", "fruit_at", "Owoce", None, render_fruit_plates_input(values, errors), show_time=False)}
           {render_service_option(values, errors, "culinary_workshops_enabled", "culinary_workshops_at", "Warsztaty kulinarne", SERVICE_DURATIONS["culinary_workshops_at"], render_workshop_type_select(values, errors))}
           {render_service_option(values, errors, "pinata_enabled", "pinata_at", "Piniata", SERVICE_DURATIONS["pinata_at"], render_pinata_theme_input(values, errors))}
           {render_service_option(values, errors, "mascot_enabled", "mascot_at", "Maskotka", SERVICE_DURATIONS["mascot_at"], render_mascot_type_select(values, errors))}
@@ -2242,6 +2354,7 @@ def service_pills(row: sqlite3.Row) -> str:
 def render_metrics(rows: list[sqlite3.Row]) -> str:
     active = [row for row in rows if row["status"] == "active"]
     animation_count = sum(1 for row in active if is_enabled(row, "animation_enabled"))
+    workshops = sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled"))
     cakes = sum(1 for row in active if is_enabled(row, "cake_enabled"))
     kitchen = sum(
         1
@@ -2249,14 +2362,15 @@ def render_metrics(rows: list[sqlite3.Row]) -> str:
         if is_enabled(row, "fruit_enabled")
         or is_enabled(row, "culinary_workshops_enabled")
     )
-    children = sum(int(row["children_count"]) for row in active)
+    guests = sum(int(row["children_count"]) + int(row["adults_count"]) for row in active)
     return f"""
 <section>
   <div class="section-body">
     <div class="metrics">
       <div class="metric"><strong>{len(active)}</strong><span class="muted">aktywne rezerwacje</span></div>
-      <div class="metric"><strong>{children}</strong><span class="muted">dzieci łącznie</span></div>
+      <div class="metric"><strong>{guests}</strong><span class="muted">goście łącznie</span></div>
       <div class="metric"><strong>{animation_count}</strong><span class="muted">animacje</span></div>
+      <div class="metric"><strong>{workshops}</strong><span class="muted">warsztaty</span></div>
       <div class="metric"><strong>{cakes}</strong><span class="muted">torty · kuchnia: {kitchen}</span></div>
     </div>
   </div>
@@ -2286,12 +2400,12 @@ def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
                     <br><span class="muted">{escape(row["children_count"])} dzieci · {escape(row["adults_count"])} dorosłych</span>
                     {notes}
                   </td>
-                  <td><strong>{escape(row["child_location"])}</strong><br><span class="muted">{escape(row["adult_location"])}</span></td>
+                  <td><strong>{escape(row["child_location"])}</strong><br><span class="muted">{escape(display_locations(row["adult_location"]))}</span></td>
                   <td>{service_pills(row)}</td>
                   <td>
                     <span class="pill {status_class}">{escape(STATUS_LABELS[row["status"]])}</span>{cancellation}
                     <div class="inline-actions">
-                      <a class="button secondary" href="{link_for(role, day, edit=row["id"])}">Edytuj</a>
+                      <a class="button secondary" href="{link_for("organizer", day, edit=row["id"])}">Edytuj</a>
                       <form class="inline-form" method="post" action="/delete?role={escape(role)}&day={escape(day)}" onsubmit="return confirm('Usunąć tę rezerwację? Tej operacji nie można cofnąć.');">
                         <input type="hidden" name="id" value="{escape(row["id"])}">
                         <button class="button danger" type="submit">Usuń</button>
@@ -2332,139 +2446,131 @@ def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
 
 
 def render_animator_view(rows: list[sqlite3.Row]) -> str:
-    relevant = [
-        row
-        for row in rows
-        if row["status"] == "active"
-        and (
-            is_enabled(row, "animation_enabled")
-            or is_enabled(row, "pinata_enabled")
-            or is_enabled(row, "mascot_enabled")
-        )
-    ]
-    if not relevant:
-        return '<section><div class="empty">Brak animacji, piniat lub maskotek w wybranym dniu.</div></section>'
+    banquets = []
+    for row in rows:
+        if row["status"] != "active":
+            continue
 
-    table_rows = []
-    for row in relevant:
-        attractions = []
+        tasks = []
         if is_enabled(row, "animation_enabled"):
-            animation_name = row["animation_type"] or "Animacja"
-            attractions.append(
-                f"{animation_name} {format_service_window(row['animation_at'], SERVICE_DURATIONS['animation_at'])}"
-            )
+            tasks.append((row["animation_at"], row["animation_type"] or "Animacja"))
         if is_enabled(row, "pinata_enabled"):
-            attractions.append(
-                f"Piniata {row['pinata_theme'] or '(brak)'} {format_service_window(row['pinata_at'], SERVICE_DURATIONS['pinata_at'])}"
-            )
+            tasks.append((row["pinata_at"], f"Piniata: {row['pinata_theme'] or '(brak)'}"))
         if is_enabled(row, "mascot_enabled"):
-            mascot_name = row["mascot_type"] or "Maskotka"
-            attractions.append(f"{mascot_name} {format_service_window(row['mascot_at'], SERVICE_DURATIONS['mascot_at'])}")
-        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
-        table_rows.append(
+            tasks.append((row["mascot_at"], f"Maskotka: {row['mascot_type'] or '(brak)'}"))
+
+        task_items = []
+        for task_time, task_name in tasks:
+            time_label = format_time(task_time)
+            if not time_label:
+                continue
+            try:
+                hour = int(time_label[:2])
+            except ValueError:
+                hour = 0
+            if hour < 10 or hour > 21:
+                continue
+            task_items.append((time_label, task_name))
+
+        if task_items:
+            task_items.sort(key=lambda item: (item[0], item[1]))
+            banquet_title = f"Bankiet: {row['birthday_child_name']} {row['birthday_child_age']} lat rodzic {row['parent_name']}"
+            banquets.append((task_items[0][0], banquet_title, task_items))
+
+    banquets.sort(key=lambda item: (item[0], item[1]))
+    if not banquets:
+        return '<section><div class="empty">Brak animacji</div></section>'
+
+    banquet_cards = []
+    for _, banquet_title, task_items in banquets:
+        task_markup = "".join(
             f"""
-            <tr>
-              <td><strong>{format_date(row["start_at"])}</strong></td>
-              <td>{escape(row["child_location"])}</td>
-              <td>{escape(row["birthday_child_name"])}, {escape(row["birthday_child_age"])} lat<br><span class="muted">{escape(row["children_count"])} dzieci</span>{notes}</td>
-              <td>{''.join(f'<span class="pill">{escape(item)}</span>' for item in attractions)}</td>
-            </tr>
+              <div class="banquet-task">
+                <div class="schedule-time">{escape(time_label)}</div>
+                <div class="schedule-title">{escape(task_name)}</div>
+              </div>
+            """
+            for time_label, task_name in task_items
+        )
+        banquet_cards.append(
+            f"""
+            <div class="banquet-card">
+              <h3 class="banquet-title">{escape(banquet_title)}</h3>
+              <div class="banquet-tasks">{task_markup}</div>
+            </div>
             """
         )
 
+    task_count = sum(len(task_items) for _, _, task_items in banquets)
     return f"""
 <section>
   <div class="section-head">
     <div>
-      <h2>Plan animatorów</h2>
-      <p class="subtitle">Widoczne są tylko rezerwacje z animacją, piniatą lub maskotką.</p>
+      <h2>Animatorzy</h2>
+      <p class="subtitle">Animacje, piniaty, maskotki.</p>
     </div>
-    <span class="count">{len(relevant)} zadań</span>
+    <span class="count">{task_count} pozycji</span>
   </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Rezerwacja</th><th>Sala</th><th>Solenizant</th><th>Atrakcje</th></tr></thead>
-      <tbody>{''.join(table_rows)}</tbody>
-    </table>
-  </div>
-</section>
-"""
-
-
-def render_bakery_view(rows: list[sqlite3.Row]) -> str:
-    relevant = [row for row in rows if row["status"] == "active" and is_enabled(row, "cake_enabled")]
-    if not relevant:
-        return '<section><div class="empty">Brak tortów do przygotowania w wybranym dniu.</div></section>'
-
-    table_rows = []
-    for row in relevant:
-        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
-        table_rows.append(
-            f"""
-            <tr>
-              <td><strong>{format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"])}</strong></td>
-              <td>{escape(row["birthday_child_name"])}</td>
-              <td>{escape(row["birthday_child_age"])} lat</td>
-              <td>{escape(row["cake_theme"] or "(brak)")}</td>
-              <td>{escape(row["child_location"])}</td>
-              <td>{notes or '<span class="muted">Brak uwag</span>'}</td>
-            </tr>
-            """
-        )
-
-    return f"""
-<section>
-  <div class="section-head">
-    <div>
-      <h2>Cukiernia</h2>
-      <p class="subtitle">Minimalny widok: tort, godzina, solenizant i uwagi.</p>
-    </div>
-    <span class="count">{len(relevant)} tortów</span>
-  </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Podanie</th><th>Solenizant</th><th>Wiek</th><th>Motyw</th><th>Sala</th><th>Uwagi</th></tr></thead>
-      <tbody>{''.join(table_rows)}</tbody>
-    </table>
+  <div class="banquet-grid">
+    {''.join(banquet_cards)}
   </div>
 </section>
 """
 
 
 def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
-    relevant = [
-        row
-        for row in rows
-        if row["status"] == "active"
-        and (
-            is_enabled(row, "fruit_enabled")
-            or is_enabled(row, "culinary_workshops_enabled")
-        )
-    ]
-    if not relevant:
-        return '<section><div class="empty">Brak zamówień kuchni w wybranym dniu.</div></section>'
+    active = [row for row in rows if row["status"] == "active"]
 
-    table_rows = []
-    for row in relevant:
-        orders = []
+    def banquet_label(row: sqlite3.Row) -> str:
+        return f"Bankiet: {row['birthday_child_name']} {row['birthday_child_age']} lat rodzic {row['parent_name']}"
+
+    def order_markup(title: str, detail: str, row: sqlite3.Row) -> str:
+        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
+        return f"""
+          <div class="kitchen-order">
+            <div class="schedule-title">{escape(title)}</div>
+            <div class="muted">{escape(detail)}</div>
+            <div class="muted">{escape(banquet_label(row))}</div>
+            {notes}
+          </div>
+        """
+
+    fruit_orders = []
+    cake_orders = []
+    workshop_orders = []
+
+    for row in active:
         if is_enabled(row, "fruit_enabled"):
-            plates = f", {row['fruit_plates']} tal." if row["fruit_plates"] else ""
-            orders.append(f"Owoce {format_time(row['fruit_at'])}{plates}")
+            plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "liczba talerzy: brak"
+            fruit_orders.append(order_markup("Owoce", f"Start imprezy {format_time(row['start_at'])} · {plates}", row))
+        if is_enabled(row, "cake_enabled"):
+            cake_orders.append(
+                order_markup(
+                    f"Tort: {row['cake_theme'] or '(brak)'}",
+                    format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]),
+                    row,
+                )
+            )
         if is_enabled(row, "culinary_workshops_enabled"):
             workshop_name = row["culinary_workshops_type"] or "Warsztaty"
-            orders.append(
-                f"{workshop_name} {format_service_window(row['culinary_workshops_at'], SERVICE_DURATIONS['culinary_workshops_at'])}"
+            workshop_orders.append(
+                order_markup(
+                    f"Warsztaty: {workshop_name}",
+                    format_service_window(row["culinary_workshops_at"], SERVICE_DURATIONS["culinary_workshops_at"]),
+                    row,
+                )
             )
-        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
-        table_rows.append(
+
+    total_orders = len(fruit_orders) + len(cake_orders) + len(workshop_orders)
+
+    def column(title: str, orders: list[str]) -> str:
+        body = "".join(orders) if orders else '<div class="kitchen-order"><span class="muted">Brak</span></div>'
+        return (
             f"""
-            <tr>
-              <td><strong>{format_date(row["start_at"])}</strong></td>
-              <td>{escape(row["child_location"])}</td>
-              <td>{escape(row["children_count"])} dzieci<br>{escape(row["adults_count"])} dorosłych</td>
-              <td>{''.join(f'<span class="pill">{escape(item)}</span>' for item in orders)}</td>
-              <td>{notes or '<span class="muted">Brak uwag</span>'}</td>
-            </tr>
+            <div class="kitchen-column">
+              <h3 class="kitchen-title">{escape(title)} ({len(orders)})</h3>
+              <div class="kitchen-orders">{body}</div>
+            </div>
             """
         )
 
@@ -2473,13 +2579,54 @@ def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
   <div class="section-head">
     <div>
       <h2>Kuchnia</h2>
-      <p class="subtitle">Owoce i warsztaty kulinarne wraz z godzinami startu.</p>
+      <p class="subtitle">Owoce, torty i warsztaty dla wybranego dnia.</p>
     </div>
-    <span class="count">{len(relevant)} zamówień</span>
+    <span class="count">{total_orders} zamówień</span>
+  </div>
+  <div class="kitchen-board">
+    {column("Owoce", fruit_orders)}
+    {column("Torty", cake_orders)}
+    {column("Warsztaty", workshop_orders)}
+  </div>
+</section>
+"""
+
+
+def render_organizer_view(rows: list[sqlite3.Row]) -> str:
+    active = [row for row in rows if row["status"] == "active"]
+    if not active:
+        return '<section><div class="empty">Brak aktywnych urodzin w wybranym dniu.</div></section>'
+
+    table_rows = []
+    for row in active:
+        notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
+        table_rows.append(
+            f"""
+            <tr>
+              <td>
+                <strong>{format_time(row["start_at"])} · {escape(row["birthday_child_name"])}, {escape(row["birthday_child_age"])} lat</strong>
+                <br><span class="muted">Rodzic: {escape(row["parent_name"])}</span>
+                <br><span class="muted">{escape(row["children_count"])} dzieci · {escape(row["adults_count"])} dorosłych</span>
+                {notes}
+              </td>
+              <td><strong>{escape(row["child_location"])}</strong><br><span class="muted">{escape(display_locations(row["adult_location"]))}</span></td>
+              <td>{service_pills(row)}</td>
+            </tr>
+            """
+        )
+
+    return f"""
+<section>
+  <div class="section-head">
+    <div>
+      <h2>Organizator urodzin</h2>
+      <p class="subtitle">Podgląd bankietów, lokalizacji i dodatków dla wybranego dnia.</p>
+    </div>
+    <span class="count">{len(active)} bankietów</span>
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Rezerwacja</th><th>Sala</th><th>Goście</th><th>Zamówienia</th><th>Uwagi</th></tr></thead>
+      <thead><tr><th>Bankiet</th><th>Miejsca</th><th>Dodatki</th></tr></thead>
       <tbody>{''.join(table_rows)}</tbody>
     </table>
   </div>
@@ -2490,10 +2637,10 @@ def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
 def render_role_view(role: str, rows: list[sqlite3.Row], day: str) -> str:
     if role == "animators":
         return render_animator_view(rows)
-    if role == "bakery":
-        return render_bakery_view(rows)
     if role == "kitchen":
         return render_kitchen_view(rows)
+    if role == "organizer":
+        return render_organizer_view(rows)
     return render_manager_view(rows, role, day)
 
 
@@ -2559,6 +2706,17 @@ def render_home(
     content = render_nav(role, day) + render_metrics(rows)
     if role == "manager":
         content += f"""
+<div class="layout">
+  <div class="stack">
+    {render_room_plan(values, errors)}
+  </div>
+  <div class="stack">
+    {render_role_view(role, rows, day)}
+  </div>
+</div>
+"""
+    elif role == "organizer":
+        content += f"""
 <div class="stack">
   {render_form(values, errors, role, day)}
 </div>
@@ -2570,7 +2728,6 @@ def render_home(
     {render_role_view(role, rows, day)}
   </div>
 </div>
-{render_schema_summary()}
 {room_plan_script()}
 """
     else:
@@ -2591,7 +2748,6 @@ def room_plan_script() -> str:
   if (!form) return;
 
   const dateInput = document.getElementById("reservation_date");
-  const idInput = document.getElementById("reservation_id");
   const statusSelect = document.getElementById("status");
   const cancellationReason = document.getElementById("cancellation_reason");
   const cancellationReasonField = document.getElementById("cancellation_reason_field");
@@ -2650,9 +2806,9 @@ def room_plan_script() -> str:
     const timeInput = option.querySelector("[data-time-input]");
     const extraInputs = Array.from(option.querySelectorAll(".service-extra select, .service-extra input"));
     const end = option.querySelector(".service-end");
-    if (!checkbox || !timeInput) return;
+    if (!checkbox) return;
 
-    timeInput.disabled = !checkbox.checked;
+    if (timeInput) timeInput.disabled = !checkbox.checked;
     extraInputs.forEach((input) => {
       input.disabled = !checkbox.checked;
     });
@@ -2660,6 +2816,7 @@ def room_plan_script() -> str:
       if (end) end.textContent = "";
       return;
     }
+    if (!timeInput) return;
 
     const duration = Number(timeInput.dataset.durationMinutes || 0);
     if (!duration || !timeInput.value) {
@@ -2686,7 +2843,6 @@ def room_plan_script() -> str:
     const params = new URLSearchParams({
       date: dateInput.value,
     });
-    if (idInput.value) params.set("exclude_id", idInput.value);
     fetch(`/api/availability?${params.toString()}`)
       .then((response) => response.ok ? response.json() : null)
       .then((payload) => {
@@ -2847,11 +3003,11 @@ def render_history_page(reservation_id: int, role: str, day: str) -> bytes:
     return page_template(content, role=role, day=day)
 
 
-def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length).decode("utf-8")
     parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values[-1] for key, values in parsed.items()}
+    return {key: values if key == "adult_location" else values[-1] for key, values in parsed.items()}
 
 
 def csv_response() -> bytes:
@@ -2904,7 +3060,7 @@ def csv_response() -> bytes:
                 row["birthday_child_name"],
                 row["birthday_child_age"],
                 row["child_location"],
-                row["adult_location"],
+                display_locations(row["adult_location"]),
                 "Tak" if is_enabled(row, "animation_enabled") else "Nie",
                 row["animation_type"] or "",
                 format_service_window(row["animation_at"], SERVICE_DURATIONS["animation_at"]),
