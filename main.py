@@ -3868,6 +3868,21 @@ def page_template(
       grid-template-columns: repeat(4, minmax(0, 1fr));
     }}
 
+    .category-fields.termin {{
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr) minmax(0, 0.9fr);
+      column-gap: 28px;
+      row-gap: 16px;
+    }}
+
+    .category-fields.termin > label {{
+      min-width: 0;
+    }}
+
+    .category-fields.termin input[type="date"],
+    .category-fields.termin input[name="party_start_time"] {{
+      min-width: 0;
+    }}
+
     .category-fields.services {{
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }}
@@ -5090,8 +5105,12 @@ def page_template(
         max-width: 96px;
       }}
 
-      .grid, .choice-grid, .form-board, .category-fields, .category-fields.services, .service-catalog, .reservation-details, .birthday-child-row, .kitchen-columns, .banquet-header, .location-forms {{
+      .grid, .choice-grid, .form-board, .category-fields, .category-fields.services, .category-fields.termin, .service-catalog, .reservation-details, .birthday-child-row, .kitchen-columns, .banquet-header, .location-forms {{
         grid-template-columns: 1fr;
+      }}
+
+      .category-fields.termin {{
+        row-gap: 18px;
       }}
 
       .role-board {{
@@ -6366,7 +6385,7 @@ def render_form(
     <div class="form-board">
       <div class="form-category">
         <h3 class="category-title">Termin</h3>
-        <div class="category-fields single">
+        <div class="category-fields single termin">
           <label>
             Data
             <input type="date" name="reservation_date" id="reservation_date" value="{escape(values.get("reservation_date", ""))}" required>
