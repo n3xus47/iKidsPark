@@ -8,7 +8,9 @@ Wewnętrzna aplikacja webowa do obsługi rezerwacji urodzinowych. Prototyp dzia�
 python3 main.py
 ```
 
-Aplikacja domyślnie działa pod adresem http://127.0.0.1:8000. Jeśli port 8000 jest zajęty, serwer automatycznie wybierze kolejny wolny port i wypisze go w terminalu.
+Aplikacja domyślnie działa pod adresem https://127.0.0.1:8000. Jeśli port 8000 jest zajęty, serwer automatycznie wybierze kolejny wolny port i wypisze go w terminalu.
+
+Przy pierwszym uruchomieniu aplikacja generuje lokalne CA `ikids-local-ca.crt` / `ikids-local-ca.key` oraz certyfikat serwera `ikids-local.crt` / `ikids-local.key`. Na telefonie trzeba zainstalować i zaufać certyfikatowi CA `ikids-local-ca.crt`; inaczej przeglądarka pokaże `ERR_CERT_AUTHORITY_INVALID` i może blokować instalację PWA. CA można pobrać z telefonu pod adresem `https://<IP-komputera>:8000/ca.crt`. Tryb HTTP można wymusić poleceniem `IKIDS_HTTP=1 python3 main.py`.
 
 ## Zakres
 

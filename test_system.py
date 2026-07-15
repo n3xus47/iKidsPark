@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -13,7 +15,8 @@ from datetime import date
 sys.path.insert(0, str(__file__).replace("test_system.py", ""))
 import main  # noqa: E402
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("IKIDS_TEST_BASE", "https://127.0.0.1:8000")
+HTTPS_CONTEXT = ssl._create_unverified_context() if BASE.startswith("https://") else None
 
 PASS = 0
 FAIL = 0
@@ -42,7 +45,7 @@ def fail(name: str, detail: str = "") -> None:
 
 def http_get(path: str) -> tuple[int, bytes, dict[str, str]]:
     req = urllib.request.Request(f"{BASE}{path}")
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=HTTPS_CONTEXT) as resp:
         return resp.status, resp.read(), dict(resp.headers)
 
 
@@ -54,7 +57,7 @@ def http_post(path: str, data: dict, query: str = "") -> tuple[int, str, dict[st
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=HTTPS_CONTEXT) as resp:
             return resp.status, resp.geturl(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", errors="replace"), dict(exc.headers)
@@ -123,10 +126,10 @@ def base_reservation(
 
 
 RESERVATIONS_PLAN = [
-    # Uwaga: id=1 w DB zajmuje 3. Wróżki 17.07 14:00 — unikamy tej sali i stolików Trójkąt 52-55
-    ("2026-07-17", "1. Biały Dom", "Bar - Stolik 7", "10:00", "Ola Testowa", "Anna Kowalska"),
+    # Seed 17.07: Wiktoria→3.Wróżki, Klara→1.Biały Dom + 6.Football/Scena30 — używamy wolnych sal/stolików
+    ("2026-07-17", "5. Zima", "Bar - Stolik 7", "10:00", "Ola Testowa", "Anna Kowalska"),
     ("2026-07-17", "2. Magiczny Las", "Bar - Stolik 8", "12:00", "Kuba Testowy", "Piotr Nowak", {"animation": True, "animation_at": "12:30"}),
-    ("2026-07-17", "4. Kosmos", "Scena - Stolik 30", "14:00", "Zosia Testowa", "Maria Wiśniewska", {"cake": True, "cake_at": "15:00"}),
+    ("2026-07-17", "4. Kosmos", "Scena - Stolik 18", "14:00", "Zosia Testowa", "Maria Wiśniewska", {"cake": True, "cake_at": "15:00"}),
     ("2026-07-18", "4. Kosmos", "Trójkąt - Stolik 41", "10:00", "Filip Testowy", "Jan Zieliński"),
     ("2026-07-18", "5. Zima", "Labirynt - Stolik 58", "12:00", "Maja Testowa", "Ewa Dąbrowska", {"workshops": True, "workshops_at": "13:00"}),
     ("2026-07-18", "6. Football", "Pozostałe stoliki - Stolik 15", "15:00", "Tomek Testowy", "Adam Lewandowski", {"pinata": True, "pinata_at": "16:00"}),
@@ -408,7 +411,7 @@ def test_edit_and_cancel() -> None:
     data["id"] = str(edit_id)
     data["notes"] = "Zaktualizowano w teście"
     data["children_count"] = "15"
-    status, response, _ = http_post("/reservations", data, "role=manager")
+    status, response, _ = http_post("/reservations", data, "role=organizer")
     if status in (200, 303):
         updated = main.get_reservation(edit_id)
         if updated and updated["children_count"] == 15 and "Zaktualizowano" in updated["notes"]:
@@ -432,7 +435,7 @@ def test_edit_and_cancel() -> None:
         data["id"] = str(cancel_id)
         data["status"] = "cancelled"
         data["cancellation_reason"] = "Test anulowania"
-        status, response, _ = http_post("/reservations", data, "role=manager")
+        status, response, _ = http_post("/reservations", data, "role=organizer")
         if status in (200, 303):
             cancelled = main.get_reservation(cancel_id)
             if cancelled and cancelled["status"] == "cancelled":
@@ -512,7 +515,7 @@ def test_delete_reservation() -> None:
         return
 
     del_id = created_ids.pop()
-    status, response, _ = http_post("/delete", {"id": str(del_id)}, "role=manager&day=2026-07-19")
+    status, response, _ = http_post("/delete", {"id": str(del_id)}, "role=organizer&day=2026-07-19")
     if status in (200, 303) and "usunięta" in response or status in (200, 303):
         if main.get_reservation(del_id) is None:
             ok(f"Usunięcie id={del_id}")
@@ -522,7 +525,7 @@ def test_delete_reservation() -> None:
         fail(f"Usunięcie id={del_id}", f"status={status}")
 
     # Usuwanie nieistniejącej
-    status, response, _ = http_post("/delete", {"id": "999999"}, "role=manager")
+    status, response, _ = http_post("/delete", {"id": "999999"}, "role=organizer")
     if status in (200, 303):
         ok("Usuwanie nieistniejącej — przekierowanie z komunikatem")
     else:

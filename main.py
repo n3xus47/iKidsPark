@@ -5,7 +5,15 @@ import errno
 import html
 import io
 import json
+import os
+import socket
 import sqlite3
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import zlib
 from datetime import date, datetime, time, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,10 +22,32 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
+APP_SHORT_TITLE = "iKids Park"
+PWA_CACHE_NAME = "ikidspark-pwa-v5"
+PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
 DB_PATH = Path(__file__).with_name("reservations.db")
-LOGO_PATH = Path(__file__).with_name("logo ikids.png")
+LOGO_PATH = Path(__file__).with_name("logo.png")
+MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
+SOURCE_PATH = Path(__file__)
+SOURCE_MTIME = SOURCE_PATH.stat().st_mtime
+CA_CERT_PATH = Path(__file__).with_name("ikids-local-ca.crt")
+CA_KEY_PATH = Path(__file__).with_name("ikids-local-ca.key")
+CERT_PATH = Path(__file__).with_name("ikids-local.crt")
+KEY_PATH = Path(__file__).with_name("ikids-local.key")
 HOST = "0.0.0.0"
 PORT = 8000
+
+
+def logo_asset_url() -> str:
+    if LOGO_PATH.exists():
+        return f"/logo.png?v={int(LOGO_PATH.stat().st_mtime)}"
+    return "/logo.png"
+
+
+def menu_logo_asset_url() -> str:
+    if MENU_LOGO_PATH.exists():
+        return f"/menu-logo.png?v={int(MENU_LOGO_PATH.stat().st_mtime)}"
+    return logo_asset_url()
 
 PARTY_ROOMS = [
     "1. Biały Dom",
@@ -164,8 +194,8 @@ LEGACY_ADULT_LOCATION_RENAMES = {
 
 ROLE_DEFS = {
     "manager": {
-        "label": "Kierownik zmiany / Recepcja",
-        "hint": "Pełny widok, edycja, statusy i dostępność sal.",
+        "label": "Kierownik i recepcja",
+        "hint": "Podgląd rezerwacji, statusów i dostępności sal.",
     },
     "animators": {
         "label": "Animatorzy",
@@ -177,7 +207,7 @@ ROLE_DEFS = {
     },
     "organizer": {
         "label": "Organizator urodzin",
-        "hint": "Podgląd bankietów, lokalizacji i dodatków.",
+        "hint": "Pełny panel: nowe rezerwacje, edycja i usuwanie.",
     },
 }
 
@@ -188,6 +218,70 @@ DAY_FILTERS = {
 }
 
 WEEKDAY_LABELS = ("Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Ndz")
+WEEKDAY_FULL_LABELS = ("poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela")
+MONTH_FULL_LABELS = (
+    "stycznia",
+    "lutego",
+    "marca",
+    "kwietnia",
+    "maja",
+    "czerwca",
+    "lipca",
+    "sierpnia",
+    "września",
+    "października",
+    "listopada",
+    "grudnia",
+)
+
+MONTH_STANDALONE_LABELS = (
+    "styczeń",
+    "luty",
+    "marzec",
+    "kwiecień",
+    "maj",
+    "czerwiec",
+    "lipiec",
+    "sierpień",
+    "wrzesień",
+    "październik",
+    "listopad",
+    "grudzień",
+)
+
+
+def week_month_label(week_days: list[date]) -> str:
+    month_counts: dict[int, int] = {}
+    for week_day in week_days:
+        month_counts[week_day.month] = month_counts.get(week_day.month, 0) + 1
+    dominant_month = max(month_counts, key=month_counts.get)
+    return MONTH_STANDALONE_LABELS[dominant_month - 1]
+
+
+def week_year_label(week_days: list[date]) -> int:
+    year_counts: dict[int, int] = {}
+    for week_day in week_days:
+        year_counts[week_day.year] = year_counts.get(week_day.year, 0) + 1
+    return max(year_counts, key=year_counts.get)
+
+
+ROLE_NAV_ICONS = {
+    "manager": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16M7 4h10a2 2 0 0 1 2 2v13H5V6a2 2 0 0 1 2-2Z"/><path d="M8 10h3M8 14h3M14 10h2M14 14h2"/></svg>""",
+    "animators": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.2 4.5 5 .7-3.6 3.5.9 5-4.5-2.4-4.5 2.4.9-5-3.6-3.5 5-.7L12 3Z"/><path d="M5 20h14"/></svg>""",
+    "kitchen": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v8M11 3v8M7 7h4M9 11v10"/><path d="M16 3v18M16 3c2 1.5 3 3.3 3 5.5S18 12 16 12"/></svg>""",
+    "organizer": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10a2 2 0 0 1 2 2v14H5V6a2 2 0 0 1 2-2Z"/><path d="M9 4V2M15 4V2M8 9h8M8 13h5M8 17h7"/></svg>""",
+}
+
+WAITERS = (
+    "Anna Kowalska",
+    "Jan Nowak",
+    "Katarzyna Wiśniewska",
+    "Piotr Wójcik",
+    "Magdalena Kamińska",
+    "Tomasz Lewandowski",
+    "Aleksandra Zielińska",
+    "Michał Szymański",
+)
 
 SERVICE_OVERLAP_MESSAGE = "Godziny dodatków w tej rezerwacji nie mogą się nakładać."
 
@@ -212,6 +306,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -253,8 +348,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
             mascot_enabled INTEGER NOT NULL DEFAULT 0,
             mascot_type TEXT,
             mascot_at TEXT,
+            balloons_enabled INTEGER NOT NULL DEFAULT 0,
+            balloons_description TEXT,
+            balloons_at TEXT,
             attraction_at TEXT,
             notes TEXT NOT NULL DEFAULT '',
+            assigned_waiter TEXT,
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
             cancellation_reason TEXT,
             created_at TEXT NOT NULL,
@@ -385,6 +484,12 @@ def ensure_current_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reservations ADD COLUMN mascot_type TEXT")
     if "mascot_at" not in columns:
         conn.execute("ALTER TABLE reservations ADD COLUMN mascot_at TEXT")
+    if "balloons_enabled" not in columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN balloons_enabled INTEGER NOT NULL DEFAULT 0")
+    if "balloons_description" not in columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN balloons_description TEXT")
+    if "balloons_at" not in columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN balloons_at TEXT")
     if "birthday_children_json" not in columns:
         conn.execute("ALTER TABLE reservations ADD COLUMN birthday_children_json TEXT")
         conn.execute(
@@ -397,6 +502,8 @@ def ensure_current_schema(conn: sqlite3.Connection) -> None:
               AND birthday_child_name IS NOT NULL
             """
         )
+    if "assigned_waiter" not in columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN assigned_waiter TEXT")
 
     conn.execute(
         """
@@ -458,6 +565,20 @@ def normalize_role(role: str | None) -> str:
     return role if role in ROLE_DEFS else "manager"
 
 
+def normalize_page_role(role: str | None) -> str:
+    if role == "home":
+        return "home"
+    return normalize_role(role)
+
+
+def can_modify_reservations(role: str) -> bool:
+    return normalize_role(role) == "organizer"
+
+
+def can_assign_waiter(role: str) -> bool:
+    return normalize_role(role) == "manager"
+
+
 def normalize_day(day: str | None) -> str:
     if not day:
         return "today"
@@ -483,6 +604,24 @@ def week_start(target_day: date) -> date:
 def week_dates(target_day: date) -> list[date]:
     start = week_start(target_day)
     return [start + timedelta(days=offset) for offset in range(7)]
+
+
+def calendar_week_pages(anchor_day: date, year: int | None = None) -> list[tuple[int, list[date]]]:
+    anchor_year = year or anchor_day.year
+    year_start = date(anchor_year, 1, 1)
+    year_end = date(anchor_year, 12, 31)
+    pages: list[tuple[int, list[date]]] = []
+    for offset in range(-52, 53):
+        center = anchor_day + timedelta(days=7 * offset)
+        days = [center + timedelta(days=delta) for delta in range(-3, 4)]
+        if all(year_start <= day <= year_end for day in days):
+            pages.append((offset, days))
+    return pages
+
+
+def week_page_offset_for_day(anchor_day: date, target_day: date) -> int:
+    delta = (target_day - anchor_day).days
+    return (delta + 3) // 7
 
 
 def day_query(target_day: date) -> str:
@@ -870,6 +1009,7 @@ def validate_reservation(
     culinary_workshops_enabled = checked_bool(data, "culinary_workshops_enabled")
     pinata_enabled = checked_bool(data, "pinata_enabled")
     mascot_enabled = checked_bool(data, "mascot_enabled")
+    balloons_enabled = checked_bool(data, "balloons_enabled")
 
     animation_type = data.get("animation_type", "").strip()
     if animation_enabled and animation_type not in ANIMATION_TYPES:
@@ -905,10 +1045,17 @@ def validate_reservation(
     if not mascot_enabled:
         mascot_type = ""
 
+    balloons_description = data.get("balloons_description", "").strip()
+    if balloons_enabled and not balloons_description:
+        balloons_description = "(brak)"
+    if not balloons_enabled:
+        balloons_description = ""
+
     animation_time = parse_time_field(data, errors, "animation_at", "Start animacji", bool(animation_enabled))
     cake_time = parse_time_field(data, errors, "cake_at", "Start tortu", bool(cake_enabled))
     fruit_time = party_start_time
     drinks_time = None
+    balloons_time = party_start_time
     workshops_time = parse_time_field(
         data,
         errors,
@@ -1007,6 +1154,9 @@ def validate_reservation(
         "mascot_enabled": mascot_enabled,
         "mascot_type": mascot_type or None,
         "mascot_at": combine_day_time(reservation_day, mascot_time) if mascot_enabled else None,
+        "balloons_enabled": balloons_enabled,
+        "balloons_description": balloons_description or None,
+        "balloons_at": combine_day_time(reservation_day, balloons_time) if balloons_enabled else None,
         "attraction_at": None,
         "notes": data.get("notes", "").strip(),
         "status": status,
@@ -1086,6 +1236,9 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["mascot_enabled"],
         values["mascot_type"],
         values["mascot_at"],
+        values["balloons_enabled"],
+        values["balloons_description"],
+        values["balloons_at"],
         values["attraction_at"],
         values["notes"],
         values["status"],
@@ -1107,7 +1260,9 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
                 drinks_enabled = ?, drinks_at = ?, culinary_workshops_enabled = ?,
                 culinary_workshops_type = ?, culinary_workshops_at = ?,
                 pinata_enabled = ?, pinata_theme = ?, pinata_at = ?,
-                mascot_enabled = ?, mascot_type = ?, mascot_at = ?, attraction_at = ?,
+                mascot_enabled = ?, mascot_type = ?, mascot_at = ?,
+                balloons_enabled = ?, balloons_description = ?, balloons_at = ?,
+                attraction_at = ?,
                 notes = ?, status = ?, cancellation_reason = ?,
                 updated_at = ?
             WHERE id = ?
@@ -1129,11 +1284,13 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
             culinary_workshops_enabled, culinary_workshops_type, culinary_workshops_at,
             pinata_enabled, pinata_theme, pinata_at,
-            mascot_enabled, mascot_type, mascot_at, attraction_at,
+            mascot_enabled, mascot_type, mascot_at,
+            balloons_enabled, balloons_description, balloons_at,
+            attraction_at,
             notes, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -1141,6 +1298,28 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
     if row:
         record_history(new_id, "created", role, row)
     return new_id
+
+
+def assign_waiter(reservation_id: int, waiter: str | None, role: str) -> bool:
+    row = get_reservation(reservation_id)
+    if row is None:
+        return False
+
+    waiter_value = waiter.strip() if waiter and waiter.strip() else None
+    if waiter_value is not None and waiter_value not in WAITERS:
+        return False
+
+    execute(
+        "UPDATE reservations SET assigned_waiter = ?, updated_at = ? WHERE id = ?",
+        (waiter_value, now_iso(), reservation_id),
+    )
+    updated = get_reservation(reservation_id)
+    if updated is None:
+        return False
+
+    action = "waiter_assigned" if waiter_value else "waiter_removed"
+    record_history(reservation_id, action, role, updated)
+    return True
 
 
 def delete_reservation(reservation_id: int) -> bool:
@@ -1297,6 +1476,693 @@ def link_for(role: str, day: str, **extra: object) -> str:
     return "/?" + urlencode(params)
 
 
+def date_title(target_day: date) -> str:
+    return (
+        f"{WEEKDAY_FULL_LABELS[target_day.weekday()]}, "
+        f"{target_day.day:02d} {MONTH_FULL_LABELS[target_day.month - 1]}"
+    )
+
+
+def app_icon_svg() -> bytes:
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="104" fill="#139bd7"/>
+  <circle cx="394" cy="118" r="78" fill="#f58212"/>
+  <circle cx="116" cy="382" r="62" fill="#7a9a12"/>
+  <rect x="86" y="174" width="340" height="190" rx="38" fill="#ffffff"/>
+  <text x="256" y="268" text-anchor="middle" font-family="Arial, sans-serif" font-size="74" font-weight="900" fill="#0b78ad">iKids</text>
+  <text x="256" y="324" text-anchor="middle" font-family="Arial, sans-serif" font-size="44" font-weight="900" fill="#f58212">Park</text>
+</svg>""".encode("utf-8")
+
+
+def app_icon_png(size: int = 512) -> bytes:
+    width = height = size
+    scale = size / 512
+
+    def in_circle(x: int, y: int, cx: float, cy: float, radius: float) -> bool:
+        return (x - cx) ** 2 + (y - cy) ** 2 <= radius**2
+
+    def in_rounded_rect(x: int, y: int, left: float, top: float, right: float, bottom: float, radius: float) -> bool:
+        if left + radius <= x <= right - radius and top <= y <= bottom:
+            return True
+        if left <= x <= right and top + radius <= y <= bottom - radius:
+            return True
+        corners = (
+            (left + radius, top + radius),
+            (right - radius, top + radius),
+            (left + radius, bottom - radius),
+            (right - radius, bottom - radius),
+        )
+        return any(in_circle(x, y, cx, cy, radius) for cx, cy in corners)
+
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            ux = x / scale
+            uy = y / scale
+            color = (19, 155, 215, 255)
+            if in_circle(ux, uy, 394, 118, 78):
+                color = (245, 130, 18, 255)
+            if in_circle(ux, uy, 116, 382, 62):
+                color = (122, 154, 18, 255)
+            if in_rounded_rect(ux, uy, 86, 174, 426, 364, 38):
+                color = (255, 255, 255, 255)
+            if in_rounded_rect(ux, uy, 142, 218, 182, 326, 10):
+                color = (11, 120, 173, 255)
+            if in_circle(ux, uy, 162, 194, 20):
+                color = (245, 130, 18, 255)
+            if in_rounded_rect(ux, uy, 214, 224, 370, 266, 12):
+                color = (11, 120, 173, 255)
+            if in_rounded_rect(ux, uy, 214, 290, 346, 326, 12):
+                color = (245, 130, 18, 255)
+            rows.extend(color)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    raw = bytes(rows)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, level=9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def manifest_response() -> bytes:
+    manifest = {
+        "name": APP_TITLE,
+        "short_name": APP_SHORT_TITLE,
+        "description": "Panel rezerwacji urodzin i atrakcji iKids Park.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait-primary",
+        "background_color": "#b4b4b4",
+        "theme_color": "#ffffff",
+        "icons": [
+            {
+                "src": f"/app-icon-{size}.png",
+                "sizes": f"{size}x{size}",
+                "type": "image/png",
+                "purpose": "any maskable",
+            }
+            for size in PWA_ICON_SIZES
+        ] + [
+            {
+                "src": "/app-icon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml",
+                "purpose": "any maskable",
+            },
+            {
+                "src": logo_asset_url(),
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any",
+            },
+        ],
+        "categories": ["business", "productivity"],
+        "lang": "pl",
+        "dir": "ltr",
+    }
+    return json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def service_worker_response() -> bytes:
+    icon_assets = ",\n  ".join(json.dumps(f"/app-icon-{size}.png") for size in PWA_ICON_SIZES)
+    payload = """const IKIDS_CACHE = "__CACHE_NAME__";
+const STATIC_ASSETS = [
+  "/",
+  "/offline",
+  "/app-icon.svg",
+  "/favicon.ico",
+  "/manifest.webmanifest",
+  "/static/manifest.json",
+  __ICON_ASSETS__
+];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(IKIDS_CACHE)
+      .then((cache) => cache.addAll(STATIC_ASSETS))
+      .catch(() => undefined)
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => Promise.all(
+      keys.filter((key) => key !== IKIDS_CACHE).map((key) => caches.delete(key))
+    ))
+  );
+  self.clients.claim();
+});
+
+self.addEventListener("fetch", (event) => {
+  if (event.request.method !== "GET") return;
+
+  const requestUrl = new URL(event.request.url);
+  if (event.request.mode === "navigate") {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy));
+          return response;
+        })
+        .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/offline")))
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
+      if (!response || response.status !== 200 || response.type !== "basic") return response;
+      const copy = response.clone();
+      caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy));
+      return response;
+    }))
+  );
+});
+"""
+    payload = payload.replace("__CACHE_NAME__", PWA_CACHE_NAME).replace("__ICON_ASSETS__", icon_assets)
+    return payload.encode("utf-8")
+
+
+def offline_response() -> bytes:
+    return f"""<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff" media="(max-width: 640px)">
+  <meta name="theme-color" content="#139bd7" media="(min-width: 641px)">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/app-icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192.png">
+  <title>{APP_SHORT_TITLE} offline</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #000;
+      background: #b4b4b4;
+    }}
+    main {{
+      max-width: 460px;
+      border: 1px solid #dddddd;
+      background: #ffffff;
+      padding: 24px;
+      border-radius: 8px;
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 1.35rem;
+    }}
+    p {{
+      margin: 0;
+      color: #555555;
+      line-height: 1.5;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Brak połączenia</h1>
+    <p>System iKids Park jest zainstalowany jako PWA. Wróć do aplikacji po odzyskaniu połączenia z serwerem.</p>
+  </main>
+</body>
+</html>""".encode("utf-8")
+
+
+def pwa_install_script() -> str:
+    return """
+  <script>
+    (() => {
+      const installButton = document.querySelector("[data-install-app]");
+      if (!installButton) return;
+
+      let deferredPrompt = null;
+      const standaloneQuery = window.matchMedia("(display-mode: standalone)");
+
+      function isStandalone() {
+        return standaloneQuery.matches || window.navigator.standalone === true;
+      }
+
+      function updateButton() {
+        installButton.hidden = isStandalone();
+      }
+
+      window.addEventListener("beforeinstallprompt", (event) => {
+        event.preventDefault();
+        deferredPrompt = event;
+        updateButton();
+      });
+
+      installButton.addEventListener("click", async () => {
+        if (isStandalone()) return;
+
+        if (deferredPrompt) {
+          deferredPrompt.prompt();
+          await deferredPrompt.userChoice.catch(() => undefined);
+          deferredPrompt = null;
+          updateButton();
+          return;
+        }
+
+        const isAppleMobile = /iphone|ipad|ipod/i.test(window.navigator.userAgent);
+        if (isAppleMobile) {
+          window.alert("Aby zainstalować aplikację: Udostępnij -> Dodaj do ekranu początkowego.");
+          return;
+        }
+
+        if (!window.isSecureContext) {
+          window.alert("Automatyczna instalacja jest blokowana na lokalnym adresie HTTP. W Chrome użyj menu z trzema kropkami i wybierz: Dodaj do ekranu głównego.");
+          return;
+        }
+
+        window.alert("Jeśli instalacja nie pojawi się automatycznie, użyj opcji przeglądarki: Zainstaluj aplikację lub Dodaj do ekranu głównego.");
+      });
+
+      if ("serviceWorker" in navigator && window.isSecureContext) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+        });
+      }
+
+      standaloneQuery.addEventListener?.("change", updateButton);
+      updateButton();
+    })();
+  </script>
+"""
+
+
+def date_navigation_script() -> str:
+    return """
+  <script>
+    (() => {
+      function initDateNavigation() {
+      const strip = document.querySelector("[data-date-strip]");
+      if (!strip) return;
+      if (strip.dataset.dateNavReady === "true") return;
+      strip.dataset.dateNavReady = "true";
+
+      const weeks = () => [...strip.querySelectorAll(".date-week")];
+
+      function scrollToWeek(week, behavior = "auto") {
+        if (!week) return;
+        strip.scrollTo({ left: week.offsetLeft, behavior });
+      }
+
+      function snapToNearestWeek() {
+        const pages = weeks();
+        if (!pages.length) return;
+        const targetLeft = strip.scrollLeft;
+        const nearest = pages.reduce((best, week) => {
+          const distance = Math.abs(week.offsetLeft - targetLeft);
+          return distance < best.distance ? { week, distance } : best;
+        }, { week: pages[0], distance: Number.POSITIVE_INFINITY }).week;
+        scrollToWeek(nearest);
+      }
+
+      let initialScroll = true;
+      let stripUserActive = false;
+      let scrollIdleTimer = 0;
+
+      function applyInitialWeek() {
+        const activeWeek = document.querySelector("[data-active-week]")
+          || document.querySelector("[data-default-week]");
+        scrollToWeek(activeWeek);
+        window.setTimeout(() => {
+          initialScroll = false;
+          hideMonthLabel();
+        }, 150);
+      }
+
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(applyInitialWeek);
+      });
+
+      if ("onscrollend" in strip) {
+        strip.addEventListener("scrollend", () => {
+          if (initialScroll) return;
+          snapToNearestWeek();
+          if (stripUserActive) {
+            endStripInteraction();
+          }
+        });
+      }
+
+      let dragActive = false;
+      let dragMoved = false;
+      let suppressClick = false;
+      let startX = 0;
+      let startScrollLeft = 0;
+
+      strip.addEventListener("dragstart", (event) => {
+        event.preventDefault();
+      });
+
+      strip.addEventListener("mousedown", (event) => {
+        if (event.button !== 0) return;
+        dragActive = true;
+        dragMoved = false;
+        suppressClick = false;
+        startX = event.pageX;
+        startScrollLeft = strip.scrollLeft;
+      });
+
+      window.addEventListener("mousemove", (event) => {
+        if (!dragActive) return;
+        const delta = event.pageX - startX;
+        if (!dragMoved && Math.abs(delta) > 5) {
+          dragMoved = true;
+          suppressClick = true;
+          strip.classList.add("is-dragging");
+          beginStripInteraction();
+        }
+        if (!dragMoved) return;
+        event.preventDefault();
+        strip.scrollLeft = startScrollLeft - delta;
+        updateMonthLabel();
+      });
+
+      const endDrag = () => {
+        if (!dragActive) return;
+        dragActive = false;
+        strip.classList.remove("is-dragging");
+        if (dragMoved) {
+          snapToNearestWeek();
+          updateMonthLabel();
+          endStripInteraction();
+        }
+        dragMoved = false;
+      };
+
+      window.addEventListener("mouseup", endDrag);
+
+      strip.addEventListener("click", (event) => {
+        if (!suppressClick) return;
+        event.preventDefault();
+        event.stopPropagation();
+        suppressClick = false;
+      }, true);
+
+      let touchStartX = 0;
+      let touchStartY = 0;
+      let touchMoved = false;
+
+      strip.addEventListener("touchstart", (event) => {
+        if (!event.touches.length) return;
+        const touch = event.touches[0];
+        touchStartX = touch.clientX;
+        touchStartY = touch.clientY;
+        touchMoved = false;
+      }, { passive: true });
+
+      strip.addEventListener("touchmove", (event) => {
+        if (!event.touches.length) return;
+        const touch = event.touches[0];
+        const deltaX = Math.abs(touch.clientX - touchStartX);
+        const deltaY = Math.abs(touch.clientY - touchStartY);
+        if (deltaX > 10 && deltaX > deltaY) {
+          touchMoved = true;
+          beginStripInteraction();
+        }
+      }, { passive: true });
+
+      strip.addEventListener("touchend", (event) => {
+        if (touchMoved) return;
+        const link = event.target.closest("a.date-day");
+        if (!link) return;
+        event.preventDefault();
+        if (window.IKIDSNavigate?.(link.href)) return;
+        window.location.assign(link.href);
+      });
+
+      const monthLabel = document.querySelector("[data-date-month-label]");
+
+      function nearestWeek() {
+        const pages = weeks();
+        if (!pages.length) return null;
+        const targetLeft = strip.scrollLeft;
+        return pages.reduce((best, week) => {
+          const distance = Math.abs(week.offsetLeft - targetLeft);
+          return distance < best.distance ? { week, distance } : best;
+        }, { week: pages[0], distance: Number.POSITIVE_INFINITY }).week;
+      }
+
+      function updateMonthLabel() {
+        if (!monthLabel) return;
+        const week = nearestWeek();
+        const month = week?.dataset.monthLabel;
+        const year = week?.dataset.yearLabel;
+        if (month && year) {
+          monthLabel.textContent = `${month} ${year}`;
+        }
+      }
+
+      function showMonthLabel() {
+        if (!monthLabel) return;
+        monthLabel.classList.add("is-visible");
+        monthLabel.setAttribute("aria-hidden", "false");
+      }
+
+      function hideMonthLabel() {
+        if (!monthLabel) return;
+        monthLabel.classList.remove("is-visible");
+        monthLabel.setAttribute("aria-hidden", "true");
+      }
+
+      function beginStripInteraction() {
+        if (initialScroll) return;
+        stripUserActive = true;
+        showMonthLabel();
+        updateMonthLabel();
+      }
+
+      function endStripInteraction() {
+        stripUserActive = false;
+        hideMonthLabel();
+      }
+
+      hideMonthLabel();
+
+      strip.addEventListener("scroll", () => {
+        if (!stripUserActive) return;
+        updateMonthLabel();
+        if (!("onscrollend" in strip)) {
+          window.clearTimeout(scrollIdleTimer);
+          scrollIdleTimer = window.setTimeout(() => {
+            snapToNearestWeek();
+            endStripInteraction();
+          }, 120);
+        }
+      }, { passive: true });
+      }
+
+      window.IKIDSInitDateNavigation = initDateNavigation;
+      initDateNavigation();
+    })();
+</script>
+"""
+
+
+def fast_navigation_script() -> str:
+    return """
+  <script>
+    (() => {
+      if (!window.fetch || !window.DOMParser || !window.history?.pushState) return;
+
+      const allowedPaths = new Set(["/", "/schema", "/history"]);
+      const pageCache = new Map();
+      const maxCachedPages = 18;
+      const pageCacheTtlMs = 12000;
+      let navigationToken = 0;
+      let prefetchTimer = 0;
+
+      function toUrl(href) {
+        try {
+          return new URL(href, window.location.href);
+        } catch {
+          return null;
+        }
+      }
+
+      function isRouteUrl(url) {
+        return url
+          && url.origin === window.location.origin
+          && allowedPaths.has(url.pathname);
+      }
+
+      function isPlainNavigation(event, link) {
+        if (!link || link.download || link.target && link.target !== "_self") return false;
+        if (event && (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) {
+          return false;
+        }
+        return isRouteUrl(toUrl(link.href));
+      }
+
+      function rememberPage(url, html) {
+        const key = url.href;
+        if (pageCache.has(key)) pageCache.delete(key);
+        pageCache.set(key, { html, createdAt: performance.now() });
+        while (pageCache.size > maxCachedPages) {
+          pageCache.delete(pageCache.keys().next().value);
+        }
+      }
+
+      async function fetchPage(url) {
+        const key = url.href;
+        const cached = pageCache.get(key);
+        if (cached && performance.now() - cached.createdAt < pageCacheTtlMs) return cached.html;
+        if (cached) pageCache.delete(key);
+        const response = await fetch(key, {
+          credentials: "same-origin",
+          headers: { "X-IKids-Navigation": "1" },
+        });
+        const contentType = response.headers.get("content-type") || "";
+        if (!response.ok || !contentType.includes("text/html")) {
+          throw new Error("Navigation response was not HTML.");
+        }
+        const html = await response.text();
+        rememberPage(url, html);
+        return html;
+      }
+
+      function executeInsertedScripts(container) {
+        container.querySelectorAll("script").forEach((oldScript) => {
+          const script = document.createElement("script");
+          Array.from(oldScript.attributes).forEach((attribute) => {
+            script.setAttribute(attribute.name, attribute.value);
+          });
+          script.textContent = oldScript.textContent;
+          oldScript.replaceWith(script);
+        });
+      }
+
+      function updateContext(url) {
+        const params = url.searchParams;
+        window.IKIDS_CONTEXT = {
+          role: params.get("role") || "manager",
+          day: params.get("day") || "today",
+        };
+      }
+
+      function applyPage(html, url, options = {}) {
+        const nextDocument = new DOMParser().parseFromString(html, "text/html");
+        const nextMain = nextDocument.querySelector("main");
+        const currentMain = document.querySelector("main");
+        if (!nextMain || !currentMain) {
+          window.location.assign(url.href);
+          return;
+        }
+
+        document.title = nextDocument.title || document.title;
+        document.body.className = nextDocument.body.className;
+        currentMain.replaceWith(document.importNode(nextMain, true));
+        updateContext(url);
+        executeInsertedScripts(document.querySelector("main"));
+        window.IKIDSInitDateNavigation?.();
+
+        if (options.history !== "none") {
+          window.history.pushState({}, "", url.href);
+        }
+        if (options.scroll !== false) {
+          window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+        }
+        schedulePrefetch();
+      }
+
+      async function navigate(href, options = {}) {
+        const url = toUrl(href);
+        if (!isRouteUrl(url)) return false;
+        if (url.href === window.location.href && options.history !== "none") return true;
+
+        const token = ++navigationToken;
+        document.documentElement.classList.add("is-fast-navigating");
+        document.querySelector("main")?.setAttribute("aria-busy", "true");
+        try {
+          const html = await fetchPage(url);
+          if (token !== navigationToken) return true;
+          applyPage(html, url, options);
+          return true;
+        } catch {
+          window.location.assign(url.href);
+          return true;
+        } finally {
+          if (token === navigationToken) {
+            document.documentElement.classList.remove("is-fast-navigating");
+            document.querySelector("main")?.removeAttribute("aria-busy");
+          }
+        }
+      }
+
+      function prefetch(href) {
+        const url = toUrl(href);
+        if (!isRouteUrl(url) || pageCache.has(url.href) || url.href === window.location.href) return;
+        fetchPage(url).catch(() => {});
+      }
+
+      function schedulePrefetch() {
+        window.clearTimeout(prefetchTimer);
+        prefetchTimer = window.setTimeout(() => {
+          const links = Array.from(document.querySelectorAll(".tabs a[href], .date-day[href], .organizer-tools a[href], .timeline-card a[href]"))
+            .filter((link) => isRouteUrl(toUrl(link.href)))
+            .slice(0, 14);
+          const run = () => links.forEach((link) => prefetch(link.href));
+          if ("requestIdleCallback" in window) window.requestIdleCallback(run, { timeout: 1200 });
+          else window.setTimeout(run, 250);
+        }, 180);
+      }
+
+      window.IKIDSNavigate = (href, options) => {
+        navigate(href, options);
+        return true;
+      };
+
+      document.addEventListener("click", (event) => {
+        const link = event.target.closest("a[href]");
+        if (!isPlainNavigation(event, link)) return;
+        event.preventDefault();
+        navigate(link.href);
+      });
+
+      document.addEventListener("pointerover", (event) => {
+        const link = event.target.closest("a[href]");
+        if (isRouteUrl(toUrl(link?.href))) prefetch(link.href);
+      }, { passive: true });
+
+      document.addEventListener("touchstart", (event) => {
+        const link = event.target.closest("a[href]");
+        if (isRouteUrl(toUrl(link?.href))) prefetch(link.href);
+      }, { passive: true });
+
+      window.addEventListener("popstate", () => {
+        navigate(window.location.href, { history: "none", scroll: false });
+      });
+
+      schedulePrefetch();
+    })();
+  </script>
+"""
+
+
 def page_template(
     content: str,
     message: str = "",
@@ -1311,38 +2177,98 @@ def page_template(
     elif errors:
         alert = '<div class="alert error">Popraw zaznaczone pola formularza.</div>'
 
+    page_role = normalize_page_role(role)
     role = normalize_role(role)
     day = normalize_day(day)
+    logo_src = logo_asset_url()
+    body_class = ' class="page-home"' if page_role == "home" else ""
 
     document = f"""<!doctype html>
 <html lang="pl">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff" media="(max-width: 640px)">
+  <meta name="theme-color" content="#139bd7" media="(min-width: 641px)">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/app-icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192.png">
   <title>{APP_TITLE}</title>
   <style>
     :root {{
-      color-scheme: dark;
-      --ink: #f7f9fc;
-      --muted: #aab3c2;
-      --line: #343944;
-      --surface: #151821;
-      --surface-strong: #1d222c;
-      --soft: #0b0d12;
+      color-scheme: light;
+      --ink: #000000;
+      --muted: #555555;
+      --line: #dddddd;
+      --surface: #ffffff;
+      --surface-strong: #ffffff;
+      --soft: #f8f8f8;
       --brand: #139bd7;
       --brand-dark: #0b78ad;
+      --logo-park: #b4b4b4;
+      --logo-park-soft: color-mix(in srgb, var(--logo-park) 22%, white);
       --orange: #f58212;
-      --lime: #b3d316;
+      --lime: #7a9a12;
       --accent: #f58212;
-      --danger: #fb7185;
-      --danger-soft: #351923;
-      --ok: #b3d316;
-      --ok-soft: #253016;
-      --busy: #f58212;
-      --busy-soft: #432613;
-      --focus: rgba(19, 155, 215, 0.32);
-      --field: #0f1218;
-      --field-strong: #111722;
+      --danger: #dc2626;
+      --danger-soft: #fde8e8;
+      --ok: #65a30d;
+      --ok-soft: #ecfccb;
+      --busy: #ea580c;
+      --busy-soft: #ffedd5;
+      --focus: rgba(19, 155, 215, 0.25);
+      --field: #ffffff;
+      --field-strong: #ffffff;
+      --menu-glow-blue: #139bd7;
+      --menu-glow-orange: #f58212;
+      --menu-glow-lime: #7a9a12;
+      --menu-glow-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.72' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='.08'/%3E%3C/svg%3E");
+    }}
+
+    @keyframes ambient-blue-cycle {{
+      0%, 16.666% {{
+        opacity: 1;
+      }}
+
+      33.333%, 83.333% {{
+        opacity: 0;
+      }}
+
+      100% {{
+        opacity: 1;
+      }}
+    }}
+
+    @keyframes ambient-orange-cycle {{
+      0%, 16.666% {{
+        opacity: 0;
+      }}
+
+      33.333%, 50% {{
+        opacity: 1;
+      }}
+
+      66.666%, 100% {{
+        opacity: 0;
+      }}
+    }}
+
+    @keyframes ambient-lime-cycle {{
+      0%, 50% {{
+        opacity: 0;
+      }}
+
+      66.666%, 83.333% {{
+        opacity: 1;
+      }}
+
+      100% {{
+        opacity: 0;
+      }}
     }}
 
     * {{
@@ -1353,42 +2279,133 @@ def page_template(
       margin: 0;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--ink);
-      background: var(--soft);
+      background: #ffffff;
       min-height: 100vh;
+      overflow-x: hidden;
     }}
 
-    header {{
-      background: #0b0d12;
-      border-bottom: 1px solid var(--line);
+    body > header {{
+      background: rgba(255, 255, 255, 0.88);
       position: sticky;
       top: 0;
       z-index: 20;
+      overflow: visible;
     }}
 
     .topbar {{
+      position: relative;
       max-width: 1380px;
       margin: 0 auto;
-      padding: 18px 24px;
-      display: flex;
+      padding: 10px 24px;
+      min-height: 58px;
+      overflow: visible;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
       align-items: center;
-      justify-content: space-between;
-      gap: 18px;
+    }}
+
+    .date-month-label,
+    .install-button {{
+      box-sizing: border-box;
+      padding: 7px 12px 7px 10px;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+      font-size: 0.92rem;
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: -0.01em;
+      display: inline-flex;
+      align-items: center;
+      white-space: nowrap;
+      z-index: 2;
+    }}
+
+    .install-button {{
+      border: 1px solid #a6a6a6;
+      border-radius: 7px;
+      position: relative;
+      grid-column: 3;
+      grid-row: 1;
+      justify-self: end;
+      align-self: center;
+      gap: 7px;
+      background: #000;
+      color: #fff;
+      cursor: pointer;
+    }}
+
+    .install-button:hover {{
+      background: #1a1a1a;
+    }}
+
+    .install-button:focus-visible {{
+      outline: 2px solid var(--brand);
+      outline-offset: 2px;
+    }}
+
+    .install-button__icon {{
+      width: 15px;
+      height: 15px;
+      flex: 0 0 15px;
+      display: block;
+      fill: currentColor;
+    }}
+
+    .install-button__label {{
+      font-size: inherit;
+      font-weight: inherit;
+      letter-spacing: inherit;
+    }}
+
+    .install-button[hidden] {{
+      display: none;
+    }}
+
+    .date-month-label {{
+      grid-column: 1;
+      grid-row: 1;
+      justify-self: start;
+      align-self: center;
+      margin: 0;
+      padding: 7px 0;
+      color: var(--ink);
+      text-transform: uppercase;
+      background: transparent;
+      border: 0;
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transition: opacity 0.24s ease, visibility 0.24s ease;
+    }}
+
+    .date-month-label.is-visible {{
+      opacity: 1;
+      visibility: visible;
     }}
 
     .brand {{
+      grid-column: 2;
+      grid-row: 1;
+      justify-self: center;
       display: flex;
       align-items: center;
+      justify-content: center;
       gap: 12px;
+      height: 38px;
       min-width: 0;
+      overflow: visible;
+      pointer-events: none;
     }}
 
     .logo {{
-      width: 132px;
-      height: 56px;
-      background: #ffffff;
+      --logo-scale: 2.85;
+      height: 38px;
+      width: auto;
+      max-width: 120px;
       object-fit: contain;
-      padding: 7px 10px;
       flex: 0 0 auto;
+      display: block;
+      transform: scale(var(--logo-scale));
+      transform-origin: center center;
     }}
 
     h1 {{
@@ -1424,43 +2441,159 @@ def page_template(
       max-width: 1380px;
       margin: 0 auto;
       padding: 22px 24px 34px;
+      position: relative;
+      z-index: 1;
     }}
 
     .toolbar {{
       display: grid;
       gap: 12px;
       margin-bottom: 18px;
+      min-width: 0;
     }}
 
-    .week-nav {{
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 10px;
-      align-items: center;
-    }}
-
-    .week-days {{
+    .organizer-tools {{
       display: flex;
-      gap: 8px;
+      gap: 10px;
       flex-wrap: wrap;
+      margin-bottom: 18px;
     }}
 
-    .week-day, .week-arrow {{
-      border: 1px solid var(--line);
-      min-height: 40px;
-      padding: 8px 12px;
-      background: var(--surface-strong);
+    .date-toolbar {{
+      min-width: 0;
+    }}
+
+    .date-day {{
+      position: relative;
+      border: 0;
+      background: transparent;
       color: var(--ink);
       text-decoration: none;
-      font-weight: 800;
+      font-weight: 900;
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      user-select: none;
+      cursor: pointer;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
     }}
 
-    .week-day.is-active, .week-day[aria-current="page"] {{
-      background: var(--brand);
-      border-color: var(--brand);
+    .date-day-surface {{
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      border: 0;
+      background: var(--surface-strong);
+      border-radius: inherit;
+      pointer-events: none;
+    }}
+
+    .date-strip {{
+      --date-gap: 6px;
+      position: relative;
+      min-width: 0;
+      gap: 0;
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      scroll-snap-type: x mandatory;
+      scroll-behavior: auto;
+      scrollbar-width: none;
+      margin: 0;
+      padding: 2px 0;
+      -webkit-overflow-scrolling: touch;
+      display: flex;
+      cursor: grab;
+    }}
+
+    .date-week {{
+      flex: 0 0 100%;
+      min-width: 100%;
+      display: flex;
+      gap: var(--date-gap);
+      scroll-snap-align: start;
+      scroll-snap-stop: always;
+    }}
+
+    .date-week .date-day {{
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+    }}
+
+    .date-strip.is-dragging {{
+      cursor: grabbing;
+      user-select: none;
+    }}
+
+    .date-strip::-webkit-scrollbar {{
+      display: none;
+    }}
+
+    .date-day {{
+      flex: 0 0 auto;
+      width: 44px;
+      min-height: 44px;
+      padding: 5px 6px;
+      border-radius: 16px;
+      flex-direction: column;
+      gap: 3px;
+    }}
+
+    .date-day-name {{
+      position: relative;
+      z-index: 3;
+      font-size: 0.68rem;
+      color: var(--brand);
+      line-height: 1;
+      text-transform: uppercase;
+    }}
+
+    .date-day-number {{
+      position: relative;
+      z-index: 3;
+      font-size: 0.95rem;
+      line-height: 1.05;
+    }}
+
+    .date-day.is-active .date-day-surface {{
+      background: #000000;
+    }}
+
+    .date-day.is-active {{
+      color: white;
+    }}
+
+    .date-day.is-active .date-day-name {{
+      color: rgba(255, 255, 255, 0.86);
+    }}
+
+    .date-day.is-today .date-day-surface {{
+      background: var(--logo-park-soft);
+    }}
+
+    .date-day.is-today {{
+      color: var(--ink);
+    }}
+
+    .date-day.is-today .date-day-name {{
+      color: var(--brand);
+    }}
+
+    .date-day.is-today.is-active .date-day-surface {{
+      background: #000000;
+      box-shadow: none;
+    }}
+
+    .date-day.is-today.is-active {{
+      color: white;
+    }}
+
+    .date-day.is-today.is-active .date-day-name {{
+      color: rgba(255, 255, 255, 0.86);
+    }}
+
+    .date-day.is-today.is-active .date-day-number {{
       color: white;
     }}
 
@@ -1595,6 +2728,8 @@ def page_template(
       line-height: 1.15;
       transition: border-color 0.18s ease, background 0.18s ease, transform 0.12s ease;
       min-width: 0;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
     }}
 
     .location-chip-loft {{
@@ -1709,7 +2844,7 @@ def page_template(
     }}
 
     .location-accordion-head:hover {{
-      background: rgba(255, 255, 255, 0.03);
+      background: #f3f3f3;
     }}
 
     .location-accordion-label {{
@@ -1725,7 +2860,7 @@ def page_template(
       color: var(--muted);
       padding: 2px 7px;
       border-radius: 999px;
-      background: rgba(255, 255, 255, 0.04);
+      background: #eeeeee;
     }}
 
     .location-accordion-chevron {{
@@ -1779,7 +2914,7 @@ def page_template(
       padding: 8px;
       border: 1px dashed var(--line);
       border-radius: 8px;
-      background: rgba(255, 255, 255, 0.02);
+      background: #fafafa;
     }}
 
     .location-range-row label {{
@@ -1896,6 +3031,34 @@ def page_template(
       padding: 0 12px 8px;
     }}
 
+    .plan-block {{
+      width: 100%;
+    }}
+
+    .plan-block-title {{
+      text-align: center;
+      padding: 16px 18px 8px;
+      color: var(--ink);
+      font-size: clamp(1.25rem, 3.5vw, 1.85rem);
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      line-height: 1.1;
+    }}
+
+    .plan-block .plan-legend-bottom {{
+      display: flex;
+      justify-content: center;
+      gap: 20px;
+      margin-top: 12px;
+      padding-bottom: 4px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }}
+
     .location-picker .plan-accordion {{
       margin-top: 14px;
       width: 100%;
@@ -1974,6 +3137,437 @@ def page_template(
       gap: 12px;
     }}
 
+    .stack > .timeline-card {{
+      margin-left: 18px;
+      margin-right: 18px;
+    }}
+
+    .day-heading {{
+      text-align: center;
+      padding: 16px 18px 8px;
+      color: var(--ink);
+      font-size: clamp(1.75rem, 5vw, 2.5rem);
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      line-height: 1.1;
+    }}
+
+    .stack > .day-heading + .timeline-card {{
+      margin-top: 12px;
+    }}
+
+    .stack > .section-head + .timeline-card {{
+      margin-top: 16px;
+    }}
+
+    .stack > .timeline-card:last-of-type {{
+      margin-bottom: 16px;
+    }}
+
+    .stack > .timeline-card + .timeline-card {{
+      margin-top: 14px;
+    }}
+
+    .timeline-card {{
+      display: grid;
+      gap: 16px;
+      padding: 22px 24px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #ffffff;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+    }}
+
+    .timeline-card.is-cancelled {{
+      opacity: 0.72;
+    }}
+
+    .timeline-header {{
+      display: flex;
+      align-items: center;
+      gap: clamp(16px, 2.5vw, 28px);
+      width: 100%;
+      flex-wrap: wrap;
+      background: transparent;
+      border: 0;
+      position: static;
+      z-index: auto;
+      padding: 0;
+      margin: 0;
+    }}
+
+    .waiter-assignment {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex: 0 0 auto;
+    }}
+
+    .waiter-assignment-label {{
+      font-size: 0.88rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+
+    .waiter-assignment-label strong {{
+      color: var(--ink);
+      font-weight: 800;
+    }}
+
+    .waiter-picker {{
+      position: relative;
+    }}
+
+    .waiter-picker > summary {{
+      list-style: none;
+      cursor: pointer;
+    }}
+
+    .waiter-picker > summary::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .waiter-options {{
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      z-index: 30;
+      min-width: 220px;
+      max-height: 260px;
+      overflow-y: auto;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+      padding: 6px;
+      display: grid;
+      gap: 4px;
+    }}
+
+    .waiter-option-form {{
+      padding: 0;
+      margin: 0;
+    }}
+
+    .waiter-option {{
+      width: 100%;
+      justify-content: flex-start;
+      background: transparent;
+      color: var(--ink);
+      border: 0;
+      min-height: 36px;
+      padding: 8px 10px;
+      font-weight: 700;
+    }}
+
+    .waiter-option:hover {{
+      background: #f3f3f3;
+    }}
+
+    .waiter-remove-btn {{
+      min-height: 36px;
+      padding: 8px 12px;
+    }}
+
+    .timeline-start {{
+      flex: 0 0 auto;
+      font-size: 2rem;
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: -0.03em;
+      color: var(--ink);
+      font-variant-numeric: tabular-nums;
+      min-width: 4.75rem;
+    }}
+
+    .profile-identity {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: 0 1 auto;
+      flex-wrap: wrap;
+      min-width: 0;
+    }}
+
+    .profile-name {{
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 600;
+      line-height: 1.25;
+      color: var(--ink);
+    }}
+
+    .profile-tags {{
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }}
+
+    .profile-tag {{
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.8125rem;
+      line-height: 1.35;
+      white-space: nowrap;
+    }}
+
+    .profile-tag-age {{
+      background: #eeeeee;
+      color: var(--muted);
+    }}
+
+    .profile-tag-room {{
+      font-weight: 500;
+    }}
+
+    .profile-tag-room-winter {{
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+    }}
+
+    .profile-tag-room-white-house {{
+      background: rgba(148, 163, 184, 0.2);
+      color: #475569;
+    }}
+
+    .profile-tag-room-forest {{
+      background: rgba(34, 197, 94, 0.14);
+      color: #4ade80;
+    }}
+
+    .profile-tag-room-fairy {{
+      background: rgba(192, 132, 252, 0.14);
+      color: #c084fc;
+    }}
+
+    .profile-tag-room-space {{
+      background: rgba(129, 140, 248, 0.14);
+      color: #818cf8;
+    }}
+
+    .profile-tag-room-football {{
+      background: rgba(74, 222, 128, 0.14);
+      color: #86efac;
+    }}
+
+    .profile-tag-room-default {{
+      background: rgba(148, 163, 184, 0.2);
+      color: #64748b;
+    }}
+
+    .profile-tag-icon {{
+      font-size: 0.72rem;
+      line-height: 1;
+    }}
+
+    .profile-guardian {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+      font-size: 0.95rem;
+      color: var(--muted);
+      line-height: 1.35;
+      flex: 0 0 auto;
+    }}
+
+    .profile-guardian-svg {{
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex-shrink: 0;
+    }}
+
+    .timeline-status {{
+      flex: 0 0 auto;
+    }}
+
+    .timeline-logistics {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding-top: 2px;
+    }}
+
+    .logistics-column {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+    }}
+
+    .logistics-chip {{
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #f0f0f0;
+      min-width: 0;
+    }}
+
+    .logistics-chip-icon {{
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      margin-top: 1px;
+    }}
+
+    .logistics-chip-svg {{
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+
+    .logistics-chip-location .logistics-chip-icon {{
+      color: #60a5fa;
+    }}
+
+    .logistics-chip-attraction .logistics-chip-icon {{
+      color: #c084fc;
+    }}
+
+    .logistics-chip-kitchen .logistics-chip-icon {{
+      color: #4ade80;
+    }}
+
+    .logistics-chip-cake .logistics-chip-icon {{
+      color: #fb923c;
+    }}
+
+    .logistics-chip-content {{
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }}
+
+    .logistics-chip-text {{
+      font-size: 0.9rem;
+      line-height: 1.4;
+      color: var(--ink);
+      font-weight: 500;
+    }}
+
+    .logistics-chip-sub {{
+      font-size: 0.78rem;
+      line-height: 1.35;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }}
+
+    .reservation-callout {{
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 11px 14px 11px 12px;
+      border-radius: 10px;
+      border: 0;
+    }}
+
+    .reservation-callout-warning {{
+      background: #fff7ed;
+      border-left: 4px solid #f59e0b;
+      color: #92400e;
+    }}
+
+    .reservation-callout-danger {{
+      background: #fef2f2;
+      border-left: 4px solid #ef4444;
+      color: #991b1b;
+    }}
+
+    .reservation-callout-icon {{
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      margin-top: 1px;
+      color: inherit;
+      opacity: 0.9;
+    }}
+
+    .reservation-callout-text {{
+      margin: 0;
+      font-size: 0.88rem;
+      line-height: 1.45;
+      color: inherit;
+      min-width: 0;
+    }}
+
+    .status-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }}
+
+    .status-badge-active {{
+      background: var(--ok-soft);
+      color: #3f6212;
+      border: 1px solid #84cc16;
+    }}
+
+    .status-badge-cancelled {{
+      background: var(--danger-soft);
+      color: var(--danger);
+      border: 1px solid #fca5a5;
+    }}
+
+    .status-badge-dot {{
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #34d399;
+      box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55);
+      animation: status-pulse 2s ease-in-out infinite;
+    }}
+
+    @keyframes status-pulse {{
+      0%, 100% {{
+        opacity: 1;
+        box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45);
+      }}
+      50% {{
+        opacity: 0.65;
+        box-shadow: 0 0 0 4px rgba(52, 211, 153, 0);
+      }}
+    }}
+
+    .status-badge-reason {{
+      display: block;
+      margin-top: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: normal;
+      max-width: 220px;
+    }}
+
+    .timeline-footer {{
+      padding-top: 2px;
+    }}
+
     .reservation-block {{
       display: grid;
       gap: 4px;
@@ -2023,12 +3617,12 @@ def page_template(
     }}
 
     .key-selected {{
-      background: #122a38;
+      background: #dbeafe;
       border-color: var(--brand);
     }}
 
     .room-node.is-selected rect, .table-node.is-selected circle {{
-      fill: #122a38;
+      fill: #dbeafe;
       stroke: var(--brand);
       stroke-width: 3;
     }}
@@ -2043,27 +3637,120 @@ def page_template(
 
     .tabs {{
       display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
+      flex-wrap: nowrap;
+      gap: 20px;
+      width: 100%;
+      min-width: 0;
     }}
 
     .tab {{
+      flex: 1 1 0;
       border: 1px solid var(--line);
-      min-height: 40px;
-      padding: 8px 12px;
+      min-height: 52px;
+      padding: 12px 16px;
       background: var(--surface-strong);
       color: var(--ink);
       text-decoration: none;
       font-weight: 800;
+      font-size: 0.94rem;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      justify-content: center;
+      gap: 10px;
+      min-width: 0;
+      text-align: center;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }}
+
+    .tabs .tab:focus,
+    .tabs .tab:focus-visible,
+    .tabs .tab:active {{
+      outline: none;
+      box-shadow: none;
+    }}
+
+    .tab-icon {{
+      width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      color: currentColor;
+    }}
+
+    .tab-icon svg {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+
+    .tab-label {{
+      min-width: 0;
+    }}
+
+    .tab-label-mobile {{
+      display: none;
     }}
 
     .tab[aria-current="page"] {{
       background: var(--brand);
       border-color: var(--brand);
       color: white;
+    }}
+
+    .tab-home {{
+      flex: 1 1 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 52px;
+      padding: 8px 12px;
+    }}
+
+    .tab-home[aria-current="page"] {{
+      background: var(--brand);
+      border-color: var(--brand);
+    }}
+
+    .tab-home-logo {{
+      width: 40px;
+      height: 40px;
+      object-fit: contain;
+      display: block;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }}
+
+    .home-summary {{
+      margin-top: 4px;
+    }}
+
+    .home-summary .metrics {{
+      margin-bottom: 0;
+    }}
+
+    html:has(body.page-home) {{
+      overflow: hidden;
+      height: 100%;
+    }}
+
+    body.page-home {{
+      overflow: hidden;
+      height: 100dvh;
+      overscroll-behavior: none;
+    }}
+
+    body.page-home main {{
+      overflow: hidden;
     }}
 
     .layout {{
@@ -2077,6 +3764,29 @@ def page_template(
     .stack {{
       display: grid;
       gap: 18px;
+    }}
+
+    .manager-layout {{
+      margin-top: 18px;
+    }}
+
+    .manager-layout .plan-accordion {{
+      width: 100%;
+    }}
+
+    .manager-layout .room-plan {{
+      min-height: 420px;
+    }}
+
+    @media (min-width: 900px) {{
+      .manager-layout .room-plan {{
+        min-height: 560px;
+      }}
+    }}
+
+    .stack > .section-head {{
+      background: var(--surface);
+      border: 1px solid var(--line);
     }}
 
     section, .panel {{
@@ -2137,8 +3847,8 @@ def page_template(
       margin: 0;
       padding: 10px 12px;
       border-bottom: 1px solid var(--line);
-      background: #202531;
-      color: #f7f9fc;
+      background: #f0f0f0;
+      color: var(--ink);
       font-size: 0.76rem;
       line-height: 1.2;
       text-transform: uppercase;
@@ -2180,11 +3890,11 @@ def page_template(
       padding: 8px 10px;
       font: inherit;
       color: var(--ink);
-      background: #0d1016;
+      background: var(--field);
     }}
 
     input::placeholder, textarea::placeholder {{
-      color: #7d8797;
+      color: #888888;
     }}
 
     textarea {{
@@ -2285,6 +3995,8 @@ def page_template(
       align-items: center;
       justify-content: center;
       min-height: 40px;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
     }}
 
     button:hover, .button:hover {{
@@ -2298,7 +4010,7 @@ def page_template(
     }}
 
     .button.secondary:hover {{
-      background: #283040;
+      background: #eeeeee;
     }}
 
     .button.warning {{
@@ -2338,13 +4050,13 @@ def page_template(
     .alert.success {{
       color: var(--ok);
       background: var(--ok-soft);
-      border-color: #526117;
+      border-color: #84cc16;
     }}
 
     .alert.error {{
       color: var(--danger);
       background: var(--danger-soft);
-      border-color: #7f2637;
+      border-color: #fca5a5;
     }}
 
     .field-error {{
@@ -2373,15 +4085,15 @@ def page_template(
     }}
 
     th {{
-      color: #cbd5e1;
-      background: #202531;
+      color: var(--ink);
+      background: #f0f0f0;
       font-size: 0.75rem;
       text-transform: uppercase;
       letter-spacing: 0;
     }}
 
     tbody tr:nth-child(even) {{
-      background: #11151d;
+      background: #f3f3f3;
     }}
 
     .pill {{
@@ -2389,8 +4101,8 @@ def page_template(
       align-items: center;
       min-height: 24px;
       padding: 3px 8px;
-      background: #122a38;
-      color: #8bdcff;
+      background: #e0f2fe;
+      color: #0369a1;
       font-weight: 900;
       font-size: 0.76rem;
       margin: 0 4px 4px 0;
@@ -2399,7 +4111,8 @@ def page_template(
 
     .pill.ok {{
       background: var(--ok-soft);
-      color: var(--ok);
+      color: #3f6212;
+      border: 1px solid #84cc16;
     }}
 
     .pill.cancelled, .pill.danger {{
@@ -2415,14 +4128,56 @@ def page_template(
 
     .metrics {{
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
     }}
 
     .metric {{
+      display: grid;
+      gap: 8px;
+      place-items: center;
+      text-align: center;
+      padding: 16px 18px;
       border: 1px solid var(--line);
-      padding: 12px;
-      background: var(--field);
+      border-radius: 16px;
+      background: #ffffff;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+    }}
+
+    .metric-icon {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      color: var(--brand);
+    }}
+
+    .metric-icon svg {{
+      width: 30px;
+      height: 30px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+
+    .metric-icon-animacje {{
+      color: #9333ea;
+    }}
+
+    .metric-icon-warsztaty {{
+      color: #65a30d;
+    }}
+
+    .metric-icon-torty {{
+      color: #ea580c;
+    }}
+
+    .metric-icon-piniaty {{
+      color: #db2777;
     }}
 
     .metric strong {{
@@ -2442,6 +4197,54 @@ def page_template(
       grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
       gap: 12px;
       padding: 14px;
+    }}
+
+    .role-board {{
+      border: 0;
+      border-radius: 18px;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fbfd 100%);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+      overflow: hidden;
+    }}
+
+    .role-board .section-head {{
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 18px 18px 0 0;
+      background:
+        linear-gradient(135deg, rgba(19, 155, 215, 0.13), rgba(255, 255, 255, 0) 42%),
+        linear-gradient(315deg, rgba(245, 130, 18, 0.12), rgba(255, 255, 255, 0) 38%),
+        #ffffff;
+      padding: 18px 20px;
+    }}
+
+    .role-board .section-head h2 {{
+      font-size: 1.22rem;
+      font-weight: 900;
+    }}
+
+    .role-board .count {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid rgba(19, 155, 215, 0.22);
+      background: rgba(19, 155, 215, 0.09);
+      color: var(--brand-dark);
+      font-weight: 900;
+    }}
+
+    .role-board .banquet-grid {{
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 18px 18px;
+      background:
+        linear-gradient(180deg, rgba(19, 155, 215, 0.04), rgba(122, 154, 18, 0.05)),
+        #ffffff;
     }}
 
     .kitchen-columns {{
@@ -2480,12 +4283,64 @@ def page_template(
       min-width: 0;
     }}
 
+    .role-card {{
+      border-radius: 16px;
+      background: #ffffff;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+      overflow: hidden;
+    }}
+
+    .role-card-head {{
+      display: grid;
+      gap: 8px;
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+      background:
+        linear-gradient(135deg, rgba(19, 155, 215, 0.11), rgba(255, 255, 255, 0) 52%),
+        #ffffff;
+    }}
+
+    .role-card-kicker {{
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      line-height: 1;
+      text-transform: uppercase;
+    }}
+
+    .role-card-head .profile-identity {{
+      gap: 10px;
+    }}
+
+    .role-card-head .profile-name {{
+      font-size: 1.28rem;
+      font-weight: 900;
+    }}
+
     .banquet-title, .kitchen-title {{
       margin: 0;
       padding: 0;
       border-bottom: 1px solid var(--line);
-      background: #202531;
-      color: #f7f9fc;
+      background: #f0f0f0;
+      color: var(--ink);
+    }}
+
+    .role-card .banquet-title {{
+      background:
+        linear-gradient(135deg, rgba(19, 155, 215, 0.1), rgba(255, 255, 255, 0) 52%),
+        #ffffff;
+    }}
+
+    .role-card .banquet-header {{
+      gap: 10px;
+      padding: 14px;
+    }}
+
+    .role-card .banquet-header-item {{
+      padding: 9px 10px;
+      border-radius: 10px;
+      background: #f7f7f7;
     }}
 
     .banquet-header {{
@@ -2505,7 +4360,7 @@ def page_template(
       font-size: 0.72rem;
       text-transform: uppercase;
       letter-spacing: 0.03em;
-      color: #aab3c2;
+      color: var(--muted);
       font-weight: 900;
     }}
 
@@ -2513,7 +4368,7 @@ def page_template(
       font-size: 0.95rem;
       font-weight: 900;
       line-height: 1.3;
-      color: #f7f9fc;
+      color: var(--ink);
       word-break: break-word;
     }}
 
@@ -2527,6 +4382,173 @@ def page_template(
       gap: 4px;
       padding: 10px 12px;
       border-top: 1px solid var(--line);
+    }}
+
+    .role-card .banquet-task {{
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      background: #ffffff;
+    }}
+
+    .role-card .banquet-task:nth-child(even) {{
+      background: #fbfbfb;
+    }}
+
+    .task-time {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 58px;
+      min-height: 34px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: #000000;
+      color: #ffffff;
+      font-size: 0.95rem;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+    }}
+
+    .task-detail {{
+      min-width: 0;
+    }}
+
+    .task-label {{
+      color: var(--ink);
+      font-size: 0.96rem;
+      font-weight: 900;
+      line-height: 1.3;
+      word-break: break-word;
+    }}
+
+    .task-meta {{
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 0.84rem;
+      font-weight: 700;
+      line-height: 1.35;
+      word-break: break-word;
+    }}
+
+    .role-extra {{
+      border-top: 1px solid var(--line);
+      background: #fbfbfb;
+    }}
+
+    .role-extra > summary {{
+      min-height: 42px;
+      padding: 11px 14px;
+      color: var(--brand-dark);
+      cursor: pointer;
+      font-size: 0.86rem;
+      font-weight: 900;
+      list-style: none;
+      user-select: none;
+    }}
+
+    .role-extra > summary::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .role-extra > summary::after {{
+      content: "+";
+      float: right;
+      color: var(--muted);
+      font-weight: 900;
+    }}
+
+    .role-extra[open] > summary {{
+      border-bottom: 1px solid var(--line);
+    }}
+
+    .role-extra[open] > summary::after {{
+      content: "−";
+    }}
+
+    .role-extra-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding: 12px 14px 14px;
+    }}
+
+    .role-extra-item {{
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+      padding: 9px 10px;
+      border-radius: 10px;
+      background: #ffffff;
+      border: 1px solid #eeeeee;
+    }}
+
+    .role-extra-item-full {{
+      grid-column: 1 / -1;
+    }}
+
+    .role-extra-label {{
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      line-height: 1.2;
+      text-transform: uppercase;
+    }}
+
+    .role-extra-value {{
+      color: var(--ink);
+      font-size: 0.88rem;
+      font-weight: 800;
+      line-height: 1.35;
+      word-break: break-word;
+    }}
+
+    .role-card .banquet-notes {{
+      border-bottom: 1px solid var(--line);
+      background: #fff7ed;
+      color: #92400e;
+      font-weight: 700;
+    }}
+
+    .role-card .kitchen-columns {{
+      border-top: 0;
+    }}
+
+    .role-card .kitchen-column-cell {{
+      display: grid;
+      align-content: start;
+      gap: 5px;
+      min-height: 96px;
+      padding: 14px;
+      font-weight: 800;
+      line-height: 1.35;
+      background: #ffffff;
+    }}
+
+    .role-card .kitchen-column-cell:nth-child(1) {{
+      background: linear-gradient(180deg, rgba(122, 154, 18, 0.1), rgba(255, 255, 255, 0) 72%);
+    }}
+
+    .role-card .kitchen-column-cell:nth-child(2) {{
+      background: linear-gradient(180deg, rgba(245, 130, 18, 0.12), rgba(255, 255, 255, 0) 72%);
+    }}
+
+    .role-card .kitchen-column-cell:nth-child(3) {{
+      background: linear-gradient(180deg, rgba(19, 155, 215, 0.1), rgba(255, 255, 255, 0) 72%);
+    }}
+
+    .role-card .kitchen-column-label {{
+      width: fit-content;
+      margin-bottom: 4px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.06);
+      color: var(--ink);
+      font-size: 0.7rem;
+      letter-spacing: 0;
     }}
 
     .banquet-task:first-child, .kitchen-order:first-child {{
@@ -2547,7 +4569,7 @@ def page_template(
     }}
 
     .schedule-time {{
-      color: #f7f9fc;
+      color: var(--ink);
       font-size: 1.05rem;
       font-weight: 900;
       line-height: 1.2;
@@ -2613,12 +4635,65 @@ def page_template(
       border-color: rgba(245, 130, 18, 0.78);
     }}
 
+    .plan-block .room-plan {{
+      border: 0;
+      background: #ffffff;
+    }}
+
+    .plan-block .plan-outline {{
+      fill: #f3f3f3;
+      stroke: #d0d0d0;
+    }}
+
+    .plan-block .room-zone rect,
+    .plan-block .room-zone polygon {{
+      fill: #ececec;
+      stroke: #b0b0b0;
+    }}
+
+    .plan-block .room-node rect {{
+      fill: #e8f5c8;
+      stroke: #7f9918;
+    }}
+
+    .plan-block .room-node.is-busy rect {{
+      fill: #ffe8cc;
+      stroke: #f58212;
+    }}
+
+    .plan-block .room-zone.is-busy rect,
+    .plan-block .room-zone.is-busy polygon {{
+      fill: #ffe8cc;
+      stroke: #f58212;
+    }}
+
+    .plan-block .table-node circle {{
+      fill: #e8f5c8;
+      stroke: #7f9918;
+    }}
+
+    .plan-block .table-node.is-busy circle {{
+      fill: #ffe8cc;
+      stroke: #f58212;
+    }}
+
+    .plan-block .plan-caption,
+    .plan-block .room-node text,
+    .plan-block .room-zone text,
+    .plan-block .table-node text {{
+      fill: #000000;
+    }}
+
+    .plan-block .room-zone .zone-subtitle {{
+      fill: #333333;
+    }}
+
     .room-plan {{
       width: 100%;
       height: auto;
       min-height: 360px;
       border: 1px solid var(--line);
-      background: #0d1016;
+      background: #ffffff;
       display: block;
     }}
 
@@ -2629,8 +4704,8 @@ def page_template(
     }}
 
     .plan-outline {{
-      fill: #151b25;
-      stroke: #343944;
+      fill: #f3f3f3;
+      stroke: #d0d0d0;
       stroke-width: 2;
     }}
 
@@ -2642,8 +4717,8 @@ def page_template(
     }}
 
     .room-zone rect, .room-zone polygon {{
-      fill: #172231;
-      stroke: #36536c;
+      fill: #ececec;
+      stroke: #b0b0b0;
       stroke-width: 2;
     }}
 
@@ -2668,8 +4743,8 @@ def page_template(
       stroke: var(--busy);
     }}
 
-    .room-node text, .room-zone text, .table-node text {{
-      fill: var(--ink);
+    .room-node text, .room-zone text, .table-node text, .plan-caption {{
+      fill: #000000;
       pointer-events: none;
       font-size: 13px;
       font-weight: 900;
@@ -2681,7 +4756,7 @@ def page_template(
     }}
 
     .room-zone .zone-subtitle {{
-      fill: var(--muted);
+      fill: #333333;
       font-size: 11px;
     }}
 
@@ -2699,6 +4774,10 @@ def page_template(
     .schema-list li {{
       break-inside: avoid;
       margin-bottom: 7px;
+    }}
+
+    .ambient-glow {{
+      display: none;
     }}
 
     @media (max-width: 1120px) {{
@@ -2720,27 +4799,339 @@ def page_template(
     }}
 
     @media (max-width: 640px) {{
+      html {{
+        background: #ffffff;
+      }}
+
+      body {{
+        padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+        position: relative;
+        isolation: isolate;
+      }}
+
+      body > header {{
+        z-index: 60;
+      }}
+
+      .ambient-glow {{
+        display: block;
+        position: fixed;
+        top: 72px;
+        left: -56px;
+        right: -56px;
+        bottom: -88px;
+        z-index: 0;
+        pointer-events: none;
+        border-radius: 50% 50% 0 0 / 82px 82px 0 0;
+        -webkit-mask-image: linear-gradient(0deg, #000 0%, rgba(0, 0, 0, 0.74) 56%, rgba(0, 0, 0, 0) 100%);
+        mask-image: linear-gradient(0deg, #000 0%, rgba(0, 0, 0, 0.74) 56%, rgba(0, 0, 0, 0) 100%);
+        overflow: hidden;
+        contain: paint;
+        filter: saturate(1.18);
+        transform: translateZ(0);
+      }}
+
+      .ambient-glow-layer {{
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background:
+          linear-gradient(0deg, color-mix(in srgb, white 72%, var(--menu-glow)) 0%, color-mix(in srgb, var(--menu-glow) 66%, transparent) 12%, color-mix(in srgb, var(--menu-glow) 42%, transparent) 36%, color-mix(in srgb, var(--menu-glow) 22%, transparent) 70%, color-mix(in srgb, var(--menu-glow) 0%, transparent) 100%),
+          radial-gradient(124% 124% at 50% 18%, color-mix(in srgb, var(--menu-glow) 92%, white) 0%, color-mix(in srgb, var(--menu-glow) 72%, transparent) 26%, color-mix(in srgb, var(--menu-glow) 28%, transparent) 62%, color-mix(in srgb, var(--menu-glow) 0%, transparent) 100%),
+          var(--menu-glow-noise);
+        opacity: 0;
+        will-change: opacity;
+      }}
+
+      .ambient-glow-blue {{
+        --menu-glow: var(--menu-glow-blue);
+        animation: ambient-blue-cycle 18s linear infinite;
+      }}
+
+      .ambient-glow-orange {{
+        --menu-glow: var(--menu-glow-orange);
+        animation: ambient-orange-cycle 18s linear infinite;
+      }}
+
+      .ambient-glow-lime {{
+        --menu-glow: var(--menu-glow-lime);
+        animation: ambient-lime-cycle 18s linear infinite;
+      }}
+
+      body::after {{
+        content: "";
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: env(safe-area-inset-bottom, 0px);
+        background: #ffffff;
+        pointer-events: none;
+        z-index: 39;
+      }}
+
       .topbar, main {{
         padding-left: 14px;
         padding-right: 14px;
       }}
 
+      main {{
+        padding-top: 8px;
+        padding-bottom: calc(108px + env(safe-area-inset-bottom, 0px));
+        overflow-x: hidden;
+        z-index: 1;
+      }}
+
       .topbar {{
-        align-items: flex-start;
-        flex-direction: column;
+        align-items: center;
+        min-height: 56px;
+        overflow: visible;
+      }}
+
+      .date-month-label {{
+        padding: 6px 0;
+        font-size: 0.82rem;
+      }}
+
+      .install-button {{
+        padding: 6px 10px 6px 8px;
+        font-size: 0.82rem;
+        gap: 6px;
+      }}
+
+      .install-button__icon {{
+        width: 14px;
+        height: 14px;
+        flex-basis: 14px;
+      }}
+
+      .install-button__label {{
+        font-size: inherit;
+      }}
+
+      .date-day {{
+        min-height: 46px;
+        padding: 5px 2px;
+        border-radius: 16px;
+      }}
+
+      .date-day-name {{
+        font-size: 0.72rem;
+      }}
+
+      .date-day-number {{
+        font-size: 1rem;
+      }}
+
+      .date-toolbar {{
+        position: relative;
+        z-index: 45;
+        isolation: isolate;
+      }}
+
+      .date-strip {{
+        position: relative;
+        z-index: 1;
+      }}
+
+      .date-day {{
+        z-index: 1;
+      }}
+
+      .tabs {{
+        --tab-bar-height: 62px;
+        --tab-icon-row: 30px;
+        --tab-label-row: 22px;
+        --tab-oval-rise: 26px;
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        transform: none;
+        z-index: 40;
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 2px;
+        width: 100%;
+        max-width: 100vw;
+        padding: 10px 8px max(10px, env(safe-area-inset-bottom, 0px));
+        border: 0;
+        border-radius: 50% 50% 0 0 / var(--tab-oval-rise) var(--tab-oval-rise) 0 0;
+        box-shadow: none;
+        overflow: visible;
+        isolation: isolate;
+        background: transparent;
+        -webkit-touch-callout: none;
+      }}
+
+      .tabs::before {{
+        content: none;
+      }}
+
+      .tabs::after {{
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        border-radius: inherit;
+        background: #ffffff;
+      }}
+
+      .tab {{
+        height: var(--tab-bar-height);
+        min-height: var(--tab-bar-height);
+        max-height: var(--tab-bar-height);
+        position: relative;
+        z-index: 2;
+        padding: 0 1px;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        color: #000000;
+        font-size: 0.62rem;
+        line-height: 1.05;
+        font-weight: 760;
+        overflow-wrap: anywhere;
+        display: grid;
+        grid-template-rows: var(--tab-icon-row) var(--tab-label-row);
+        align-content: center;
+        justify-items: center;
+        gap: 2px;
+      }}
+
+      .tab-home {{
+        position: relative;
+        z-index: 2;
+        display: grid;
+        grid-template-rows: var(--tab-icon-row) var(--tab-label-row);
+        align-content: center;
+        justify-items: center;
+        height: var(--tab-bar-height);
+        min-height: var(--tab-bar-height);
+        max-height: var(--tab-bar-height);
+        padding: 0 1px;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+      }}
+
+      .tab-home[aria-current="page"] {{
+        background: transparent;
+        border: 0;
+      }}
+
+      .tab-home-logo {{
+        grid-row: 1 / span 2;
+        align-self: center;
+        width: 36px;
+        height: 36px;
+        object-fit: contain;
+        transform: none;
+        box-shadow: none;
+        user-select: none;
+        -webkit-user-drag: none;
+      }}
+
+      .tab-icon {{
+        grid-row: 1;
+        align-self: center;
+        width: 28px;
+        height: 28px;
+        border-radius: 999px;
+        padding: 5px;
+        color: currentColor;
+        flex: 0 0 auto;
+      }}
+
+      .tab-label {{
+        grid-row: 2;
+        align-self: center;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        min-height: var(--tab-label-row);
+        max-height: var(--tab-label-row);
+        max-width: 100%;
+        white-space: normal;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-align: center;
+        line-height: 1.05;
+      }}
+
+      .tab-label-full {{
+        display: none;
+      }}
+
+      .tab-label-mobile {{
+        display: inline;
+      }}
+
+      .tab[aria-current="page"] {{
+        background: transparent;
+        border: 0;
+        color: #000000;
+      }}
+
+      .tab[aria-current="page"] .tab-icon {{
+        background: #000000;
+        color: #ffffff;
       }}
 
       .brand {{
-        align-items: flex-start;
+        height: 32px;
       }}
 
       .logo {{
-        width: 108px;
-        height: 48px;
+        --logo-scale: 2.45;
+        height: 32px;
+        max-width: 96px;
       }}
 
-      .grid, .choice-grid, .metrics, .form-board, .category-fields, .category-fields.services, .service-catalog, .reservation-details, .birthday-child-row, .kitchen-columns, .banquet-header, .location-forms {{
+      .grid, .choice-grid, .form-board, .category-fields, .category-fields.services, .service-catalog, .reservation-details, .birthday-child-row, .kitchen-columns, .banquet-header, .location-forms {{
         grid-template-columns: 1fr;
+      }}
+
+      .role-board {{
+        border-radius: 16px;
+      }}
+
+      .role-board .section-head {{
+        border-radius: 16px 16px 0 0;
+        padding: 16px;
+      }}
+
+      .role-board .banquet-grid {{
+        grid-template-columns: 1fr;
+        padding: 12px;
+        border-radius: 0 0 16px 16px;
+      }}
+
+      .role-card {{
+        border-radius: 14px;
+      }}
+
+      .role-card .banquet-header {{
+        gap: 8px;
+        padding: 12px;
+      }}
+
+      .role-card-head {{
+        padding: 14px;
+      }}
+
+      .role-extra-grid {{
+        grid-template-columns: 1fr;
+      }}
+
+      .role-card .kitchen-column-cell {{
+        min-height: 74px;
+      }}
+
+      .metrics {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
 
       .location-panel {{
@@ -2768,6 +5159,29 @@ def page_template(
         border-bottom: 0;
       }}
 
+      .timeline-card {{
+        padding: 18px 16px;
+        border-radius: 14px;
+      }}
+
+      .timeline-header {{
+        gap: 14px;
+      }}
+
+      .timeline-start {{
+        font-size: 1.75rem;
+        min-width: 4.25rem;
+      }}
+
+      .profile-guardian {{
+        margin-left: 0;
+        width: 100%;
+      }}
+
+      .timeline-logistics {{
+        grid-template-columns: 1fr;
+      }}
+
       .section-head {{
         flex-direction: column;
       }}
@@ -2778,20 +5192,25 @@ def page_template(
     }}
   </style>
 </head>
-<body>
+<body{body_class}>
+  <div class="ambient-glow" aria-hidden="true">
+    <span class="ambient-glow-layer ambient-glow-blue"></span>
+    <span class="ambient-glow-layer ambient-glow-orange"></span>
+    <span class="ambient-glow-layer ambient-glow-lime"></span>
+  </div>
   <header>
     <div class="topbar">
+      <p class="date-month-label" data-date-month-label aria-hidden="true"></p>
       <div class="brand">
-        <img class="logo" src="/logo.png" alt="iKids Park">
-        <div>
-          <h1>iKids Park Rezerwacje</h1>
-          <p class="subtitle">Wewnętrzny panel urodzin: kierownik zmiany, recepcja, animatorzy, kuchnia i organizator.</p>
-        </div>
+        <img class="logo" src="{logo_src}" alt="iKids Park">
       </div>
-      <div class="tabs">
-        <a class="tab" href="/schema">Struktura bazy</a>
-        <a class="tab" href="/export">Eksport CSV</a>
-      </div>
+      <button class="install-button" type="button" data-install-app aria-label="Pobierz aplikację">
+        <svg class="install-button__icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M11 3a1 1 0 0 1 2 0v8.586l2.293-2.293a1 1 0 0 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L11 11.586V3z"/>
+          <path d="M5 18a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z"/>
+        </svg>
+        <span class="install-button__label">Pobierz</span>
+      </button>
     </div>
   </header>
   <main>
@@ -2801,47 +5220,109 @@ def page_template(
   <script>
     window.IKIDS_CONTEXT = {json.dumps({"role": role, "day": day}, ensure_ascii=False)};
   </script>
+  {pwa_install_script()}
+  {date_navigation_script()}
+  {fast_navigation_script()}
 </body>
 </html>"""
     return document.encode("utf-8")
 
 
-def render_nav(role: str, day: str) -> str:
-    role = normalize_role(role)
+def render_organizer_tools(role: str, day: str) -> str:
+    return f"""
+<div class="organizer-tools">
+  <a class="button secondary" href="/schema?role={escape(role)}&day={escape(day)}">Struktura bazy</a>
+  <a class="button secondary" href="/export">Eksport CSV</a>
+</div>
+"""
+
+
+def render_nav(page_role: str, day: str) -> str:
+    page_role = normalize_page_role(page_role)
     day = normalize_day(day)
     target_day = selected_day(day)
-    role_links = []
+    role_links_by_key = {}
+    mobile_labels = {
+        "manager": "Kierownik<br>recepcja",
+        "organizer": "Organizator<br>urodzin",
+    }
     for key, meta in ROLE_DEFS.items():
-        role_links.append(
-            f'<a class="tab" href="{link_for(key, day_query(target_day))}" aria-current="page"'
-            f' title="{escape(meta["hint"])}">{escape(meta["label"])}</a>'
-            if key == role
-            else f'<a class="tab" href="{link_for(key, day_query(target_day))}" title="{escape(meta["hint"])}">{escape(meta["label"])}</a>'
+        mobile_label = mobile_labels.get(key, escape(meta["label"]))
+        tab_content = (
+            f'<span class="tab-icon">{ROLE_NAV_ICONS[key]}</span>'
+            f'<span class="tab-label"><span class="tab-label-full">{escape(meta["label"])}</span>'
+            f'<span class="tab-label-mobile">{mobile_label}</span></span>'
         )
+        role_links_by_key[key] = (
+            f'<a class="tab" href="{link_for(key, day_query(target_day))}" aria-current="page"'
+            f' title="{escape(meta["hint"])}">{tab_content}</a>'
+            if key == page_role
+            else f'<a class="tab" href="{link_for(key, day_query(target_day))}" title="{escape(meta["hint"])}">{tab_content}</a>'
+        )
+    home_current = ' aria-current="page"' if page_role == "home" else ""
+    home_link = (
+        f'<a class="tab tab-home" href="{link_for("home", day_query(target_day))}"'
+        f'{home_current} aria-label="Strona główna">'
+        f'<img class="tab-home-logo" src="{menu_logo_asset_url()}" alt="iKids Park"></a>'
+    )
+    role_links = [
+        role_links_by_key["manager"],
+        role_links_by_key["animators"],
+        home_link,
+        role_links_by_key["kitchen"],
+        role_links_by_key["organizer"],
+    ]
 
-    week = week_dates(target_day)
-    prev_week = day_query(week[0] - timedelta(days=7))
-    next_week = day_query(week[0] + timedelta(days=7))
-    day_links = []
-    for index, week_day in enumerate(week):
-        query = day_query(week_day)
-        weekday = WEEKDAY_LABELS[week_day.weekday()]
-        text = f"{weekday} · {week_day.strftime('%d.%m')}"
-        is_active = week_day == target_day
-        day_links.append(
-            f'<a class="week-day{" is-active" if is_active else ""}" href="{link_for(role, query)}" aria-current="page">{escape(text)}</a>'
-            if is_active
-            else f'<a class="week-day" href="{link_for(role, query)}">{escape(text)}</a>'
+    strip_anchor_day = date.today()
+    active_week_offset = week_page_offset_for_day(strip_anchor_day, target_day)
+    week_pages = calendar_week_pages(strip_anchor_day, strip_anchor_day.year)
+    week_blocks = []
+    for week_offset, week_days in week_pages:
+        week_attrs = [
+            f'data-month-label="{escape(week_month_label(week_days))}"',
+            f'data-year-label="{week_year_label(week_days)}"',
+        ]
+        if week_offset == 0:
+            week_attrs.append("data-default-week")
+        if week_offset == active_week_offset:
+            week_attrs.append("data-active-week")
+        week_attr_str = f' {" ".join(week_attrs)}' if week_attrs else ""
+        day_links = []
+        for strip_day in week_days:
+            query = day_query(strip_day)
+            weekday = WEEKDAY_LABELS[strip_day.weekday()][0].upper()
+            is_active = strip_day == target_day
+            is_today = strip_day == strip_anchor_day
+            day_classes = ["date-day"]
+            if is_active:
+                day_classes.append("is-active")
+            if is_today:
+                day_classes.append("is-today")
+            day_attrs = []
+            if is_active:
+                day_attrs.append('aria-current="page"')
+                day_attrs.append("data-selected-day")
+            if is_today:
+                day_attrs.append("data-today-day")
+            attrs = f' {" ".join(day_attrs)}' if day_attrs else ""
+            day_links.append(
+                f"""
+            <a class="{" ".join(day_classes)}" href="{link_for(page_role, query)}"{attrs}>
+              <span class="date-day-surface" aria-hidden="true"></span>
+              <span class="date-day-name">{escape(weekday)}</span>
+              <span class="date-day-number">{escape(strip_day.strftime("%d"))}</span>
+            </a>"""
+            )
+        week_blocks.append(
+            f'<div class="date-week"{week_attr_str}>{"".join(day_links)}</div>'
         )
 
     return f"""
 <div class="toolbar">
-  <div class="tabs">{''.join(role_links)}</div>
-  <div class="week-nav">
-    <a class="week-arrow" href="{link_for(role, prev_week)}" aria-label="Poprzedni tydzień">◀</a>
-    <div class="week-days">{''.join(day_links)}</div>
-    <a class="week-arrow" href="{link_for(role, next_week)}" aria-label="Następny tydzień">▶</a>
+  <div class="date-toolbar">
+    <div class="date-strip" data-date-strip>{"".join(week_blocks)}</div>
   </div>
+  <div class="tabs">{''.join(role_links)}</div>
 </div>
 """
 
@@ -2880,6 +5361,9 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "mascot_enabled": 0,
         "mascot_type": "",
         "mascot_at": "",
+        "balloons_enabled": 0,
+        "balloons_description": "",
+        "balloons_at": "",
         "attraction_at": "",
         "notes": "",
         "status": "active",
@@ -2900,6 +5384,7 @@ def row_to_form_values(row: sqlite3.Row) -> dict[str, object]:
         "culinary_workshops_at",
         "pinata_at",
         "mascot_at",
+        "balloons_at",
         "attraction_at",
     ):
         values[field] = format_time(row[field])
@@ -3114,66 +5599,441 @@ def render_birthday_children_fields(values: dict[str, object], errors: dict[str,
 """
 
 
-def render_reservation_details(row: sqlite3.Row, include_notes: bool = True) -> str:
-    notes = (
-        f'<div class="reservation-block"><div class="reservation-label">Notatka</div><div>{escape(row["notes"])}</div></div>'
-        if include_notes and row["notes"]
-        else ""
-    )
-    animator_items = []
-    if is_enabled(row, "animation_enabled"):
-        label = row["animation_type"] or "Animacja"
-        animator_items.append(f"<li>{escape(label)} · {escape(format_service_window(row['animation_at'], SERVICE_DURATIONS['animation_at']))}</li>")
-    if is_enabled(row, "pinata_enabled"):
-        animator_items.append(f"<li>Piniata: {escape(row['pinata_theme'] or '(brak)')} · {escape(format_service_window(row['pinata_at'], SERVICE_DURATIONS['pinata_at']))}</li>")
-    if is_enabled(row, "mascot_enabled"):
-        animator_items.append(f"<li>Maskotka: {escape(row['mascot_type'] or '(brak)')} · {escape(format_service_window(row['mascot_at'], SERVICE_DURATIONS['mascot_at']))}</li>")
+def reservation_duration_meta(row: sqlite3.Row | dict[str, object]) -> tuple[str, str]:
+    try:
+        start = datetime.fromisoformat(str(row["start_at"]))
+        end = datetime.fromisoformat(str(row["end_at"]))
+        minutes = max(0, int((end - start).total_seconds() // 60))
+        return format_duration(minutes) or "", end.strftime("%H:%M")
+    except (ValueError, TypeError):
+        return "", ""
 
-    kitchen_items = []
-    if is_enabled(row, "fruit_enabled"):
-        plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "brak liczby talerzy"
-        kitchen_items.append(f"<li>Owoce · start imprezy {escape(format_time(row['start_at']))} · {escape(plates)}</li>")
-    if is_enabled(row, "cake_enabled"):
-        kitchen_items.append(f"<li>Tort: {escape(row['cake_theme'] or '(brak)')} · {escape(format_service_window(row['cake_at'], SERVICE_DURATIONS['cake_at']))}</li>")
-    if is_enabled(row, "culinary_workshops_enabled"):
-        kitchen_items.append(
-            f"<li>Warsztaty: {escape(row['culinary_workshops_type'] or '(brak)')} · {escape(format_service_window(row['culinary_workshops_at'], SERVICE_DURATIONS['culinary_workshops_at']))}</li>"
-        )
 
-    animator_block = (
-        f"""
-        <div class="reservation-block">
-          <div class="reservation-label">Animatorzy</div>
-          <ul class="reservation-list">{''.join(animator_items)}</ul>
+def render_note_callout(notes: str, *, tone: str = "warning", label: str = "Uwaga") -> str:
+    if not notes:
+        return ""
+    del label
+    icon = (
+        '<svg class="logistics-chip-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/>'
+        '<path d="M12 9v4"/><path d="M12 17h.01"/>'
+        "</svg>"
+    )
+    return f"""
+      <div class="reservation-callout reservation-callout-{escape(tone)}" role="note">
+        <span class="reservation-callout-icon" aria-hidden="true">{icon}</span>
+        <p class="reservation-callout-text">{escape(notes)}</p>
+      </div>
+    """
+
+
+LOGISTICS_CHIP_ICONS = {
+    "location": (
+        '<svg class="logistics-chip-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0"/>'
+        '<circle cx="12" cy="10" r="3"/>'
+        "</svg>"
+    ),
+    "attraction": (
+        '<svg class="logistics-chip-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>'
+        '<path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>'
+        "</svg>"
+    ),
+    "kitchen": (
+        '<svg class="logistics-chip-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06Z"/>'
+        '<path d="M10 2c1 .5 2 2 2 5"/>'
+        "</svg>"
+    ),
+    "cake": (
+        '<svg class="logistics-chip-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8"/>'
+        '<path d="M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1"/>'
+        '<path d="M2 21h20"/><path d="M7 8v3"/><path d="M12 8v3"/><path d="M17 8v3"/>'
+        '<path d="M7 4h.01"/><path d="M12 4h.01"/><path d="M17 4h.01"/>'
+        "</svg>"
+    ),
+    "pinata": (
+        '<svg class="logistics-chip-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<rect x="3" y="8" width="18" height="4" rx="1"/>'
+        '<path d="M12 8v13"/>'
+        '<path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/>'
+        '<path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5"/>'
+        "</svg>"
+    ),
+}
+
+
+METRIC_ICONS = {
+    "bankiety": (
+        '<svg class="metric-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="M8 2v4"/><path d="M16 2v4"/>'
+        '<rect x="3" y="4" width="18" height="18" rx="2"/>'
+        '<path d="M3 10h18"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/>'
+        "</svg>"
+    ),
+    "guests": (
+        '<svg class="metric-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>'
+        '<circle cx="9" cy="7" r="4"/>'
+        '<path d="M22 21v-2a4 4 0 0 0-3-3.87"/>'
+        '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>'
+        "</svg>"
+    ),
+    "animacje": LOGISTICS_CHIP_ICONS["attraction"].replace("logistics-chip-svg", "metric-svg"),
+    "warsztaty": LOGISTICS_CHIP_ICONS["kitchen"].replace("logistics-chip-svg", "metric-svg"),
+    "torty": LOGISTICS_CHIP_ICONS["cake"].replace("logistics-chip-svg", "metric-svg"),
+    "piniaty": LOGISTICS_CHIP_ICONS["pinata"].replace("logistics-chip-svg", "metric-svg"),
+}
+
+
+def render_metric(value: int, label: str, icon_key: str) -> str:
+    icon_class = f" metric-icon-{icon_key}" if icon_key in {"animacje", "warsztaty", "torty", "piniaty"} else ""
+    return (
+        f'<div class="metric">'
+        f'<span class="metric-icon{icon_class}" aria-hidden="true">{METRIC_ICONS[icon_key]}</span>'
+        f"<strong>{value}</strong>"
+        f'<span class="muted">{escape(label)}</span>'
+        f"</div>"
+    )
+
+
+def render_role_card_identity(row: sqlite3.Row | dict[str, object]) -> str:
+    children = birthday_children_from_row(row)
+    names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
+    name_markup = ", ".join(names) if names else "Brak solenizanta"
+    age_tags = "".join(
+        f'<span class="profile-tag profile-tag-age">{escape(format_age_label(child.get("age")))}</span>'
+        for child in children
+        if format_age_label(child.get("age"))
+    )
+    tags_block = f'<div class="profile-tags">{age_tags}</div>' if age_tags else ""
+    return f"""
+      <div class="role-card-head">
+        <span class="role-card-kicker">Solenizant</span>
+        <div class="profile-identity">
+          <h3 class="profile-name">{name_markup}</h3>
+          {tags_block}
         </div>
+      </div>
+    """
+
+
+def render_role_extra_info(row: sqlite3.Row, notes: object = "") -> str:
+    room = escape(display_location(row["child_location"]))
+    adult = escape(display_locations(row["adult_location"]))
+    parent = escape(str(row["parent_name"]))
+    start = escape(format_time(row["start_at"]))
+    children_count = escape(row["children_count"])
+    adults_count = escape(row["adults_count"])
+    notes_text = str(notes or "").strip()
+    notes_markup = (
+        f"""
+          <div class="role-extra-item role-extra-item-full">
+            <span class="role-extra-label">Notatka</span>
+            <span class="role-extra-value">{escape(notes_text)}</span>
+          </div>
         """
-        if animator_items
+        if notes_text
         else ""
     )
-    kitchen_block = (
-        f"""
-        <div class="reservation-block">
-          <div class="reservation-label">Kuchnia</div>
-          <ul class="reservation-list">{''.join(kitchen_items)}</ul>
-        </div>
+    balloons_markup = ""
+    if is_enabled(row, "balloons_enabled"):
+        balloons_time = escape(format_time(row["balloons_at"]))
+        balloons_description = escape(row["balloons_description"] or "(brak)")
+        balloons_value = f"{balloons_description} · {balloons_time}" if balloons_time else balloons_description
+        balloons_markup = f"""
+          <div class="role-extra-item role-extra-item-full">
+            <span class="role-extra-label">Balony</span>
+            <span class="role-extra-value">{balloons_value}</span>
+          </div>
         """
-        if kitchen_items
-        else ""
+    return f"""
+      <details class="role-extra">
+        <summary>Info dodatkowe</summary>
+        <div class="role-extra-grid">
+          <div class="role-extra-item">
+            <span class="role-extra-label">Sala</span>
+            <span class="role-extra-value">{room}</span>
+          </div>
+          <div class="role-extra-item">
+            <span class="role-extra-label">Stoliki</span>
+            <span class="role-extra-value">{adult}</span>
+          </div>
+          <div class="role-extra-item">
+            <span class="role-extra-label">Start bankietu</span>
+            <span class="role-extra-value">{start}</span>
+          </div>
+          <div class="role-extra-item">
+            <span class="role-extra-label">Rodzic</span>
+            <span class="role-extra-value">{parent}</span>
+          </div>
+          <div class="role-extra-item">
+            <span class="role-extra-label">Dzieci</span>
+            <span class="role-extra-value">{children_count}</span>
+          </div>
+          <div class="role-extra-item">
+            <span class="role-extra-label">Dorośli</span>
+            <span class="role-extra-value">{adults_count}</span>
+          </div>
+          {balloons_markup}
+          {notes_markup}
+        </div>
+      </details>
+    """
+
+
+def render_logistics_chip(kind: str, primary: str, secondary: str = "") -> str:
+    if not primary:
+        return ""
+    icon = LOGISTICS_CHIP_ICONS.get(kind, LOGISTICS_CHIP_ICONS["kitchen"])
+    secondary_markup = f'<span class="logistics-chip-sub">{secondary}</span>' if secondary else ""
+    return f"""
+      <div class="logistics-chip logistics-chip-{escape(kind)}">
+        <span class="logistics-chip-icon" aria-hidden="true">{icon}</span>
+        <span class="logistics-chip-content">
+          <span class="logistics-chip-text">{primary}</span>
+          {secondary_markup}
+        </span>
+      </div>
+    """
+
+
+def render_logistics_grid(left_chips: list[str], right_chips: list[str]) -> str:
+    left_markup = "".join(chip for chip in left_chips if chip)
+    right_markup = "".join(chip for chip in right_chips if chip)
+    if not left_markup and not right_markup:
+        return ""
+    left_column = f'<div class="logistics-column">{left_markup}</div>' if left_markup else ""
+    right_column = f'<div class="logistics-column">{right_markup}</div>' if right_markup else ""
+    return f'<div class="timeline-logistics">{left_column}{right_column}</div>'
+
+
+ROOM_TAG_THEMES = {
+    "Zima": ("❄️", "winter"),
+    "Biały Dom": ("🏛️", "white-house"),
+    "Magiczny Las": ("🌲", "forest"),
+    "Wróżki": ("✨", "fairy"),
+    "Kosmos": ("🚀", "space"),
+    "Football": ("⚽", "football"),
+}
+
+PROFILE_USER_ICON = (
+    '<svg class="profile-guardian-svg" viewBox="0 0 24 24" aria-hidden="true">'
+    '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>'
+    '<circle cx="12" cy="7" r="4"/>'
+    "</svg>"
+)
+
+
+def format_age_label(age: object) -> str:
+    try:
+        value = int(age)
+    except (TypeError, ValueError):
+        return ""
+    if value == 1:
+        return "1 rok"
+    if value % 10 in (2, 3, 4) and value % 100 not in (12, 13, 14):
+        return f"{value} lata"
+    return f"{value} lat"
+
+
+def render_profile_room_tag(location: object) -> str:
+    normalized = normalize_location(location)
+    if normalized == EMPTY_LOCATION:
+        return ""
+    display = escape(display_location(normalized))
+    theme_key = normalized.split(". ", 1)[-1] if ". " in normalized else normalized
+    emoji, theme_class = ROOM_TAG_THEMES.get(theme_key, ("📍", "default"))
+    return (
+        f'<span class="profile-tag profile-tag-room profile-tag-room-{theme_class}">'
+        f'<span class="profile-tag-icon" aria-hidden="true">{emoji}</span> {display}'
+        f"</span>"
     )
+
+
+def render_waiter_assignment(row: sqlite3.Row, role: str, day: str) -> str:
+    if not can_assign_waiter(role):
+        return ""
+
+    reservation_id = int(row["id"])
+    assigned = str(row["assigned_waiter"] or "").strip()
+    action = f"/assign-waiter?role={escape(role)}&day={escape(day)}"
+    available_waiters = [name for name in WAITERS if name != assigned]
+    options = "".join(
+        f"""
+        <form method="post" action="{action}" class="waiter-option-form">
+          <input type="hidden" name="id" value="{reservation_id}">
+          <input type="hidden" name="waiter" value="{escape(name)}">
+          <button type="submit" class="button secondary waiter-option">{escape(name)}</button>
+        </form>
+        """
+        for name in available_waiters
+    )
+    empty_options = '<span class="muted">Brak innych kelnerów</span>' if assigned else '<span class="muted">Brak kelnerów</span>'
+
+    if assigned:
+        return f"""
+      <div class="waiter-assignment is-assigned">
+        <span class="waiter-assignment-label">Kelner: <strong>{escape(assigned)}</strong></span>
+        <details class="waiter-picker">
+          <summary class="button secondary">Zmień</summary>
+          <div class="waiter-options">{options or empty_options}</div>
+        </details>
+        <form method="post" action="{action}" class="inline-form">
+          <input type="hidden" name="id" value="{reservation_id}">
+          <input type="hidden" name="waiter" value="">
+          <button type="submit" class="button secondary waiter-remove-btn">Usuń</button>
+        </form>
+      </div>
+    """
 
     return f"""
-      <div class="reservation-details">
-        <div class="reservation-block full banquet-header-block">
-          {render_banquet_header(row)}
-        </div>
-        <div class="reservation-block">
-          <div class="reservation-label">Miejsce rodziców</div>
-          <div>{escape(display_locations(row["adult_location"]))}</div>
-        </div>
-        {animator_block}
-        {kitchen_block}
-        {notes}
+      <div class="waiter-assignment">
+        <details class="waiter-picker">
+          <summary class="button secondary">Przypisz kelnera</summary>
+          <div class="waiter-options">{options or empty_options}</div>
+        </details>
       </div>
+    """
+
+
+def render_profile_identity(row: sqlite3.Row | dict[str, object]) -> str:
+    children = birthday_children_from_row(row)
+
+    names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
+    name_markup = ", ".join(names) if names else "Brak solenizanta"
+
+    age_tags = "".join(
+        f'<span class="profile-tag profile-tag-age">{escape(format_age_label(child.get("age")))}</span>'
+        for child in children
+        if format_age_label(child.get("age"))
+    )
+    child_location = row["child_location"] if not isinstance(row, dict) else row.get("child_location", "")
+    room_tag = render_profile_room_tag(child_location)
+    tags_markup = age_tags + room_tag
+    tags_block = f'<div class="profile-tags">{tags_markup}</div>' if tags_markup else ""
+
+    return f"""
+      <div class="profile-identity">
+        <h3 class="profile-name">{name_markup}</h3>
+        {tags_block}
+      </div>
+    """
+
+
+def render_profile_guardian(row: sqlite3.Row | dict[str, object]) -> str:
+    parent_raw = row["parent_name"] if not isinstance(row, dict) else row.get("parent_name", "")
+    parent = escape(str(parent_raw))
+    if not parent:
+        return ""
+    return f'<div class="profile-guardian">{PROFILE_USER_ICON}<span>{parent}</span></div>'
+
+
+def render_profile_header(row: sqlite3.Row | dict[str, object]) -> str:
+    return render_profile_identity(row) + render_profile_guardian(row)
+
+
+def render_status_badge(status: str, cancellation_reason: str = "") -> str:
+    if status == "active":
+        return (
+            f'<span class="status-badge status-badge-active">'
+            f'<span class="status-badge-dot" aria-hidden="true"></span>'
+            f"{escape(STATUS_LABELS[status])}</span>"
+        )
+    reason = (
+        f'<span class="status-badge-reason">{escape(cancellation_reason)}</span>'
+        if cancellation_reason
+        else ""
+    )
+    return (
+        f'<span class="status-badge status-badge-cancelled">{escape(STATUS_LABELS[status])}</span>{reason}'
+    )
+
+
+def render_reservation_details(
+    row: sqlite3.Row,
+    include_notes: bool = True,
+    show_status: bool = False,
+    footer_markup: str = "",
+    role: str = "",
+    day: str = "today",
+    assign_waiter: bool = False,
+) -> str:
+    start_label = escape(format_time(row["start_at"]))
+
+    status = row["status"]
+    cancelled_class = " is-cancelled" if status == "cancelled" else ""
+
+    status_markup = ""
+    if show_status and status == "cancelled":
+        cancellation_reason = str(row["cancellation_reason"] or "")
+        status_markup = f'<div class="timeline-status">{render_status_badge(status, cancellation_reason)}</div>'
+
+    animator_items: list[tuple[str, str]] = []
+    if is_enabled(row, "animation_enabled"):
+        label = escape(row["animation_type"] or "Animacja")
+        window = escape(format_service_window(row["animation_at"], SERVICE_DURATIONS["animation_at"]))
+        animator_items.append((label, window))
+    if is_enabled(row, "pinata_enabled"):
+        label = escape(f"Piniata: {row['pinata_theme'] or '(brak)'}")
+        window = escape(format_service_window(row["pinata_at"], SERVICE_DURATIONS["pinata_at"]))
+        animator_items.append((label, window))
+    if is_enabled(row, "mascot_enabled"):
+        label = escape(f"Maskotka: {row['mascot_type'] or '(brak)'}")
+        window = escape(format_service_window(row["mascot_at"], SERVICE_DURATIONS["mascot_at"]))
+        animator_items.append((label, window))
+    if is_enabled(row, "balloons_enabled"):
+        label = escape(f"Balony: {row['balloons_description'] or '(brak)'}")
+        animator_items.append((label, ""))
+
+    left_chips: list[str] = []
+    location_label = escape(display_locations(row["adult_location"]))
+    if location_label:
+        left_chips.append(render_logistics_chip("location", location_label))
+
+    if is_enabled(row, "fruit_enabled"):
+        plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "brak liczby talerzy"
+        left_chips.append(render_logistics_chip("kitchen", f"Owoce ({escape(plates)})"))
+    if is_enabled(row, "cake_enabled"):
+        label = escape(f"Tort: {row['cake_theme'] or '(brak)'}")
+        window = escape(format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]))
+        left_chips.append(render_logistics_chip("cake", label, window))
+    if is_enabled(row, "culinary_workshops_enabled"):
+        label = escape(f"Warsztaty: {row['culinary_workshops_type'] or '(brak)'}")
+        window = escape(format_service_window(row["culinary_workshops_at"], SERVICE_DURATIONS["culinary_workshops_at"]))
+        left_chips.append(render_logistics_chip("kitchen", label, window))
+
+    right_chips = [
+        render_logistics_chip("attraction", label, window)
+        for label, window in animator_items
+    ]
+    logistics_markup = render_logistics_grid(left_chips, right_chips)
+
+    callouts: list[str] = []
+    if include_notes and row["notes"]:
+        callouts.append(render_note_callout(str(row["notes"])))
+    if status == "cancelled" and row["cancellation_reason"]:
+        callouts.append(render_note_callout(str(row["cancellation_reason"]), tone="danger", label="Anulowanie"))
+    notes_markup = "".join(callouts)
+
+    footer = f'<footer class="timeline-footer">{footer_markup}</footer>' if footer_markup else ""
+    waiter_markup = render_waiter_assignment(row, role, day) if assign_waiter else ""
+
+    return f"""
+      <article class="timeline-card{cancelled_class}">
+        <header class="timeline-header">
+          <time class="timeline-start" datetime="{escape(str(row['start_at']))}">{start_label}</time>
+          {render_profile_identity(row)}
+          {waiter_markup}
+          {render_profile_guardian(row)}
+          {status_markup}
+        </header>
+        {logistics_markup}
+        {notes_markup}
+        {footer}
+      </article>
     """
 
 
@@ -3246,6 +6106,16 @@ def render_mascot_type_select(values: dict[str, object], errors: dict[str, str])
 """
 
 
+def render_balloons_description_input(values: dict[str, object], errors: dict[str, str]) -> str:
+    return f"""
+        <label class="service-extra">
+          Opis balonów
+          <input name="balloons_description" value="{escape(values.get("balloons_description", ""))}" placeholder="np. girlanda z imieniem, 10 balonów helowych">
+          {error_for(errors, "balloons_description")}
+        </label>
+"""
+
+
 def format_duration(minutes: int | None) -> str:
     if minutes is None:
         return ""
@@ -3308,7 +6178,7 @@ def render_service_option(
 """
 
 
-def render_room_plan(values: dict[str, object], errors: dict[str, str]) -> str:
+def render_room_plan(values: dict[str, object], errors: dict[str, str], *, compact: bool = False) -> str:
     statuses = availability_for(
         str(values.get("reservation_date", "")),
     )
@@ -3373,6 +6243,31 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str]) -> str:
 """
         )
 
+    svg_markup = f"""
+        <svg class="room-plan" viewBox="0 0 940 560" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
+          <path d="M40 252 H250 V338 H40 Z" class="plan-outline"></path>
+          <path d="M280 148 H592 V338 H280 Z" class="plan-outline"></path>
+          <path d="M628 76 H804 L880 164 V338 H628 Z" class="plan-outline"></path>
+          <path d="M736 338 H912 V532 H736 Z" class="plan-outline"></path>
+          <text class="plan-caption" x="92" y="392" font-size="13" font-weight="900">Pokoje / loże tematyczne</text>
+          {''.join(zones)}
+          {''.join(table_nodes)}
+          {''.join(room_nodes)}
+        </svg>
+"""
+
+    if compact:
+        return f"""
+<div class="plan-block" id="room-plan">
+  <div class="plan-block-title">PLAN SALI</div>
+  {svg_markup}
+  <div class="plan-legend plan-legend-bottom">
+    <span><span class="legend-key key-free"></span>WOLNE</span>
+    <span><span class="legend-key key-busy"></span>ZAJĘTE</span>
+  </div>
+</div>
+"""
+
     return f"""
 <div class="location-accordion plan-accordion is-open full" data-accordion="room-plan" id="room-plan-accordion">
   <button type="button" class="location-accordion-head plan-accordion-head" aria-expanded="true">
@@ -3389,17 +6284,7 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str]) -> str:
   <div class="location-accordion-panel">
     <div class="location-accordion-body">
       <div class="plan-wrap">
-        <svg class="room-plan" viewBox="0 0 940 560" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
-          <rect x="16" y="16" width="908" height="528" fill="none" stroke="#343944" stroke-width="2"></rect>
-          <path d="M40 252 H250 V338 H40 Z" class="plan-outline"></path>
-          <path d="M280 148 H592 V338 H280 Z" class="plan-outline"></path>
-          <path d="M628 76 H804 L880 164 V338 H628 Z" class="plan-outline"></path>
-          <path d="M736 338 H912 V532 H736 Z" class="plan-outline"></path>
-          <text x="92" y="392" font-size="13" font-weight="900" fill="#aab3c2">Pokoje / loże tematyczne</text>
-          {''.join(zones)}
-          {''.join(table_nodes)}
-          {''.join(room_nodes)}
-        </svg>
+{svg_markup}
       </div>
     </div>
   </div>
@@ -3555,6 +6440,7 @@ def render_form(
           {render_service_option(values, errors, "culinary_workshops_enabled", "culinary_workshops_at", "Warsztaty kulinarne", SERVICE_DURATIONS["culinary_workshops_at"], render_workshop_type_select(values, errors))}
           {render_service_option(values, errors, "pinata_enabled", "pinata_at", "Piniata", SERVICE_DURATIONS["pinata_at"], render_pinata_theme_input(values, errors))}
           {render_service_option(values, errors, "mascot_enabled", "mascot_at", "Maskotka", SERVICE_DURATIONS["mascot_at"], render_mascot_type_select(values, errors))}
+          {render_service_option(values, errors, "balloons_enabled", "balloons_at", "Balony", None, render_balloons_description_input(values, errors), show_time=False)}
         </div>
       </div>
 
@@ -3611,6 +6497,9 @@ def service_pills(row: sqlite3.Row) -> str:
         if row["mascot_type"]:
             mascot_label = f"Maskotka: {row['mascot_type']}"
         items.append((mascot_label, row["mascot_at"], SERVICE_DURATIONS["mascot_at"]))
+    if is_enabled(row, "balloons_enabled"):
+        balloons_label = f"Balony: {row['balloons_description'] or '(brak)'}"
+        items.append((balloons_label, row["balloons_at"], None))
 
     if not items:
         return '<span class="pill">Bez dodatków</span>'
@@ -3625,86 +6514,43 @@ def render_metrics(rows: list[sqlite3.Row]) -> str:
     animation_count = sum(1 for row in active if is_enabled(row, "animation_enabled"))
     workshops = sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled"))
     cakes = sum(1 for row in active if is_enabled(row, "cake_enabled"))
-    kitchen = sum(
-        1
-        for row in active
-        if is_enabled(row, "fruit_enabled")
-        or is_enabled(row, "culinary_workshops_enabled")
-    )
+    pinatas = sum(1 for row in active if is_enabled(row, "pinata_enabled"))
     guests = sum(int(row["children_count"]) + int(row["adults_count"]) for row in active)
     return f"""
-<section>
-  <div class="section-body">
-    <div class="metrics">
-      <div class="metric"><strong>{len(active)}</strong><span class="muted">aktywne rezerwacje</span></div>
-      <div class="metric"><strong>{guests}</strong><span class="muted">goście łącznie</span></div>
-      <div class="metric"><strong>{animation_count}</strong><span class="muted">animacje</span></div>
-      <div class="metric"><strong>{workshops}</strong><span class="muted">warsztaty</span></div>
-      <div class="metric"><strong>{cakes}</strong><span class="muted">torty · kuchnia: {kitchen}</span></div>
-    </div>
-  </div>
-</section>
+<div class="metrics">
+  {render_metric(len(active), "bankiety", "bankiety")}
+  {render_metric(guests, "liczba gości", "guests")}
+  {render_metric(animation_count, "animacje", "animacje")}
+  {render_metric(pinatas, "piniaty", "piniaty")}
+  {render_metric(cakes, "torty", "torty")}
+  {render_metric(workshops, "warsztaty", "warsztaty")}
+</div>
 """
 
 
 def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
+    target_day = selected_day(day)
+    weekday = WEEKDAY_LABELS[target_day.weekday()]
+    day_label = f"{weekday} · {target_day.strftime('%d.%m')}"
     if not rows:
         body = '<div class="empty">Brak rezerwacji w wybranym dniu.</div>'
     else:
-        table_rows = []
-        for row in rows:
-            status_class = "ok" if row["status"] == "active" else "cancelled"
-            cancellation = (
-                f'<div class="muted">Powód: {escape(row["cancellation_reason"])}</div>'
-                if row["status"] == "cancelled" and row["cancellation_reason"]
-                else ""
+        cards = [
+            render_reservation_details(
+                row,
+                include_notes=True,
+                show_status=True,
+                role=role,
+                day=day,
+                assign_waiter=True,
             )
-            notes = f'<div class="muted">{escape(row["notes"])}</div>' if row["notes"] else ""
-            table_rows.append(
-                f"""
-                <tr>
-                  <td colspan="4">
-                    {render_reservation_details(row, include_notes=False)}
-                    {notes}
-                  </td>
-                  <td>
-                    <span class="pill {status_class}">{escape(STATUS_LABELS[row["status"]])}</span>{cancellation}
-                    <div class="inline-actions">
-                      <a class="button secondary" href="{link_for("organizer", day, edit=row["id"])}">Edytuj</a>
-                      <form class="inline-form" method="post" action="/delete?role={escape(role)}&day={escape(day)}" onsubmit="return confirm('Usunąć tę rezerwację? Tej operacji nie można cofnąć.');">
-                        <input type="hidden" name="id" value="{escape(row["id"])}">
-                        <button class="button danger" type="submit">Usuń</button>
-                      </form>
-                    </div>
-                  </td>
-                </tr>
-                """
-            )
-        body = f"""
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th colspan="4">Szczegóły rezerwacji</th>
-                <th>Status i akcje</th>
-              </tr>
-            </thead>
-            <tbody>{''.join(table_rows)}</tbody>
-          </table>
-        </div>
-        """
+            for row in rows
+        ]
+        body = "".join(cards)
 
     return f"""
-<section>
-  <div class="section-head">
-    <div>
-      <h2>Dzień operacyjny</h2>
-      <p class="subtitle">Pełny widok rezerwacji dla recepcji i kierownika zmiany.</p>
-    </div>
-    <span class="count">{len(rows)} pozycji</span>
-  </div>
+  <div class="day-heading">{escape(day_label)}</div>
   {body}
-</section>
 """
 
 
@@ -3745,29 +6591,30 @@ def render_animator_view(rows: list[sqlite3.Row]) -> str:
 
     banquet_cards = []
     for _, row, task_items, notes in banquets:
-        notes_markup = f'<div class="banquet-notes muted">{escape(notes)}</div>' if notes else ""
         task_markup = "".join(
             f"""
               <div class="banquet-task">
-                <div class="schedule-time">{escape(time_label)}</div>
-                <div class="schedule-title">{escape(task_name)}</div>
+                <div class="task-time">{escape(time_label)}</div>
+                <div class="task-detail">
+                  <div class="task-label">{escape(task_name)}</div>
+                </div>
               </div>
             """
             for time_label, task_name in task_items
         )
         banquet_cards.append(
             f"""
-            <div class="banquet-card">
-              <div class="banquet-title">{render_banquet_header(row)}</div>
-              {notes_markup}
+            <div class="banquet-card role-card animator-card">
+              {render_role_card_identity(row)}
               <div class="banquet-tasks">{task_markup}</div>
+              {render_role_extra_info(row, notes)}
             </div>
             """
         )
 
     task_count = sum(len(task_items) for _, _, task_items, _ in banquets)
     return f"""
-<section>
+<section class="role-board animator-board">
   <div class="section-head">
     <div>
       <h2>Animatorzy</h2>
@@ -3793,52 +6640,53 @@ def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
         if not (has_fruit or has_cake or has_workshops):
             continue
 
-        fruit_body = '<span class="kitchen-cell-empty">Brak</span>'
+        task_items = []
         if has_fruit:
             plates = f"{row['fruit_plates']} tal." if row["fruit_plates"] else "brak liczby talerzy"
-            fruit_body = (
-                f"<div>{escape(plates)}</div>"
-                f"<div class=\"muted\">{escape(format_time(row['start_at']))}</div>"
-            )
+            task_items.append((format_time(row["start_at"]), "Owoce", plates))
 
-        cake_body = '<span class="kitchen-cell-empty">Brak</span>'
         if has_cake:
-            cake_body = (
-                f"<div>{escape(row['cake_theme'] or '(brak)')}</div>"
-                f"<div class=\"muted\">{escape(format_service_window(row['cake_at'], SERVICE_DURATIONS['cake_at']))}</div>"
-            )
+            cake_window = format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"])
+            task_items.append((format_time(row["cake_at"]), "Tort", row["cake_theme"] or "(brak)", cake_window))
 
-        workshop_body = '<span class="kitchen-cell-empty">Brak</span>'
         if has_workshops:
             workshop_name = row["culinary_workshops_type"] or "Warsztaty"
-            workshop_body = (
-                f"<div>{escape(workshop_name)}</div>"
-                f"<div class=\"muted\">{escape(format_service_window(row['culinary_workshops_at'], SERVICE_DURATIONS['culinary_workshops_at']))}</div>"
+            workshop_window = format_service_window(
+                row["culinary_workshops_at"],
+                SERVICE_DURATIONS["culinary_workshops_at"],
             )
+            task_items.append((format_time(row["culinary_workshops_at"]), "Warsztaty", workshop_name, workshop_window))
 
-        notes_markup = f'<div class="banquet-notes muted">{escape(row["notes"])}</div>' if row["notes"] else ""
-        sort_time = format_time(row["cake_at"]) or format_time(row["start_at"])
+        task_items = [item for item in task_items if item[0]]
+        if not task_items:
+            continue
+        task_items.sort(key=lambda item: (item[0], item[1]))
+        task_blocks = []
+        for item in task_items:
+            meta = escape(item[2])
+            if len(item) > 3 and item[3]:
+                meta = f"{meta} · {escape(item[3])}"
+            task_blocks.append(
+                f"""
+              <div class="banquet-task kitchen-task">
+                <div class="task-time">{escape(item[0])}</div>
+                <div class="task-detail">
+                  <div class="task-label">{escape(item[1])}</div>
+                  <div class="task-meta">{meta}</div>
+                </div>
+              </div>
+            """
+            )
+        task_markup = "".join(task_blocks)
+        sort_time = task_items[0][0]
         banquet_entries.append(
             (
                 sort_time,
-                f"""
-            <div class="banquet-card kitchen-card">
-              <div class="banquet-title">{render_banquet_header(row)}</div>
-              {notes_markup}
-              <div class="kitchen-columns">
-                <div class="kitchen-column-cell">
-                  <div class="kitchen-column-label">Owoce</div>
-                  {fruit_body}
-                </div>
-                <div class="kitchen-column-cell">
-                  <div class="kitchen-column-label">Tort</div>
-                  {cake_body}
-                </div>
-                <div class="kitchen-column-cell">
-                  <div class="kitchen-column-label">Warsztaty</div>
-                  {workshop_body}
-                </div>
-              </div>
+            f"""
+            <div class="banquet-card role-card kitchen-card">
+              {render_role_card_identity(row)}
+              <div class="banquet-tasks kitchen-orders">{task_markup}</div>
+              {render_role_extra_info(row, row["notes"])}
             </div>
             """,
             )
@@ -3851,11 +6699,11 @@ def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
     banquet_cards = [markup for _, markup in banquet_entries]
 
     return f"""
-<section>
+<section class="role-board kitchen-board-section">
   <div class="section-head">
     <div>
       <h2>Kuchnia</h2>
-      <p class="subtitle">Informacje o bankiecie i notatka w nagłówku, zamówienia w kolumnach poniżej.</p>
+      <p class="subtitle">Owoce, torty i warsztaty.</p>
     </div>
     <span class="count">{len(banquet_cards)} bankietów</span>
   </div>
@@ -3866,37 +6714,41 @@ def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
 """
 
 
-def render_organizer_view(rows: list[sqlite3.Row]) -> str:
-    active = [row for row in rows if row["status"] == "active"]
-    if not active:
-        return '<section><div class="empty">Brak aktywnych urodzin w wybranym dniu.</div></section>'
-
-    table_rows = []
-    for row in active:
-        table_rows.append(
-            f"""
-            <tr>
-              <td colspan="2">{render_reservation_details(row)}</td>
-            </tr>
+def render_organizer_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
+    if not rows:
+        body = '<div class="empty">Brak rezerwacji w wybranym dniu.</div>'
+    else:
+        cards = []
+        for row in rows:
+            actions = f"""
+              <div class="inline-actions">
+                <a class="button secondary" href="{link_for(role, day, edit=row["id"])}">Edytuj</a>
+                <a class="button secondary" href="/history?id={escape(row["id"])}&role={escape(role)}&day={escape(day)}">Historia</a>
+                <form class="inline-form" method="post" action="/delete?role={escape(role)}&day={escape(day)}" onsubmit="return confirm('Usunąć tę rezerwację? Tej operacji nie można cofnąć.');">
+                  <input type="hidden" name="id" value="{escape(row["id"])}">
+                  <button class="button danger" type="submit">Usuń</button>
+                </form>
+              </div>
             """
-        )
+            cards.append(
+                render_reservation_details(
+                    row,
+                    include_notes=True,
+                    show_status=True,
+                    footer_markup=actions,
+                )
+            )
+        body = "".join(cards)
 
     return f"""
-<section>
   <div class="section-head">
     <div>
-      <h2>Organizator urodzin</h2>
-      <p class="subtitle">Podgląd bankietów, lokalizacji i dodatków dla wybranego dnia.</p>
+      <h2>Rezerwacje dnia</h2>
+      <p class="subtitle">Zarządzanie rezerwacjami, statusami i dodatkami dla wybranego dnia.</p>
     </div>
-    <span class="count">{len(active)} bankietów</span>
+    <span class="count">{len(rows)} pozycji</span>
   </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th colspan="2">Rezerwacje</th></tr></thead>
-      <tbody>{''.join(table_rows)}</tbody>
-    </table>
-  </div>
-</section>
+  {body}
 """
 
 
@@ -3906,7 +6758,7 @@ def render_role_view(role: str, rows: list[sqlite3.Row], day: str) -> str:
     if role == "kitchen":
         return render_kitchen_view(rows)
     if role == "organizer":
-        return render_organizer_view(rows)
+        return render_organizer_view(rows, role, day)
     return render_manager_view(rows, role, day)
 
 
@@ -3924,6 +6776,7 @@ def render_schema_summary() -> str:
         "culinary_workshops_enabled / culinary_workshops_type / culinary_workshops_at",
         "pinata_enabled / pinata_theme / pinata_at",
         "mascot_enabled / mascot_type / mascot_at",
+        "balloons_enabled / balloons_description / balloons_at",
         "notes",
         "status / cancellation_reason",
         "created_at / updated_at",
@@ -3954,11 +6807,19 @@ def render_home(
     errors: dict[str, str] | None = None,
     edit_id: int | None = None,
 ) -> bytes:
+    page_role = normalize_page_role(role)
     role = normalize_role(role)
     day = normalize_day(day)
     errors = errors or {}
     target_day = selected_day(day)
     rows = get_reservations_for_day(target_day)
+
+    if page_role == "home":
+        content = render_nav(page_role, day) + f'<div class="home-summary">{render_metrics(rows)}</div>'
+        return page_template(content, message=message, errors=errors, role=page_role, day=day)
+
+    if role != "organizer":
+        edit_id = None
 
     if values is None and edit_id:
         row = get_reservation(edit_id)
@@ -3969,20 +6830,9 @@ def render_home(
     if values is None:
         values = default_form_values(target_day)
 
-    content = render_nav(role, day) + render_metrics(rows)
-    if role == "manager":
-        content += f"""
-<div class="layout">
-  <div class="stack">
-    {render_room_plan(values, errors)}
-  </div>
-  <div class="stack">
-    {render_role_view(role, rows, day)}
-  </div>
-</div>
-"""
-    elif role == "organizer":
-        content += f"""
+    content = render_nav(page_role, day)
+    if role == "organizer":
+        content += render_organizer_tools(role, day) + f"""
 <div class="stack">
   {render_form(values, errors, role, day, include_plan=True)}
 </div>
@@ -3991,6 +6841,13 @@ def render_home(
 </div>
 {room_plan_script()}
 """
+    elif role == "manager":
+        content += f"""
+<div class="stack manager-layout">
+  {render_role_view(role, rows, day)}
+  {render_room_plan(values, errors, compact=True)}
+</div>
+"""
     else:
         content += f"""
 <div class="stack">
@@ -3998,7 +6855,7 @@ def render_home(
 </div>
 """
 
-    return page_template(content, message=message, errors=errors, role=role, day=day)
+    return page_template(content, message=message, errors=errors, role=page_role, day=day)
 
 
 def room_plan_script() -> str:
@@ -4533,6 +7390,9 @@ CREATE TABLE reservations (
   mascot_enabled BOOLEAN NOT NULL DEFAULT false,
   mascot_type TEXT,
   mascot_at TIMESTAMPTZ,
+  balloons_enabled BOOLEAN NOT NULL DEFAULT false,
+  balloons_description TEXT,
+  balloons_at TIMESTAMPTZ,
   notes TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL CHECK (status IN ('active', 'cancelled')),
   cancellation_reason TEXT,
@@ -4565,7 +7425,7 @@ CREATE TABLE reservation_history (
   </div>
   <div class="section-body">
     <p>Kluczowa decyzja: rezerwacja jest jednym agregatem z godzinami usług, a historia zmian jest osobną tabelą append-only. Konflikty liczone są po przedziale <code>start_at/end_at</code>, statusie <code>active</code> i lokalizacjach.</p>
-    <pre style="white-space: pre-wrap; border: 1px solid var(--line); padding: 14px; background: #0f172a; color: #e2e8f0; overflow-x: auto;"><code>{escape(sql.strip())}</code></pre>
+    <pre style="white-space: pre-wrap; border: 1px solid var(--line); padding: 14px; background: #ffffff; color: #000000; overflow-x: auto;"><code>{escape(sql.strip())}</code></pre>
   </div>
 </section>
 """
@@ -4606,6 +7466,11 @@ def render_history_page(reservation_id: int, role: str, day: str) -> bytes:
         if rows
         else '<div class="empty">Brak wpisów historii.</div>'
     )
+    back_link = (
+        f'<a class="button secondary" href="{link_for(role, day, edit=reservation_id)}">Wróć do edycji</a>'
+        if can_modify_reservations(role)
+        else f'<a class="button secondary" href="{link_for(role, day)}">Wróć do panelu</a>'
+    )
     content = render_nav(role, day) + f"""
 <section>
   <div class="section-head">
@@ -4613,7 +7478,7 @@ def render_history_page(reservation_id: int, role: str, day: str) -> bytes:
       <h2>Historia rezerwacji</h2>
       <p class="subtitle banquet-header-inline">{render_banquet_header(row)}</p>
     </div>
-    <a class="button secondary" href="{link_for(role, day, edit=reservation_id)}">Wróć do edycji</a>
+    {back_link}
   </div>
   {body}
 </section>
@@ -4661,6 +7526,9 @@ def csv_response() -> bytes:
             "Maskotka",
             "Rodzaj maskotki",
             "Maskotka czas",
+            "Balony",
+            "Opis balonów",
+            "Godzina balonów",
             "Status",
             "Powód anulowania",
             "Notatki",
@@ -4697,6 +7565,9 @@ def csv_response() -> bytes:
                 "Tak" if is_enabled(row, "mascot_enabled") else "Nie",
                 row["mascot_type"] or "",
                 format_service_window(row["mascot_at"], SERVICE_DURATIONS["mascot_at"]),
+                "Tak" if is_enabled(row, "balloons_enabled") else "Nie",
+                row["balloons_description"] or "",
+                format_time(row["balloons_at"]),
                 STATUS_LABELS[row["status"]],
                 row["cancellation_reason"],
                 row["notes"],
@@ -4705,7 +7576,24 @@ def csv_response() -> bytes:
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
+def icon_size_for_path(path: str) -> int | None:
+    filenames = {
+        f"/app-icon-{size}.png": size
+        for size in PWA_ICON_SIZES
+    }
+    filenames.update({
+        f"/static/icon-{size}.png": size
+        for size in PWA_ICON_SIZES
+    })
+    filenames["/favicon.ico"] = 48
+    return filenames.get(path)
+
+
 class ReservationHandler(BaseHTTPRequestHandler):
+    def handle(self) -> None:
+        maybe_reload_dev_server()
+        return super().handle()
+
     def send_bytes(
         self,
         payload: bytes,
@@ -4716,6 +7604,8 @@ class ReservationHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        if content_type.startswith("text/html"):
+            self.send_header("Cache-Control", "no-store")
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -4729,7 +7619,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        role = normalize_role(query.get("role", ["manager"])[0])
+        role = normalize_page_role(query.get("role", ["manager"])[0])
         day = normalize_day(query.get("day", ["today"])[0])
 
         if parsed.path == "/":
@@ -4741,9 +7631,73 @@ class ReservationHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/logo.png":
             if LOGO_PATH.exists():
-                self.send_bytes(LOGO_PATH.read_bytes(), content_type="image/png")
+                self.send_bytes(
+                    LOGO_PATH.read_bytes(),
+                    content_type="image/png",
+                    extra_headers={"Cache-Control": "public, max-age=31536000, immutable"},
+                )
                 return
             self.send_bytes(b"", status=HTTPStatus.NOT_FOUND, content_type="image/png")
+            return
+
+        if parsed.path == "/menu-logo.png":
+            if MENU_LOGO_PATH.exists():
+                self.send_bytes(
+                    MENU_LOGO_PATH.read_bytes(),
+                    content_type="image/png",
+                    extra_headers={"Cache-Control": "public, max-age=31536000, immutable"},
+                )
+                return
+            self.send_bytes(b"", status=HTTPStatus.NOT_FOUND, content_type="image/png")
+            return
+
+        if parsed.path == "/ca.crt":
+            ensure_local_certificate()
+            self.send_bytes(
+                CA_CERT_PATH.read_bytes(),
+                content_type="application/x-x509-ca-cert",
+                extra_headers={"Content-Disposition": 'attachment; filename="ikids-local-ca.crt"'},
+            )
+            return
+
+        if parsed.path in {"/app-icon.svg", "/static/app-icon.svg"}:
+            self.send_bytes(
+                app_icon_svg(),
+                content_type="image/svg+xml; charset=utf-8",
+                extra_headers={"Cache-Control": "public, max-age=86400"},
+            )
+            return
+
+        icon_size = icon_size_for_path(parsed.path)
+        if icon_size is not None:
+            self.send_bytes(
+                app_icon_png(icon_size),
+                content_type="image/png",
+                extra_headers={"Cache-Control": "public, max-age=86400"},
+            )
+            return
+
+        if parsed.path in {"/manifest.webmanifest", "/static/manifest.json"}:
+            self.send_bytes(
+                manifest_response(),
+                content_type="application/manifest+json; charset=utf-8",
+                extra_headers={"Cache-Control": "no-store"},
+            )
+            return
+
+        if parsed.path in {"/sw.js", "/static/sw.js"}:
+            self.send_bytes(
+                service_worker_response(),
+                content_type="text/javascript; charset=utf-8",
+                extra_headers={
+                    "Cache-Control": "no-store",
+                    "Service-Worker-Allowed": "/",
+                },
+            )
+            return
+
+        if parsed.path == "/offline":
+            self.send_bytes(offline_response())
             return
 
         if parsed.path == "/schema":
@@ -4788,7 +7742,39 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed.path in {"/", "/export", "/schema", "/api/availability"}:
+        if parsed.path == "/ca.crt":
+            ensure_local_certificate()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-x509-ca-cert")
+            self.end_headers()
+            return
+
+        if parsed.path in {"/app-icon.svg", "/static/app-icon.svg"}:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.end_headers()
+            return
+
+        if icon_size_for_path(parsed.path) is not None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            return
+
+        if parsed.path in {"/manifest.webmanifest", "/static/manifest.json"}:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/manifest+json; charset=utf-8")
+            self.end_headers()
+            return
+
+        if parsed.path in {"/sw.js", "/static/sw.js"}:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Service-Worker-Allowed", "/")
+            self.end_headers()
+            return
+
+        if parsed.path in {"/", "/export", "/schema", "/api/availability", "/offline"}:
             self.send_response(HTTPStatus.OK)
             self.send_header(
                 "Content-Type",
@@ -4803,31 +7789,59 @@ class ReservationHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        role = normalize_role(query.get("role", ["manager"])[0])
+        raw_role = query.get("role", ["manager"])[0]
+        page_role = normalize_page_role(raw_role)
+        work_role = normalize_role(raw_role)
         day = normalize_day(query.get("day", ["today"])[0])
         data = parse_post(self)
 
         if parsed.path == "/reservations":
+            if not can_modify_reservations(work_role):
+                self.redirect(link_for(page_role, day, message="Brak uprawnień do zapisu rezerwacji."))
+                return
             raw_id = data.get("id", "")
             reservation_id = int(raw_id) if raw_id.isdigit() else None
             values, errors = validate_reservation(data, reservation_id=reservation_id)
             if errors:
                 self.send_bytes(
-                    render_home(role=role, day=day, values=values, errors=errors),
+                    render_home(role=work_role, day=day, values=values, errors=errors),
                     status=HTTPStatus.BAD_REQUEST,
                 )
                 return
-            saved_id = save_reservation(values, role=role)
+            saved_id = save_reservation(values, role=work_role)
             message = "Rezerwacja została zaktualizowana." if reservation_id else "Rezerwacja została zapisana."
-            self.redirect(link_for(role, day, edit=saved_id, message=message))
+            self.redirect(link_for(work_role, day, edit=saved_id, message=message))
             return
 
         if parsed.path == "/delete":
+            if not can_modify_reservations(work_role):
+                self.redirect(link_for(page_role, day, message="Brak uprawnień do usuwania rezerwacji."))
+                return
             raw_id = data.get("id", "")
             if raw_id.isdigit() and delete_reservation(int(raw_id)):
-                self.redirect(link_for(role, day, message="Rezerwacja została usunięta."))
+                self.redirect(link_for(work_role, day, message="Rezerwacja została usunięta."))
             else:
-                self.redirect(link_for(role, day, message="Nie znaleziono rezerwacji do usunięcia."))
+                self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji do usunięcia."))
+            return
+
+        if parsed.path == "/assign-waiter":
+            if not can_assign_waiter(work_role):
+                self.redirect(link_for(page_role, day, message="Brak uprawnień do przypisania kelnera."))
+                return
+            raw_id = data.get("id", "")
+            if not raw_id.isdigit():
+                self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji."))
+                return
+            waiter = data.get("waiter", "")
+            if assign_waiter(int(raw_id), waiter or None, work_role):
+                message = (
+                    "Kelner został przypisany."
+                    if waiter.strip()
+                    else "Przypisanie kelnera zostało usunięte."
+                )
+                self.redirect(link_for(work_role, day, message=message))
+            else:
+                self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować kelnera."))
             return
 
         payload = json.dumps({"error": "Unsupported route"}, ensure_ascii=False).encode("utf-8")
@@ -4838,13 +7852,241 @@ class ReservationHandler(BaseHTTPRequestHandler):
         print(f"[{timestamp}] {self.address_string()} {format % args}")
 
 
+class ThreadingHTTPSServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        ssl_context: ssl.SSLContext,
+    ) -> None:
+        self.ssl_context = ssl_context
+        super().__init__(server_address, request_handler_class)
+
+    def get_request(self) -> tuple[ssl.SSLSocket, tuple[str, int]]:
+        socket_obj, address = self.socket.accept()
+        socket_obj.settimeout(8)
+        return (
+            self.ssl_context.wrap_socket(
+                socket_obj,
+                server_side=True,
+                do_handshake_on_connect=False,
+            ),
+            address,
+        )
+
+    def handle_error(self, request: object, client_address: tuple[str, int]) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, TimeoutError)):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{timestamp}] {client_address[0]} odrzucone połączenie TLS: {exc}")
+            return
+        super().handle_error(request, client_address)
+
+
+def maybe_reload_dev_server() -> None:
+    global SOURCE_MTIME
+    current_mtime = SOURCE_PATH.stat().st_mtime
+    if current_mtime == SOURCE_MTIME:
+        return
+    SOURCE_MTIME = current_mtime
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"\n[{timestamp}] Wykryto zmiany w {SOURCE_PATH.name}, przeładowuję serwer...")
+    os.execv(sys.executable, [sys.executable, str(SOURCE_PATH), *sys.argv[1:]])
+
+
+def local_ipv4_addresses() -> list[str]:
+    addresses = {"127.0.0.1"}
+    hostname = socket.gethostname()
+    try:
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            addresses.add(info[4][0])
+    except OSError:
+        pass
+
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        addresses.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        if "probe" in locals():
+            probe.close()
+
+    return sorted(addresses)
+
+
+def certificate_matches_hosts(cert_path: Path, hosts: list[str]) -> bool:
+    if not cert_path.exists():
+        return False
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(cert_path))
+    except (OSError, ssl.SSLError):
+        return False
+    alt_names = {value for kind, value in decoded.get("subjectAltName", []) if kind in {"DNS", "IP Address"}}
+    return "localhost" in alt_names and all(host in alt_names for host in hosts)
+
+
+def certificate_is_issued_by_local_ca(cert_path: Path) -> bool:
+    if not cert_path.exists() or not CA_CERT_PATH.exists():
+        return False
+    result = subprocess.run(
+        ["openssl", "verify", "-CAfile", str(CA_CERT_PATH), str(cert_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def generate_local_ca() -> None:
+    if CA_CERT_PATH.exists() and CA_KEY_PATH.exists():
+        return
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "3650",
+            "-nodes",
+            "-keyout",
+            str(CA_KEY_PATH),
+            "-out",
+            str(CA_CERT_PATH),
+            "-subj",
+            "/CN=iKids Park Local CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE,pathlen:0",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    CA_KEY_PATH.chmod(0o600)
+
+
+def ensure_local_certificate() -> tuple[Path, Path]:
+    ipv4_addresses = local_ipv4_addresses()
+    try:
+        generate_local_ca()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Nie udało się wygenerować lokalnego CA HTTPS przez openssl.") from exc
+
+    if (
+        CERT_PATH.exists()
+        and KEY_PATH.exists()
+        and certificate_matches_hosts(CERT_PATH, ipv4_addresses)
+        and certificate_is_issued_by_local_ca(CERT_PATH)
+    ):
+        return CERT_PATH, KEY_PATH
+
+    alt_names = ["DNS:localhost", *[f"IP:{address}" for address in ipv4_addresses]]
+    openssl_config = f"""
+[req]
+distinguished_name = req_distinguished_name
+prompt = no
+
+[req_distinguished_name]
+CN = iKids Park Local
+
+[v3_req]
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = {", ".join(alt_names)}
+"""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as config_file:
+        config_file.write(openssl_config)
+        config_path = config_file.name
+    csr_path = tempfile.NamedTemporaryFile(delete=False).name
+
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-nodes",
+                "-keyout",
+                str(KEY_PATH),
+                "-out",
+                csr_path,
+                "-config",
+                config_path,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-in",
+                csr_path,
+                "-CA",
+                str(CA_CERT_PATH),
+                "-CAkey",
+                str(CA_KEY_PATH),
+                "-CAcreateserial",
+                "-out",
+                str(CERT_PATH),
+                "-days",
+                "825",
+                "-sha256",
+                "-extfile",
+                config_path,
+                "-extensions",
+                "v3_req",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Nie udało się wygenerować lokalnego certyfikatu HTTPS przez openssl.") from exc
+    finally:
+        try:
+            os.unlink(config_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(csr_path)
+        except OSError:
+            pass
+
+    KEY_PATH.chmod(0o600)
+    return CERT_PATH, KEY_PATH
+
+
+def https_context() -> ssl.SSLContext:
+    cert_path, key_path = ensure_local_certificate()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    return context
+
+
 def run() -> None:
     init_db()
     server = None
     selected_port = PORT
+    use_https = os.environ.get("IKIDS_HTTP", "").strip() != "1"
+    context = https_context() if use_https else None
+    server_class = ThreadingHTTPSServer if use_https else ThreadingHTTPServer
     for candidate_port in range(PORT, PORT + 20):
         try:
-            server = ThreadingHTTPServer((HOST, candidate_port), ReservationHandler)
+            if context is not None:
+                server = server_class((HOST, candidate_port), ReservationHandler, context)
+            else:
+                server = server_class((HOST, candidate_port), ReservationHandler)
             selected_port = candidate_port
             break
         except OSError as exc:
@@ -4853,7 +8095,12 @@ def run() -> None:
     if server is None:
         raise RuntimeError(f"Nie znaleziono wolnego portu w zakresie {PORT}-{PORT + 19}.")
 
-    print(f"{APP_TITLE} działa pod adresem http://{HOST}:{selected_port}")
+    protocol = "https" if use_https else "http"
+    print(f"{APP_TITLE} działa pod adresem {protocol}://{HOST}:{selected_port}")
+    if use_https:
+        print(f"Lokalne CA do zaufania na telefonie: {CA_CERT_PATH}")
+        print(f"Certyfikat serwera: {CERT_PATH}")
+        print(f"CA można pobrać z telefonu pod adresem {protocol}://<IP-komputera>:{selected_port}/ca.crt")
     print("Zatrzymaj serwer skrótem Ctrl+C.")
     try:
         server.serve_forever()
