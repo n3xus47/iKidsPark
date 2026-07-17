@@ -3,9 +3,11 @@ from __future__ import annotations
 import csv
 import errno
 import html
+import ipaddress
 import io
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import ssl
@@ -23,7 +25,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
-PWA_CACHE_NAME = "ikidspark-pwa-v5"
+PWA_CACHE_NAME = "ikidspark-pwa-v9"
 PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
 DB_PATH = Path(__file__).with_name("reservations.db")
 LOGO_PATH = Path(__file__).with_name("logo.png")
@@ -36,6 +38,7 @@ CERT_PATH = Path(__file__).with_name("ikids-local.crt")
 KEY_PATH = Path(__file__).with_name("ikids-local.key")
 HOST = "0.0.0.0"
 PORT = 8000
+DEFAULT_LOCAL_DOMAINS = ("ikids.pl",)
 
 
 def logo_asset_url() -> str:
@@ -1483,60 +1486,7 @@ def date_title(target_day: date) -> str:
     )
 
 
-def app_icon_svg() -> bytes:
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="104" fill="#139bd7"/>
-  <circle cx="394" cy="118" r="78" fill="#f58212"/>
-  <circle cx="116" cy="382" r="62" fill="#7a9a12"/>
-  <rect x="86" y="174" width="340" height="190" rx="38" fill="#ffffff"/>
-  <text x="256" y="268" text-anchor="middle" font-family="Arial, sans-serif" font-size="74" font-weight="900" fill="#0b78ad">iKids</text>
-  <text x="256" y="324" text-anchor="middle" font-family="Arial, sans-serif" font-size="44" font-weight="900" fill="#f58212">Park</text>
-</svg>""".encode("utf-8")
-
-
 def app_icon_png(size: int = 512) -> bytes:
-    width = height = size
-    scale = size / 512
-
-    def in_circle(x: int, y: int, cx: float, cy: float, radius: float) -> bool:
-        return (x - cx) ** 2 + (y - cy) ** 2 <= radius**2
-
-    def in_rounded_rect(x: int, y: int, left: float, top: float, right: float, bottom: float, radius: float) -> bool:
-        if left + radius <= x <= right - radius and top <= y <= bottom:
-            return True
-        if left <= x <= right and top + radius <= y <= bottom - radius:
-            return True
-        corners = (
-            (left + radius, top + radius),
-            (right - radius, top + radius),
-            (left + radius, bottom - radius),
-            (right - radius, bottom - radius),
-        )
-        return any(in_circle(x, y, cx, cy, radius) for cx, cy in corners)
-
-    rows = bytearray()
-    for y in range(height):
-        rows.append(0)
-        for x in range(width):
-            ux = x / scale
-            uy = y / scale
-            color = (19, 155, 215, 255)
-            if in_circle(ux, uy, 394, 118, 78):
-                color = (245, 130, 18, 255)
-            if in_circle(ux, uy, 116, 382, 62):
-                color = (122, 154, 18, 255)
-            if in_rounded_rect(ux, uy, 86, 174, 426, 364, 38):
-                color = (255, 255, 255, 255)
-            if in_rounded_rect(ux, uy, 142, 218, 182, 326, 10):
-                color = (11, 120, 173, 255)
-            if in_circle(ux, uy, 162, 194, 20):
-                color = (245, 130, 18, 255)
-            if in_rounded_rect(ux, uy, 214, 224, 370, 266, 12):
-                color = (11, 120, 173, 255)
-            if in_rounded_rect(ux, uy, 214, 290, 346, 326, 12):
-                color = (245, 130, 18, 255)
-            rows.extend(color)
-
     def chunk(kind: bytes, data: bytes) -> bytes:
         return (
             struct.pack(">I", len(data))
@@ -1545,12 +1495,132 @@ def app_icon_png(size: int = 512) -> bytes:
             + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
         )
 
-    raw = bytes(rows)
+    def encode_png_rgba(width: int, height: int, pixels: list[tuple[int, int, int, int]]) -> bytes:
+        rows = bytearray()
+        for y in range(height):
+            rows.append(0)
+            start = y * width
+            for r, g, b, a in pixels[start:start + width]:
+                rows.extend((r, g, b, a))
+        raw = bytes(rows)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, level=9))
+            + chunk(b"IEND", b"")
+        )
+
+    def decode_logo_png() -> tuple[int, int, list[tuple[int, int, int, int]]] | None:
+        if not LOGO_PATH.exists():
+            return None
+        data = LOGO_PATH.read_bytes()
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None
+
+        pos = 8
+        width = height = bit_depth = color_type = interlace = None
+        compressed = bytearray()
+        while pos + 8 <= len(data):
+            length = struct.unpack(">I", data[pos:pos + 4])[0]
+            kind = data[pos + 4:pos + 8]
+            body = data[pos + 8:pos + 8 + length]
+            pos += 12 + length
+            if kind == b"IHDR":
+                width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            elif kind == b"IDAT":
+                compressed.extend(body)
+            elif kind == b"IEND":
+                break
+
+        if bit_depth != 8 or color_type != 6 or interlace != 0 or not width or not height:
+            return None
+
+        stride = width * 4
+        raw = zlib.decompress(bytes(compressed))
+        rows: list[bytearray] = []
+        offset = 0
+
+        def paeth(a: int, b: int, c: int) -> int:
+            p = a + b - c
+            pa = abs(p - a)
+            pb = abs(p - b)
+            pc = abs(p - c)
+            if pa <= pb and pa <= pc:
+                return a
+            if pb <= pc:
+                return b
+            return c
+
+        for y in range(height):
+            filter_type = raw[offset]
+            offset += 1
+            row = bytearray(raw[offset:offset + stride])
+            offset += stride
+            prev = rows[y - 1] if y else bytearray(stride)
+            for x in range(stride):
+                left = row[x - 4] if x >= 4 else 0
+                up = prev[x]
+                up_left = prev[x - 4] if x >= 4 else 0
+                if filter_type == 1:
+                    row[x] = (row[x] + left) & 0xFF
+                elif filter_type == 2:
+                    row[x] = (row[x] + up) & 0xFF
+                elif filter_type == 3:
+                    row[x] = (row[x] + ((left + up) // 2)) & 0xFF
+                elif filter_type == 4:
+                    row[x] = (row[x] + paeth(left, up, up_left)) & 0xFF
+            rows.append(row)
+
+        pixels = [
+            (row[x], row[x + 1], row[x + 2], row[x + 3])
+            for row in rows
+            for x in range(0, stride, 4)
+        ]
+        return width, height, pixels
+
+    decoded = decode_logo_png()
+    if decoded is None:
+        return encode_png_rgba(size, size, [(255, 255, 255, 255)] * (size * size))
+
+    src_w, src_h, src = decoded
+    visible = [
+        (i % src_w, i // src_w)
+        for i, (_, _, _, alpha) in enumerate(src)
+        if alpha > 8
+    ]
+    if not visible:
+        return encode_png_rgba(size, size, [(255, 255, 255, 255)] * (size * size))
+
+    min_x = min(x for x, _ in visible)
+    max_x = max(x for x, _ in visible)
+    min_y = min(y for _, y in visible)
+    max_y = max(y for _, y in visible)
+    crop_w = max_x - min_x + 1
+    crop_h = max_y - min_y + 1
+    max_logo_size = max(1, int(size * 0.68))
+    scale = min(max_logo_size / crop_w, max_logo_size / crop_h)
+    logo_w = max(1, int(crop_w * scale))
+    logo_h = max(1, int(crop_h * scale))
+    left = (size - logo_w) // 2
+    top = (size - logo_h) // 2
+    output = [(255, 255, 255, 255)] * (size * size)
+
+    for y in range(logo_h):
+        sy = min_y + min(crop_h - 1, int((y + 0.5) / scale))
+        for x in range(logo_w):
+            sx = min_x + min(crop_w - 1, int((x + 0.5) / scale))
+            r, g, b, a = src[sy * src_w + sx]
+            alpha = a / 255
+            idx = (top + y) * size + left + x
+            output[idx] = (
+                round(r * alpha + 255 * (1 - alpha)),
+                round(g * alpha + 255 * (1 - alpha)),
+                round(b * alpha + 255 * (1 - alpha)),
+                255,
+            )
+
     return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(raw, level=9))
-        + chunk(b"IEND", b"")
+        encode_png_rgba(size, size, output)
     )
 
 
@@ -1567,25 +1637,12 @@ def manifest_response() -> bytes:
         "theme_color": "#ffffff",
         "icons": [
             {
-                "src": f"/app-icon-{size}.png",
+                "src": f"/app-icon-{size}.png?v={PWA_CACHE_NAME}",
                 "sizes": f"{size}x{size}",
                 "type": "image/png",
                 "purpose": "any maskable",
             }
             for size in PWA_ICON_SIZES
-        ] + [
-            {
-                "src": "/app-icon.svg",
-                "sizes": "any",
-                "type": "image/svg+xml",
-                "purpose": "any maskable",
-            },
-            {
-                "src": logo_asset_url(),
-                "sizes": "512x512",
-                "type": "image/png",
-                "purpose": "any",
-            },
         ],
         "categories": ["business", "productivity"],
         "lang": "pl",
@@ -1595,12 +1652,11 @@ def manifest_response() -> bytes:
 
 
 def service_worker_response() -> bytes:
-    icon_assets = ",\n  ".join(json.dumps(f"/app-icon-{size}.png") for size in PWA_ICON_SIZES)
+    icon_assets = ",\n  ".join(json.dumps(f"/app-icon-{size}.png?v={PWA_CACHE_NAME}") for size in PWA_ICON_SIZES)
     payload = """const IKIDS_CACHE = "__CACHE_NAME__";
 const STATIC_ASSETS = [
   "/",
   "/offline",
-  "/app-icon.svg",
   "/favicon.ico",
   "/manifest.webmanifest",
   "/static/manifest.json",
@@ -1669,8 +1725,8 @@ def offline_response() -> bytes:
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/app-icon-192.png" type="image/png">
-  <link rel="apple-touch-icon" href="/app-icon-192.png">
+  <link rel="icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}">
   <title>{APP_SHORT_TITLE} offline</title>
   <style>
     body {{
@@ -2195,8 +2251,8 @@ def page_template(
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/app-icon-192.png" type="image/png">
-  <link rel="apple-touch-icon" href="/app-icon-192.png">
+  <link rel="icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}">
   <title>{APP_TITLE}</title>
   <style>
     :root {{
@@ -7680,11 +7736,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path in {"/app-icon.svg", "/static/app-icon.svg"}:
-            self.send_bytes(
-                app_icon_svg(),
-                content_type="image/svg+xml; charset=utf-8",
-                extra_headers={"Cache-Control": "public, max-age=86400"},
-            )
+            self.send_bytes(b"", status=HTTPStatus.GONE, content_type="text/plain; charset=utf-8")
             return
 
         icon_size = icon_size_for_path(parsed.path)
@@ -7692,7 +7744,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.send_bytes(
                 app_icon_png(icon_size),
                 content_type="image/png",
-                extra_headers={"Cache-Control": "public, max-age=86400"},
+                extra_headers={"Cache-Control": "no-store"},
             )
             return
 
@@ -7769,14 +7821,15 @@ class ReservationHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path in {"/app-icon.svg", "/static/app-icon.svg"}:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_response(HTTPStatus.GONE)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             return
 
         if icon_size_for_path(parsed.path) is not None:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
 
@@ -7935,6 +7988,14 @@ def local_ipv4_addresses() -> list[str]:
     return sorted(addresses)
 
 
+def local_dns_names() -> list[str]:
+    configured = os.environ.get("IKIDS_DOMAINS", "")
+    domains = [domain.strip() for domain in configured.split(",") if domain.strip()]
+    if not domains:
+        domains = list(DEFAULT_LOCAL_DOMAINS)
+    return sorted({"localhost", *domains})
+
+
 def certificate_matches_hosts(cert_path: Path, hosts: list[str]) -> bool:
     if not cert_path.exists():
         return False
@@ -7943,55 +8004,167 @@ def certificate_matches_hosts(cert_path: Path, hosts: list[str]) -> bool:
     except (OSError, ssl.SSLError):
         return False
     alt_names = {value for kind, value in decoded.get("subjectAltName", []) if kind in {"DNS", "IP Address"}}
-    return "localhost" in alt_names and all(host in alt_names for host in hosts)
+    return all(host in alt_names for host in hosts)
 
 
 def certificate_is_issued_by_local_ca(cert_path: Path) -> bool:
     if not cert_path.exists() or not CA_CERT_PATH.exists():
         return False
-    result = subprocess.run(
-        ["openssl", "verify", "-CAfile", str(CA_CERT_PATH), str(cert_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
+    try:
+        result = subprocess.run(
+            ["openssl", "verify", "-CAfile", str(CA_CERT_PATH), str(cert_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except OSError:
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives.asymmetric import padding, rsa
+            from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+
+            ca_cert = x509.load_pem_x509_certificate(CA_CERT_PATH.read_bytes())
+            cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            public_key = ca_cert.public_key()
+            signature_hash = cert.signature_hash_algorithm
+            if isinstance(public_key, rsa.RSAPublicKey):
+                public_key.verify(cert.signature, cert.tbs_certificate_bytes, padding.PKCS1v15(), signature_hash)
+            else:
+                public_key.verify(cert.signature, cert.tbs_certificate_bytes, ECDSA(signature_hash))
+            return cert.issuer == ca_cert.subject
+        except Exception:
+            return False
+
+
+def generate_local_ca_with_cryptography() -> None:
+    if CA_CERT_PATH.exists() and CA_KEY_PATH.exists():
+        return
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "iKids Park Local CA")])
+    now = datetime.utcnow()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=False,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=True,
+            crl_sign=True,
+            encipher_only=False,
+            decipher_only=False,
+        ), critical=True)
+        .sign(key, hashes.SHA256())
     )
-    return result.returncode == 0
+    CA_KEY_PATH.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    CA_CERT_PATH.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    CA_KEY_PATH.chmod(0o600)
 
 
 def generate_local_ca() -> None:
     if CA_CERT_PATH.exists() and CA_KEY_PATH.exists():
         return
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-sha256",
-            "-days",
-            "3650",
-            "-nodes",
-            "-keyout",
-            str(CA_KEY_PATH),
-            "-out",
-            str(CA_CERT_PATH),
-            "-subj",
-            "/CN=iKids Park Local CA",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE,pathlen:0",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-days",
+                "3650",
+                "-nodes",
+                "-keyout",
+                str(CA_KEY_PATH),
+                "-out",
+                str(CA_CERT_PATH),
+                "-subj",
+                "/CN=iKids Park Local CA",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE,pathlen:0",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        CA_KEY_PATH.chmod(0o600)
+    except OSError:
+        generate_local_ca_with_cryptography()
+
+
+def generate_local_certificate_with_cryptography(ipv4_addresses: list[str], dns_names: list[str]) -> tuple[Path, Path]:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    ca_key = serialization.load_pem_private_key(CA_KEY_PATH.read_bytes(), password=None)
+    ca_cert = x509.load_pem_x509_certificate(CA_CERT_PATH.read_bytes())
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "iKids Park Local")])
+    alt_names = [
+        *[x509.DNSName(name) for name in dns_names],
+        *[x509.IPAddress(ipaddress.ip_address(address)) for address in ipv4_addresses],
+    ]
+    now = datetime.utcnow()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=825))
+        .add_extension(x509.KeyUsage(
+            digital_signature=True,
+            content_commitment=False,
+            key_encipherment=True,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        ), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
+        .sign(ca_key, hashes.SHA256())
     )
-    CA_KEY_PATH.chmod(0o600)
+    KEY_PATH.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    CERT_PATH.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    KEY_PATH.chmod(0o600)
+    return CERT_PATH, KEY_PATH
 
 
 def ensure_local_certificate() -> tuple[Path, Path]:
     ipv4_addresses = local_ipv4_addresses()
+    dns_names = local_dns_names()
     try:
         generate_local_ca()
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -8000,12 +8173,15 @@ def ensure_local_certificate() -> tuple[Path, Path]:
     if (
         CERT_PATH.exists()
         and KEY_PATH.exists()
-        and certificate_matches_hosts(CERT_PATH, ipv4_addresses)
+        and certificate_matches_hosts(CERT_PATH, [*dns_names, *ipv4_addresses])
         and certificate_is_issued_by_local_ca(CERT_PATH)
     ):
         return CERT_PATH, KEY_PATH
 
-    alt_names = ["DNS:localhost", *[f"IP:{address}" for address in ipv4_addresses]]
+    if shutil.which("openssl") is None:
+        return generate_local_certificate_with_cryptography(ipv4_addresses, dns_names)
+
+    alt_names = [*[f"DNS:{name}" for name in dns_names], *[f"IP:{address}" for address in ipv4_addresses]]
     openssl_config = f"""
 [req]
 distinguished_name = req_distinguished_name
@@ -8097,7 +8273,7 @@ def run() -> None:
     init_db()
     server = None
     selected_port = PORT
-    use_https = os.environ.get("IKIDS_HTTP", "").strip() != "1"
+    use_https = os.environ.get("IKIDS_HTTPS", "").strip() == "1"
     context = https_context() if use_https else None
     server_class = ThreadingHTTPSServer if use_https else ThreadingHTTPServer
     for candidate_port in range(PORT, PORT + 20):
@@ -8120,6 +8296,9 @@ def run() -> None:
         print(f"Lokalne CA do zaufania na telefonie: {CA_CERT_PATH}")
         print(f"Certyfikat serwera: {CERT_PATH}")
         print(f"CA można pobrać z telefonu pod adresem {protocol}://<IP-komputera>:{selected_port}/ca.crt")
+    else:
+        print(f"Na telefonie otworz: http://<IP-komputera>:{selected_port}")
+        print(f"Hotspot Windows zwykle uzywa: http://192.168.137.1:{selected_port}")
     print("Zatrzymaj serwer skrótem Ctrl+C.")
     try:
         server.serve_forever()
