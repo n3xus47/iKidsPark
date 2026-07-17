@@ -1,7 +1,11 @@
 __pycache__/
 *.py[cod]
 .idea/
+.venv/
+.env
 reservations.db
+reservations.db-shm
+reservations.db-wal
 *.db-wal
 *.db-shm
 *.log
@@ -9,3 +13,6 @@ reservations.db
 *.aab
 android/
 Android/
+android-local/build/
+android-local/dist/
+android-local/keystore/

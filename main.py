@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import socket
-import sqlite3
 import ssl
 import struct
 import subprocess
@@ -20,16 +19,25 @@ from datetime import date, datetime, time, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import dict_row
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
-PWA_CACHE_NAME = "ikidspark-pwa-v9"
+PWA_CACHE_NAME = "ikidspark-pwa-v10"
 PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
-DB_PATH = Path(__file__).with_name("reservations.db")
+DbRow = dict[str, Any]
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 LOGO_PATH = Path(__file__).with_name("logo.png")
 MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
+ROOM_PLAN_SVG_PATH = Path(__file__).with_name("14.svg")
+ROOM_PLAN_PNG_PATH = Path(__file__).with_name("assets") / "room-plan.png"
 SOURCE_PATH = Path(__file__)
 SOURCE_MTIME = SOURCE_PATH.stat().st_mtime
 CA_CERT_PATH = Path(__file__).with_name("ikids-local-ca.crt")
@@ -37,8 +45,21 @@ CA_KEY_PATH = Path(__file__).with_name("ikids-local-ca.key")
 CERT_PATH = Path(__file__).with_name("ikids-local.crt")
 KEY_PATH = Path(__file__).with_name("ikids-local.key")
 HOST = "0.0.0.0"
-PORT = 8000
+PORT = int(os.environ.get("PORT", "8000"))
 DEFAULT_LOCAL_DOMAINS = ("ikids.pl",)
+
+RESERVATION_COLORS = [
+    "#e63946",
+    "#f77f00",
+    "#2a9d8f",
+    "#457b9d",
+    "#6a4c93",
+    "#c9184a",
+    "#3a86ff",
+    "#2b9348",
+    "#fb5607",
+    "#0077b6",
+]
 
 
 def logo_asset_url() -> str:
@@ -128,42 +149,112 @@ ANIMATION_TYPES = [name for names in ANIMATION_GROUPS.values() for name in names
 WORKSHOP_TYPES = ["Pizza", "Burger", "Piernik", "Shake"]
 MASCOT_TYPES = ["Lew", "Pan Królik", "Pani Królik", "Miś"]
 
-ROOM_LAYOUT = [
-    ("1. Biały Dom", 92, 410, 86, 48),
-    ("2. Magiczny Las", 184, 410, 86, 48),
-    ("3. Wróżki", 276, 410, 86, 48),
-    ("4. Kosmos", 368, 410, 86, 48),
-    ("5. Zima", 460, 410, 86, 48),
-    ("6. Football", 552, 410, 86, 48),
+# Interactive hotspots for the floor plan (asset canvas 1440 x 810; display crops empty margins).
+# Tuple: (number, center_x, center_y, width, height). Numbers 1-6 are party rooms.
+PLAN_HOTSPOTS = [
+    (1, 370.0, 533.8, 64.7, 63.3),
+    (2, 450.6, 533.8, 63.3, 63.3),
+    (3, 539.0, 517.5, 63.3, 64.7),
+    (4, 634.8, 517.5, 63.3, 64.7),
+    (5, 730.6, 517.5, 63.3, 64.7),
+    (6, 818.9, 506.4, 63.3, 64.7),
+    (7, 254.7, 420.6, 28.0, 36.0),
+    (8, 207.6, 420.6, 28.0, 36.0),
+    (9, 124.6, 439.1, 36.0, 28.0),
+    (10, 59.2, 445.5, 24.0, 24.0),
+    (11, 59.2, 414.3, 24.0, 24.0),
+    (12, 59.2, 383.1, 24.0, 24.0),
+    (13, 59.2, 345.1, 36.0, 28.0),
+    (14, 124.6, 345.1, 36.0, 28.0),
+    (15, 124.6, 402.0, 36.0, 28.0),
+    (18, 593.2, 389.1, 34.0, 34.0),
+    (19, 667.4, 389.1, 34.0, 34.0),
+    (20, 741.7, 389.1, 34.0, 34.0),
+    (21, 704.8, 348.2, 24.0, 24.0),
+    (22, 627.8, 348.2, 24.0, 24.0),
+    (23, 584.3, 307.6, 28.0, 36.0),
+    (24, 639.8, 307.6, 28.0, 36.0),
+    (25, 695.2, 307.6, 28.0, 36.0),
+    (26, 750.6, 307.6, 28.0, 36.0),
+    (30, 593.2, 226.3, 34.0, 34.0),
+    (31, 667.4, 226.3, 34.0, 34.0),
+    (32, 741.7, 226.3, 34.0, 34.0),
+    (33, 824.2, 335.6, 36.0, 28.0),
+    (34, 877.1, 335.6, 36.0, 28.0),
+    (35, 930.1, 335.6, 36.0, 28.0),
+    (36, 908.6, 373.3, 34.0, 34.0),
+    (37, 845.6, 373.3, 34.0, 34.0),
+    (38, 808.2, 420.6, 24.0, 24.0),
+    (39, 864.3, 420.6, 24.0, 24.0),
+    (40, 920.6, 420.6, 24.0, 24.0),
+    (41, 1106.9, 408.3, 28.0, 36.0),
+    (42, 1051.4, 408.3, 28.0, 36.0),
+    (43, 995.9, 408.3, 28.0, 36.0),
+    (44, 1117.0, 364.1, 24.0, 24.0),
+    (45, 1060.8, 364.1, 24.0, 24.0),
+    (46, 1004.6, 364.1, 24.0, 24.0),
+    (47, 1060.8, 303.4, 36.0, 36.0),
+    (48, 1017.5, 257.6, 36.0, 36.0),
+    (49, 1002.9, 150.9, 26.0, 26.0),
+    (50, 1043.4, 189.7, 26.0, 26.0),
+    (51, 1084.0, 228.7, 26.0, 26.0),
+    (52, 1121.9, 259.9, 36.0, 36.0),
+    (53, 1144.7, 281.6, 36.0, 36.0),
+    (54, 1178.1, 314.1, 36.0, 36.0),
+    (55, 1200.9, 335.8, 36.0, 36.0),
+    (56, 1217.1, 424.1, 28.0, 36.0),
+    (57, 1178.0, 423.4, 28.0, 36.0),
+    (58, 1149.1, 633.5, 24.0, 24.0),
+    (59, 1149.1, 587.2, 24.0, 24.0),
+    (60, 1149.1, 540.9, 24.0, 24.0),
+    (61, 1149.1, 492.8, 24.0, 24.0),
+    (62, 1205.3, 517.5, 24.0, 24.0),
+    (63, 1261.5, 517.5, 24.0, 24.0),
+    (64, 1317.7, 517.5, 24.0, 24.0),
+    (65, 1373.8, 517.5, 24.0, 24.0),
+    (66, 1373.8, 480.2, 24.0, 24.0),
+    (67, 1317.7, 480.2, 24.0, 24.0),
+    (68, 1261.5, 480.2, 24.0, 24.0),
+    (69, 1205.3, 480.2, 24.0, 24.0),
+    (70, 1255.4, 402.0, 28.0, 36.0),
+    (71, 1255.4, 360.8, 28.0, 36.0),
+    (72, 1382.2, 360.8, 28.0, 36.0),
+    (73, 1382.2, 402.0, 28.0, 36.0),
 ]
 
-ADULT_ZONE_LAYOUT = [
-    ("Bar", "7-14", 40, 258, 210, 72),
-    ("Scena", "18-40", 280, 154, 312, 176),
-    ("Trójkąt", "41-57", 628, 82, 244, 248),
-    ("Labirynt", "58-74", 740, 338, 168, 188),
+# Wall / edge segments extracted from 14.svg (absolute canvas coords).
+# Tuple: (x1, y1, x2, y2).
+PLAN_WALLS = [
+    (149.6, 382.8, 490.6, 382.8),
+    (149.6, 382.8, 149.6, 328.8),
+    (149.6, 328.8, 33.9, 328.8),
+    (33.9, 328.8, 33.9, 474.1),
+    (33.9, 474.1, 490.6, 474.1),
+    (490.6, 186.2, 490.6, 474.1),
+    (490.6, 455.1, 1231.5, 455.1),
+    (490.6, 186.2, 952.7, 186.2),
+    (952.7, 131.9, 952.7, 455.1),
+    (952.7, 131.9, 1015.0, 131.9),
+    (1231.5, 340.1, 1231.5, 455.1),
+    (1015.0, 131.9, 1231.5, 340.1),
+    (1231.5, 340.1, 1406.8, 340.1),
+    (1406.8, 340.1, 1406.8, 679.2),
+    (1114.2, 679.2, 1406.8, 679.2),
+    (1114.2, 455.1, 1114.2, 679.2),
+    (490.6, 474.1, 490.6, 609.8),
+    (328.8, 609.8, 490.6, 609.8),
+    (328.8, 474.1, 328.8, 609.8),
+    (409.4, 474.1, 409.4, 609.8),
+    (490.6, 595.1, 776.8, 595.1),
+    (586.8, 455.1, 586.8, 595.1),
+    (681.8, 455.1, 681.8, 595.1),
+    (776.8, 455.1, 776.8, 595.1),
+    (860.5, 455.1, 860.5, 574.4),
+    (776.8, 574.4, 860.5, 574.4),
 ]
 
-TABLE_LAYOUT = [
-    (13, 68, 276), (14, 68, 306),
-    (7, 130, 278), (8, 166, 278), (9, 202, 278),
-    (10, 130, 310), (11, 166, 310), (12, 202, 310),
-    (30, 364, 174), (31, 430, 174), (32, 496, 174),
-    (27, 374, 212), (28, 430, 212), (29, 486, 212),
-    (23, 340, 246), (24, 390, 246), (25, 440, 246), (26, 490, 246),
-    (21, 374, 280), (22, 424, 280),
-    (33, 520, 234), (34, 558, 234), (35, 558, 270),
-    (18, 332, 306), (19, 382, 306), (20, 432, 306),
-    (36, 492, 306), (37, 528, 306), (38, 564, 306), (39, 528, 334), (40, 564, 334),
-    (52, 732, 110), (53, 764, 136), (54, 796, 164), (55, 828, 194),
-    (47, 692, 150), (48, 730, 180), (49, 768, 210), (50, 806, 240), (51, 844, 270),
-    (41, 684, 292), (42, 720, 292), (43, 756, 292), (44, 792, 292), (45, 828, 292), (46, 864, 292),
-    (56, 858, 332), (57, 890, 332),
-    (58, 744, 368), (59, 744, 402), (60, 744, 436), (61, 744, 470),
-    (62, 816, 368), (63, 858, 368), (64, 816, 402), (65, 858, 402),
-    (66, 816, 436), (67, 858, 436), (68, 816, 470), (69, 858, 470),
-    (71, 782, 488), (72, 782, 520), (73, 836, 488), (74, 836, 520),
-]
+PLAN_VIEWBOX = (30.9, 128.0, 1378.1, 554.1)
+
 
 LEGACY_CHILD_LOCATION_RENAMES = {
     "Salka Piłka Nożna": "6. Football",
@@ -305,23 +396,29 @@ SERVICE_DURATIONS = {
 }
 
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+def require_database_url() -> str:
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "Brak DATABASE_URL. Wklej connection string z Supabase → Project Settings → Database "
+            "(URI) do pliku .env, np. postgresql://postgres.xxx:HASLO@aws-0-...pooler.supabase.com:6543/postgres"
+        )
+    return DATABASE_URL
 
 
-def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+def adapt_sql(query: str) -> str:
+    """Convert ? placeholders to psycopg %s."""
+    return query.replace("?", "%s")
 
 
-def create_schema(conn: sqlite3.Connection) -> None:
+def connect() -> psycopg.Connection:
+    return psycopg.connect(require_database_url(), row_factory=dict_row)
+
+
+def create_schema(conn: psycopg.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reservations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             start_at TEXT NOT NULL,
             end_at TEXT NOT NULL,
             children_count INTEGER NOT NULL,
@@ -329,6 +426,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             parent_name TEXT NOT NULL,
             birthday_child_name TEXT NOT NULL,
             birthday_child_age INTEGER NOT NULL,
+            birthday_children_json TEXT,
             child_location TEXT NOT NULL,
             adult_location TEXT NOT NULL,
             animation_enabled INTEGER NOT NULL DEFAULT 0,
@@ -367,13 +465,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reservation_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reservation_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            reservation_id BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
             action TEXT NOT NULL,
             changed_by_role TEXT NOT NULL,
             snapshot_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (reservation_id) REFERENCES reservations(id)
+            created_at TEXT NOT NULL
         )
         """
     )
@@ -397,146 +494,22 @@ def create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
-    columns = table_columns(conn, "reservations")
-    if not columns or "start_at" in columns:
-        return
-
-    backup_name = "reservations_legacy_backup_" + datetime.now().strftime("%Y%m%d%H%M%S")
-    conn.execute(f"ALTER TABLE reservations RENAME TO {backup_name}")
-    create_schema(conn)
-
-    legacy_rows = conn.execute(f"SELECT * FROM {backup_name}").fetchall()
-    legacy_room_map = {
-        "Dżungla": "2. Magiczny Las",
-        "Kosmos": "4. Kosmos",
-        "Księżniczki": "3. Wróżki",
-        "Piraci": "1. Biały Dom",
-        "Superbohaterowie": "6. Football",
-        "Sala kreatywna": "5. Zima",
-    }
-
-    for row in legacy_rows:
-        row_keys = set(row.keys())
-        reservation_day = row["reservation_date"] if "reservation_date" in row_keys else date.today().isoformat()
-        start_at = f"{reservation_day}T10:00"
-        end_at = f"{reservation_day}T12:00"
-        created_at = row["created_at"] if "created_at" in row_keys else now_iso()
-        theme_room = row["theme_room"] if "theme_room" in row_keys else PARTY_ROOMS[0]
-        child_location = legacy_room_map.get(theme_room, PARTY_ROOMS[0])
-
-        conn.execute(
-            """
-            INSERT INTO reservations (
-                start_at, end_at, children_count, adults_count, parent_name,
-                birthday_child_name, birthday_child_age, child_location, adult_location,
-                animation_enabled, cake_enabled, fruit_enabled, culinary_workshops_enabled,
-                notes, status, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-            """,
-            (
-                start_at,
-                end_at,
-                row["children_count"] if "children_count" in row_keys else 1,
-                row["adults_count"] if "adults_count" in row_keys else 0,
-                row["parent_name"] if "parent_name" in row_keys else "Migracja danych",
-                row["child_name"] if "child_name" in row_keys else "Solenizant",
-                row["child_age"] if "child_age" in row_keys else 6,
-                child_location,
-                ADULT_LOCATIONS[0],
-                1 if "animations" in row_keys and row["animations"] == "Tak" else 0,
-                1 if "cake" in row_keys and row["cake"] == "Tak" else 0,
-                1 if "fruit" in row_keys and row["fruit"] == "Tak" else 0,
-                1 if "workshops" in row_keys and row["workshops"] == "Tak" else 0,
-                row["notes"] if "notes" in row_keys else "",
-                created_at,
-                now_iso(),
-            ),
-        )
-
-
-def migrate_location_names(conn: sqlite3.Connection) -> None:
+def migrate_location_names(conn: psycopg.Connection) -> None:
     for old_name, new_name in LEGACY_CHILD_LOCATION_RENAMES.items():
         conn.execute(
-            "UPDATE reservations SET child_location = ? WHERE child_location = ?",
+            adapt_sql("UPDATE reservations SET child_location = ? WHERE child_location = ?"),
             (new_name, old_name),
         )
     for old_name, new_name in LEGACY_ADULT_LOCATION_RENAMES.items():
         conn.execute(
-            "UPDATE reservations SET adult_location = ? WHERE adult_location = ?",
+            adapt_sql("UPDATE reservations SET adult_location = ? WHERE adult_location = ?"),
             (new_name, old_name),
         )
 
 
-def ensure_current_schema(conn: sqlite3.Connection) -> None:
-    columns = table_columns(conn, "reservations")
-    if "animation_type" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN animation_type TEXT")
-    if "cake_theme" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN cake_theme TEXT")
-    if "fruit_plates" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN fruit_plates INTEGER")
-    if "culinary_workshops_type" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN culinary_workshops_type TEXT")
-    if "pinata_theme" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN pinata_theme TEXT")
-    if "pinata_at" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN pinata_at TEXT")
-    if "mascot_type" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN mascot_type TEXT")
-    if "mascot_at" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN mascot_at TEXT")
-    if "balloons_enabled" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN balloons_enabled INTEGER NOT NULL DEFAULT 0")
-    if "balloons_description" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN balloons_description TEXT")
-    if "balloons_at" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN balloons_at TEXT")
-    if "birthday_children_json" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN birthday_children_json TEXT")
-        conn.execute(
-            """
-            UPDATE reservations
-            SET birthday_children_json = json_array(
-                json_object('name', birthday_child_name, 'age', birthday_child_age)
-            )
-            WHERE birthday_children_json IS NULL
-              AND birthday_child_name IS NOT NULL
-            """
-        )
-    if "assigned_waiter" not in columns:
-        conn.execute("ALTER TABLE reservations ADD COLUMN assigned_waiter TEXT")
-
-    conn.execute(
-        """
-        UPDATE reservations
-        SET pinata_at = attraction_at
-        WHERE pinata_enabled = 1
-          AND pinata_at IS NULL
-          AND attraction_at IS NOT NULL
-        """
-    )
-    conn.execute(
-        """
-        UPDATE reservations
-        SET mascot_at = attraction_at
-        WHERE mascot_enabled = 1
-          AND mascot_at IS NULL
-          AND attraction_at IS NOT NULL
-        """
-    )
-
-
 def init_db() -> None:
     with connect() as conn:
-        existing = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'reservations'"
-        ).fetchone()
-        if existing:
-            migrate_legacy_schema(conn)
         create_schema(conn)
-        ensure_current_schema(conn)
         migrate_location_names(conn)
 
 
@@ -544,20 +517,27 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def db_rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
+def db_rows(query: str, params: tuple = ()) -> list[DbRow]:
     with connect() as conn:
-        return conn.execute(query, params).fetchall()
+        return list(conn.execute(adapt_sql(query), params).fetchall())
 
 
-def db_one(query: str, params: tuple = ()) -> sqlite3.Row | None:
+def db_one(query: str, params: tuple = ()) -> DbRow | None:
     with connect() as conn:
-        return conn.execute(query, params).fetchone()
+        return conn.execute(adapt_sql(query), params).fetchone()
 
 
 def execute(query: str, params: tuple = ()) -> int:
+    sql = adapt_sql(query).rstrip().rstrip(";")
     with connect() as conn:
-        cursor = conn.execute(query, params)
-        return int(cursor.lastrowid or 0)
+        if sql.lstrip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
+            sql = f"{sql} RETURNING id"
+        result = conn.execute(sql, params)
+        if result.description:
+            row = result.fetchone()
+            if row and "id" in row and row["id"] is not None:
+                return int(row["id"])
+        return 0
 
 
 def escape(value: object) -> str:
@@ -655,7 +635,7 @@ def parse_birthday_children(data: dict[str, object]) -> list[dict[str, object]]:
     return children
 
 
-def birthday_children_from_row(row: sqlite3.Row | dict[str, object]) -> list[dict[str, object]]:
+def birthday_children_from_row(row: DbRow | dict[str, object]) -> list[dict[str, object]]:
     raw_json = row["birthday_children_json"] if "birthday_children_json" in row.keys() else None
     if raw_json:
         try:
@@ -675,7 +655,7 @@ def birthday_children_from_row(row: sqlite3.Row | dict[str, object]) -> list[dic
     return []
 
 
-def format_birthday_children(row: sqlite3.Row | dict[str, object]) -> str:
+def format_birthday_children(row: DbRow | dict[str, object]) -> str:
     children = birthday_children_from_row(row)
     if not children:
         return "Brak solenizanta"
@@ -690,7 +670,27 @@ def format_birthday_children(row: sqlite3.Row | dict[str, object]) -> str:
     return ", ".join(parts)
 
 
-def banquet_info_title(row: sqlite3.Row | dict[str, object]) -> str:
+def reservation_plan_tip(row: DbRow | dict[str, object]) -> str:
+    children = birthday_children_from_row(row)
+    if children:
+        child = children[0]
+        name = str(child.get("name") or "").strip() or "Solenizant"
+        age = child.get("age")
+        child_part = f"{name}, {age} lat" if age not in (None, "") else name
+    else:
+        if isinstance(row, dict):
+            child_part = str(row.get("birthday_child_name") or "Solenizant").strip()
+        else:
+            child_part = str(row["birthday_child_name"] or "Solenizant").strip()
+    if isinstance(row, dict):
+        waiter = str(row.get("assigned_waiter") or "").strip()
+    else:
+        waiter = str(row["assigned_waiter"] or "").strip() if "assigned_waiter" in row.keys() else ""
+    waiter_part = waiter if waiter else "brak kelnera"
+    return f"{child_part} · {waiter_part}"
+
+
+def banquet_info_title(row: DbRow | dict[str, object]) -> str:
     if isinstance(row, dict):
         parent = escape(str(row.get("parent_name", "")))
         sala = escape(display_location(row.get("child_location", "")))
@@ -704,7 +704,7 @@ def banquet_info_title(row: sqlite3.Row | dict[str, object]) -> str:
     )
 
 
-def render_banquet_header(row: sqlite3.Row | dict[str, object]) -> str:
+def render_banquet_header(row: DbRow | dict[str, object]) -> str:
     if isinstance(row, dict):
         parent = escape(str(row.get("parent_name", "")))
         sala = escape(display_location(row.get("child_location", "")))
@@ -932,12 +932,42 @@ def display_locations(value: object) -> str:
     return ", ".join(locations)
 
 
-def reservation_locations(row: sqlite3.Row | dict[str, object]) -> set[str]:
+def reservation_locations(row: DbRow | dict[str, object]) -> set[str]:
     locations = set(location_values(row["adult_location"]))
     child = str(row["child_location"]).strip()
     if child and child != EMPTY_LOCATION:
         locations.add(child)
     return locations
+
+
+def location_for_plan_number(number: int) -> str | None:
+    if 1 <= number <= len(PARTY_ROOMS):
+        return PARTY_ROOMS[number - 1]
+    area = TABLE_ZONE_BY_NUMBER.get(number)
+    if not area:
+        return None
+    return f"{area} - Stolik {number}"
+
+
+def reservation_color_map(rows: list[DbRow]) -> dict[int, str]:
+    active = [
+        row
+        for row in rows
+        if str(row["status"] or "") == "active"
+    ]
+    active.sort(key=lambda row: (str(row["start_at"]), int(row["id"])))
+    mapping: dict[int, str] = {}
+    for index, row in enumerate(active[: len(RESERVATION_COLORS)]):
+        mapping[int(row["id"])] = RESERVATION_COLORS[index]
+    return mapping
+
+
+def room_plan_asset_url() -> str:
+    if ROOM_PLAN_SVG_PATH.exists():
+        return f"/room-plan.svg?v={int(ROOM_PLAN_SVG_PATH.stat().st_mtime)}"
+    if ROOM_PLAN_PNG_PATH.exists():
+        return f"/room-plan.png?v={int(ROOM_PLAN_PNG_PATH.stat().st_mtime)}"
+    return "/room-plan.svg"
 
 
 def time_in_reservation_window(start_dt: datetime | None, end_dt: datetime | None, value: time | None) -> bool:
@@ -953,7 +983,7 @@ def find_conflicts(
     child_location: str,
     adult_locations: list[str],
     exclude_id: int | None = None,
-) -> list[sqlite3.Row]:
+) -> list[DbRow]:
     params: list[object] = [end_at, start_at]
     exclude_sql = ""
     if exclude_id:
@@ -1191,11 +1221,11 @@ def validate_reservation(
     return cleaned, errors
 
 
-def history_snapshot(row: sqlite3.Row | dict[str, object]) -> str:
+def history_snapshot(row: DbRow | dict[str, object]) -> str:
     return json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
 
 
-def record_history(reservation_id: int, action: str, role: str, snapshot: sqlite3.Row | dict[str, object]) -> None:
+def record_history(reservation_id: int, action: str, role: str, snapshot: DbRow | dict[str, object]) -> None:
     execute(
         """
         INSERT INTO reservation_history (reservation_id, action, changed_by_role, snapshot_json, created_at)
@@ -1334,11 +1364,11 @@ def delete_reservation(reservation_id: int) -> bool:
     return True
 
 
-def get_reservation(reservation_id: int) -> sqlite3.Row | None:
+def get_reservation(reservation_id: int) -> DbRow | None:
     return db_one("SELECT * FROM reservations WHERE id = ?", (reservation_id,))
 
 
-def get_reservations_for_day(target_day: date) -> list[sqlite3.Row]:
+def get_reservations_for_day(target_day: date) -> list[DbRow]:
     start, end = day_bounds(target_day)
     return db_rows(
         """
@@ -1351,7 +1381,7 @@ def get_reservations_for_day(target_day: date) -> list[sqlite3.Row]:
     )
 
 
-def get_all_reservations() -> list[sqlite3.Row]:
+def get_all_reservations() -> list[DbRow]:
     return db_rows(
         """
         SELECT *
@@ -1361,7 +1391,7 @@ def get_all_reservations() -> list[sqlite3.Row]:
     )
 
 
-def get_history(reservation_id: int) -> list[sqlite3.Row]:
+def get_history(reservation_id: int) -> list[DbRow]:
     return db_rows(
         """
         SELECT *
@@ -1378,8 +1408,17 @@ def availability_for(
     start_time: str = "",
     end_time: str = "",
     exclude_id: int | None = None,
-) -> dict[str, dict[str, str]]:
-    statuses = {location: {"status": "free", "label": "Wolne"} for location in ALL_LOCATIONS}
+) -> dict[str, dict[str, object]]:
+    statuses: dict[str, dict[str, object]] = {
+        location: {
+            "status": "free",
+            "label": "Wolne",
+            "color": "",
+            "reservation_id": "",
+            "tip": "",
+        }
+        for location in ALL_LOCATIONS
+    }
     day_value = parse_date_for_api(reservation_day)
     if day_value is None:
         return statuses
@@ -1394,21 +1433,31 @@ def availability_for(
 
     rows = db_rows(
         f"""
-        SELECT id, start_at, end_at, parent_name, birthday_child_name, child_location, adult_location
+        SELECT id, start_at, end_at, parent_name, birthday_child_name, birthday_child_age,
+               birthday_children_json, assigned_waiter, child_location, adult_location, status
         FROM reservations
         WHERE status = 'active'
           AND start_at < ?
           AND end_at > ?
           {exclude_sql}
-        ORDER BY start_at ASC
+        ORDER BY start_at ASC, id ASC
         """,
         tuple(params),
     )
+    colors = reservation_color_map(rows)
     for row in rows:
-        label = f"Zajęte: {row['birthday_child_name']}"
+        color = colors.get(int(row["id"]), "")
+        tip = reservation_plan_tip(row)
+        label = f"Zajęte: {tip}"
         for location in reservation_locations(row):
             if location in statuses:
-                statuses[location] = {"status": "occupied", "label": label}
+                statuses[location] = {
+                    "status": "occupied",
+                    "label": label,
+                    "color": color,
+                    "reservation_id": str(row["id"]),
+                    "tip": tip,
+                }
     return statuses
 
 
@@ -1453,7 +1502,7 @@ def field_time(values: dict[str, object], field: str) -> str:
     return format_time(values.get(field))
 
 
-def is_enabled(row: sqlite3.Row | dict[str, object], field: str) -> bool:
+def is_enabled(row: DbRow | dict[str, object], field: str) -> bool:
     return int(row[field] or 0) == 1
 
 
@@ -2512,7 +2561,86 @@ def page_template(
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
-      margin-bottom: 18px;
+      margin: 0;
+    }}
+
+    .organizer-layout {{
+      margin-top: 18px;
+    }}
+
+    .organizer-tools-board .section-head {{
+      align-items: center;
+      border-radius: 18px;
+      border-bottom: 1px solid var(--line);
+    }}
+
+    .organizer-form-board form {{
+      padding: 0;
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 18px 18px;
+      background: #ffffff;
+    }}
+
+    .organizer-form-board .form-board {{
+      border: 0;
+      border-radius: 0;
+    }}
+
+    .organizer-form-board .actions {{
+      padding: 14px 16px 18px;
+    }}
+
+    .organizer-day-list {{
+      display: grid;
+      gap: 14px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 18px 18px;
+      background:
+        linear-gradient(180deg, rgba(19, 155, 215, 0.04), rgba(122, 154, 18, 0.05)),
+        #ffffff;
+    }}
+
+    .organizer-day-list .timeline-card {{
+      margin: 0;
+    }}
+
+    .organizer-day-list .empty {{
+      margin: 0;
+    }}
+
+    .guest-count-block {{
+      display: grid;
+      gap: 8px;
+      grid-column: 1 / span 2;
+      min-width: 0;
+    }}
+
+    .guest-count-title {{
+      font-size: 0.88rem;
+      font-weight: 800;
+      color: var(--ink);
+    }}
+
+    .guest-count-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      align-items: start;
+    }}
+
+    .guest-count-field {{
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }}
+
+    .guest-count-input {{
+      width: 5.5rem;
+      max-width: 100%;
+      min-height: 40px;
     }}
 
     .date-toolbar {{
@@ -3092,14 +3220,27 @@ def page_template(
     }}
 
     .plan-block-title {{
+      display: block;
+      width: 100%;
       text-align: center;
       padding: 16px 18px 8px;
+      border: 0;
+      background: transparent;
       color: var(--ink);
+      font: inherit;
       font-size: clamp(1.25rem, 3.5vw, 1.85rem);
       font-weight: 800;
       letter-spacing: 0.06em;
       text-transform: uppercase;
       line-height: 1.1;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }}
+
+    .plan-block-title:hover,
+    .plan-block-title:focus-visible {{
+      color: var(--brand);
+      outline: none;
     }}
 
     .plan-block .plan-legend-bottom {{
@@ -3250,6 +3391,30 @@ def page_template(
       z-index: auto;
       padding: 0;
       margin: 0;
+    }}
+
+    .timeline-header.has-color {{
+      background: var(--reservation-color);
+      border-radius: 12px;
+      padding: 14px 16px;
+      color: #ffffff;
+    }}
+
+    .timeline-header.has-color .timeline-start,
+    .timeline-header.has-color .profile-name,
+    .timeline-header.has-color .waiter-assignment-label,
+    .timeline-header.has-color .waiter-assignment-label strong {{
+      color: #ffffff;
+    }}
+
+    .timeline-header.has-color .profile-tag {{
+      background: rgba(255, 255, 255, 0.22);
+      color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.35);
+    }}
+
+    .timeline-header.has-color .profile-guardian {{
+      color: rgba(255, 255, 255, 0.92);
     }}
 
     .waiter-assignment {{
@@ -3672,17 +3837,6 @@ def page_template(
       }}
     }}
 
-    .key-selected {{
-      background: #dbeafe;
-      border-color: var(--brand);
-    }}
-
-    .room-node.is-selected rect, .table-node.is-selected circle {{
-      fill: #dbeafe;
-      stroke: var(--brand);
-      stroke-width: 3;
-    }}
-
     .table-node {{
       cursor: pointer;
     }}
@@ -3828,16 +3982,6 @@ def page_template(
 
     .manager-layout .plan-accordion {{
       width: 100%;
-    }}
-
-    .manager-layout .room-plan {{
-      min-height: 420px;
-    }}
-
-    @media (min-width: 900px) {{
-      .manager-layout .room-plan {{
-        min-height: 560px;
-      }}
     }}
 
     .stack > .section-head {{
@@ -4711,128 +4855,199 @@ def page_template(
       background: #ffffff;
     }}
 
-    .plan-block .plan-outline {{
-      fill: #f3f3f3;
-      stroke: #d0d0d0;
-    }}
-
-    .plan-block .room-zone rect,
-    .plan-block .room-zone polygon {{
-      fill: #ececec;
-      stroke: #b0b0b0;
-    }}
-
-    .plan-block .room-node rect {{
-      fill: #e8f5c8;
-      stroke: #7f9918;
-    }}
-
-    .plan-block .room-node.is-busy rect {{
-      fill: #ffe8cc;
-      stroke: #f58212;
-    }}
-
-    .plan-block .room-zone.is-busy rect,
-    .plan-block .room-zone.is-busy polygon {{
-      fill: #ffe8cc;
-      stroke: #f58212;
-    }}
-
-    .plan-block .table-node circle {{
-      fill: #e8f5c8;
-      stroke: #7f9918;
-    }}
-
-    .plan-block .table-node.is-busy circle {{
-      fill: #ffe8cc;
-      stroke: #f58212;
-    }}
-
-    .plan-block .plan-caption,
-    .plan-block .room-node text,
-    .plan-block .room-zone text,
-    .plan-block .table-node text {{
-      fill: #000000;
-    }}
-
-    .plan-block .room-zone .zone-subtitle {{
-      fill: #333333;
-    }}
-
     .room-plan {{
       width: 100%;
       height: auto;
-      min-height: 360px;
+      aspect-ratio: 1378 / 554;
       border: 1px solid var(--line);
       background: #ffffff;
       display: block;
     }}
 
-    @media (min-width: 900px) {{
-      .room-plan {{
-        min-height: 520px;
-      }}
+    .plan-canvas {{
+      fill: #ffffff;
     }}
 
-    .plan-outline {{
-      fill: #f3f3f3;
-      stroke: #d0d0d0;
-      stroke-width: 2;
-    }}
-
-    .room-node rect {{
-      fill: var(--ok-soft);
-      stroke: #7f9918;
-      stroke-width: 2;
-      transition: fill 0.15s ease, stroke 0.15s ease;
-    }}
-
-    .room-zone rect, .room-zone polygon {{
-      fill: #ececec;
-      stroke: #b0b0b0;
-      stroke-width: 2;
-    }}
-
-    .room-node.is-busy rect {{
-      fill: var(--busy-soft);
-      stroke: var(--busy);
-    }}
-
-    .room-zone.is-busy rect, .room-zone.is-busy polygon {{
-      fill: var(--busy-soft);
-      stroke: var(--busy);
-    }}
-
-    .table-node circle {{
-      fill: var(--ok-soft);
-      stroke: #7f9918;
-      stroke-width: 2;
-    }}
-
-    .table-node.is-busy circle {{
-      fill: var(--busy-soft);
-      stroke: var(--busy);
-    }}
-
-    .room-node text, .room-zone text, .table-node text, .plan-caption {{
-      fill: #000000;
+    .plan-base {{
       pointer-events: none;
-      font-size: 13px;
-      font-weight: 900;
-      letter-spacing: 0;
     }}
 
-    .room-zone text {{
-      font-size: 12px;
+    .plan-node {{
+      cursor: pointer;
     }}
 
-    .room-zone .zone-subtitle {{
-      fill: #333333;
-      font-size: 11px;
+    .plan-field {{
+      fill: transparent;
+      stroke: transparent;
+      stroke-width: 2.4;
+      transition: fill 0.15s ease, stroke 0.15s ease, stroke-width 0.15s ease;
     }}
 
-    .table-node text {{
-      font-size: 10px;
+    .plan-label {{
+      fill: transparent;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      font-weight: 800;
+      text-anchor: middle;
+      dominant-baseline: central;
+      pointer-events: none;
+      user-select: none;
+      transition: fill 0.15s ease;
+    }}
+
+    .plan-node.is-busy .plan-field,
+    .plan-node.is-selected .plan-field {{
+      fill: #ffffff;
+      stroke: var(--node-color, var(--busy));
+      stroke-width: 3.2;
+    }}
+
+    .plan-node.is-selected .plan-field {{
+      stroke: var(--brand);
+    }}
+
+    .plan-node.is-busy.is-selected .plan-field {{
+      stroke: var(--node-color, var(--brand));
+      stroke-width: 3.6;
+    }}
+
+    .plan-node.is-busy .plan-label {{
+      fill: var(--node-color, var(--busy));
+    }}
+
+    .plan-node.is-selected .plan-label {{
+      fill: var(--brand);
+    }}
+
+    .plan-node.is-busy.is-selected .plan-label {{
+      fill: var(--node-color, var(--brand));
+    }}
+
+    .plan-fs {{
+      position: fixed;
+      inset: 0;
+      z-index: 12000;
+      display: none;
+      background: #ffffff;
+    }}
+
+    .plan-fs.is-open {{
+      display: block;
+    }}
+
+    body.plan-fs-open {{
+      overflow: hidden;
+    }}
+
+    .plan-fs-close {{
+      position: absolute;
+      top: max(10px, env(safe-area-inset-top, 0px));
+      right: max(10px, env(safe-area-inset-right, 0px));
+      z-index: 4;
+      width: 44px;
+      height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--ink);
+      font-size: 1.4rem;
+      font-weight: 700;
+      line-height: 1;
+      cursor: pointer;
+    }}
+
+    .plan-fs-stage {{
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+      padding: 12px;
+      transform-origin: center center;
+    }}
+
+    .plan-fs-stage .room-plan {{
+      width: 100%;
+      height: 100%;
+      max-width: 100%;
+      max-height: 100%;
+      aspect-ratio: auto;
+      border: 0;
+      background: #ffffff;
+    }}
+
+    .plan-fs-placeholder {{
+      display: none;
+    }}
+
+    .plan-fs.is-open .plan-fs-close {{
+      position: fixed;
+    }}
+
+    .plan-tip {{
+      position: fixed;
+      z-index: 35;
+      display: none;
+      max-width: min(240px, calc(100vw - 24px));
+      padding: 8px 12px;
+      border-radius: 12px;
+      background: #111111;
+      color: #ffffff;
+      font-size: 0.78rem;
+      font-weight: 700;
+      line-height: 1.35;
+      letter-spacing: 0.01em;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+      pointer-events: none;
+      transform: translate(-50%, calc(-100% - 12px));
+    }}
+
+    body.plan-fs-open .plan-tip {{
+      z-index: 13050;
+    }}
+
+    .plan-tip.is-visible {{
+      display: block !important;
+    }}
+
+    .plan-tip.is-below {{
+      transform: translate(-50%, 14px);
+    }}
+
+    .plan-tip::after {{
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 100%;
+      width: 0;
+      height: 0;
+      margin-left: -7px;
+      border: 7px solid transparent;
+      border-top-color: #111111;
+    }}
+
+    .plan-tip.is-below::after {{
+      top: auto;
+      bottom: 100%;
+      border-top-color: transparent;
+      border-bottom-color: #111111;
+    }}
+
+    .plan-tip-name {{
+      display: block;
+    }}
+
+    .plan-tip-waiter {{
+      display: block;
+      margin-top: 2px;
+      color: rgba(255, 255, 255, 0.78);
+      font-weight: 600;
+      font-size: 0.72rem;
+    }}
+
+    .key-selected {{
+      background: #dbeafe;
+      border-color: var(--brand);
     }}
 
     .schema-list {{
@@ -5240,17 +5455,50 @@ def page_template(
       }}
 
       .timeline-header {{
-        gap: 14px;
+        gap: 12px;
+        justify-content: space-between;
+        align-items: flex-start;
       }}
 
       .timeline-start {{
+        order: 2;
+        margin-left: auto;
         font-size: 1.75rem;
         min-width: 4.25rem;
+        text-align: right;
       }}
 
-      .profile-guardian {{
+      .timeline-header .profile-identity {{
+        order: 1;
+        flex: 1 1 auto;
+      }}
+
+      .timeline-header .waiter-assignment,
+      .timeline-header .timeline-status {{
+        order: 3;
+      }}
+
+      .timeline-header .profile-guardian {{
+        order: 4;
         margin-left: 0;
         width: 100%;
+      }}
+
+      .guest-count-block {{
+        grid-column: 1 / -1;
+      }}
+
+      .guest-count-input {{
+        width: 4.75rem;
+      }}
+
+      .organizer-day-list {{
+        padding: 12px;
+      }}
+
+      .organizer-tools-board .section-head {{
+        flex-direction: column;
+        align-items: stretch;
       }}
 
       .timeline-logistics {{
@@ -5298,17 +5546,264 @@ def page_template(
   {pwa_install_script()}
   {date_navigation_script()}
   {fast_navigation_script()}
+  {plan_tip_script()}
+  {plan_fullscreen_script()}
 </body>
 </html>"""
     return document.encode("utf-8")
 
 
+def plan_tip_script() -> str:
+    return """
+<script>
+(() => {
+  const svg = document.querySelector(".room-plan");
+  if (!svg) return;
+
+  let tipTimer = null;
+  let activeNode = null;
+  const planTip = document.createElement("div");
+  planTip.className = "plan-tip";
+  planTip.setAttribute("role", "status");
+  document.body.appendChild(planTip);
+
+  function hidePlanTip() {
+    activeNode = null;
+    planTip.classList.remove("is-visible", "is-below");
+    planTip.replaceChildren();
+    window.clearTimeout(tipTimer);
+  }
+
+  function findPlanNode(event) {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    for (const el of path) {
+      if (el?.classList?.contains?.("plan-node")) return el;
+    }
+    return event.target?.closest?.(".plan-node") || null;
+  }
+
+  function placePlanTip(node) {
+    if (!node || !planTip.classList.contains("is-visible")) return;
+    const rect = node.getBoundingClientRect();
+    const offscreen =
+      rect.bottom < 0 ||
+      rect.top > window.innerHeight ||
+      rect.right < 0 ||
+      rect.left > window.innerWidth;
+    if (offscreen) {
+      hidePlanTip();
+      return;
+    }
+    const tipWidth = Math.max(planTip.offsetWidth || 170, 130);
+    const left = Math.max(
+      12 + tipWidth / 2,
+      Math.min(window.innerWidth - 12 - tipWidth / 2, rect.left + rect.width / 2)
+    );
+    const showBelow = rect.top < 56;
+    planTip.style.left = `${left}px`;
+    planTip.style.top = `${showBelow ? rect.bottom : rect.top}px`;
+    planTip.style.transform = "";
+    planTip.classList.toggle("is-below", showBelow);
+  }
+
+  function showPlanTip(node) {
+    const tip = (node.getAttribute("data-tip") || node.dataset.tip || "").trim();
+    if (!tip) return false;
+    const parts = tip.split(" · ");
+    planTip.replaceChildren();
+    const nameEl = document.createElement("span");
+    nameEl.className = "plan-tip-name";
+    nameEl.textContent = parts[0] || tip;
+    planTip.appendChild(nameEl);
+    if (parts.length > 1) {
+      const waiterEl = document.createElement("span");
+      waiterEl.className = "plan-tip-waiter";
+      waiterEl.textContent = parts.slice(1).join(" · ");
+      planTip.appendChild(waiterEl);
+    }
+    activeNode = node;
+    planTip.classList.add("is-visible");
+    placePlanTip(node);
+    window.clearTimeout(tipTimer);
+    tipTimer = window.setTimeout(hidePlanTip, 4000);
+    return true;
+  }
+
+  window.IKIDS_SHOW_PLAN_TIP = (node, event) => {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    showPlanTip(node);
+  };
+  window.IKIDS_HIDE_PLAN_TIP = hidePlanTip;
+
+  window.addEventListener("scroll", () => placePlanTip(activeNode), true);
+  window.addEventListener("resize", () => placePlanTip(activeNode));
+
+  document.addEventListener("click", (event) => {
+    if (event.target.closest?.("[data-open-plan-fs], .plan-fs-close")) return;
+    const node = findPlanNode(event);
+    if (node && node.classList.contains("is-busy")) {
+      event.preventDefault();
+      event.stopPropagation();
+      showPlanTip(node);
+      return;
+    }
+    if (!node && !event.target.closest?.(".plan-tip")) hidePlanTip();
+  }, true);
+})();
+</script>
+"""
+
+
+def plan_fullscreen_script() -> str:
+    return """
+<script>
+(() => {
+  const openBtn = document.querySelector("[data-open-plan-fs]");
+  const svg = document.querySelector(".room-plan");
+  if (!openBtn || !svg) return;
+
+  const homeParent = svg.parentElement;
+  if (!homeParent) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "plan-fs";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", "Plan sali na pełnym ekranie");
+  overlay.innerHTML = `
+    <button type="button" class="plan-fs-close" aria-label="Zamknij plan">×</button>
+    <div class="plan-fs-stage"></div>
+  `;
+  document.body.appendChild(overlay);
+
+  const stage = overlay.querySelector(".plan-fs-stage");
+  const closeBtn = overlay.querySelector(".plan-fs-close");
+  const placeholder = document.createElement("div");
+  placeholder.className = "plan-fs-placeholder";
+  placeholder.setAttribute("aria-hidden", "true");
+
+  function hideTip() {
+    if (typeof window.IKIDS_HIDE_PLAN_TIP === "function") window.IKIDS_HIDE_PLAN_TIP();
+  }
+
+  function isOpen() {
+    return overlay.classList.contains("is-open");
+  }
+
+  function isPhoneLike() {
+    return Math.min(window.screen.width, window.screen.height) <= 920;
+  }
+
+  function deviceAngle() {
+    if (screen.orientation && typeof screen.orientation.angle === "number") {
+      return screen.orientation.angle;
+    }
+    if (typeof window.orientation === "number") return window.orientation;
+    return window.innerWidth >= window.innerHeight ? 90 : 0;
+  }
+
+  function syncLockedStage() {
+    if (!isOpen()) return;
+    hideTip();
+    if (!isPhoneLike()) {
+      stage.style.inset = "0";
+      stage.style.top = "";
+      stage.style.left = "";
+      stage.style.width = "";
+      stage.style.height = "";
+      stage.style.transform = "";
+      stage.style.padding = "12px";
+      return;
+    }
+    // Keep plan in fixed landscape orientation relative to the room,
+    // countering the phone/browser rotation.
+    const angle = ((deviceAngle() % 360) + 360) % 360;
+    const longSide = Math.max(window.innerWidth, window.innerHeight);
+    const shortSide = Math.min(window.innerWidth, window.innerHeight);
+    stage.style.inset = "auto";
+    stage.style.top = "50%";
+    stage.style.left = "50%";
+    stage.style.width = `${longSide}px`;
+    stage.style.height = `${shortSide}px`;
+    stage.style.padding = "16px 52px 16px 16px";
+    stage.style.transform = `translate(-50%, -50%) rotate(${90 - angle}deg)`;
+  }
+
+  function openPlan() {
+    if (isOpen()) return;
+    hideTip();
+    homeParent.insertBefore(placeholder, svg);
+    stage.appendChild(svg);
+    overlay.classList.add("is-open");
+    document.body.classList.add("plan-fs-open");
+    openBtn.setAttribute("aria-expanded", "true");
+    syncLockedStage();
+  }
+
+  function closePlan() {
+    if (!isOpen()) return;
+    hideTip();
+    homeParent.insertBefore(svg, placeholder);
+    placeholder.remove();
+    overlay.classList.remove("is-open");
+    document.body.classList.remove("plan-fs-open");
+    openBtn.setAttribute("aria-expanded", "false");
+    stage.style.inset = "";
+    stage.style.top = "";
+    stage.style.left = "";
+    stage.style.width = "";
+    stage.style.height = "";
+    stage.style.transform = "";
+    stage.style.padding = "";
+  }
+
+  openBtn.setAttribute("aria-expanded", "false");
+  openBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    openPlan();
+  });
+  closeBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    closePlan();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && isOpen()) {
+      event.preventDefault();
+      closePlan();
+    }
+  });
+  window.addEventListener("orientationchange", () => {
+    window.setTimeout(syncLockedStage, 50);
+  });
+  window.addEventListener("resize", syncLockedStage);
+  if (screen.orientation) {
+    screen.orientation.addEventListener("change", () => {
+      window.setTimeout(syncLockedStage, 50);
+    });
+  }
+})();
+</script>
+"""
+
+
 def render_organizer_tools(role: str, day: str) -> str:
     return f"""
-<div class="organizer-tools">
-  <a class="button secondary" href="/schema?role={escape(role)}&day={escape(day)}">Struktura bazy</a>
-  <a class="button secondary" href="/export">Eksport CSV</a>
-</div>
+<section class="role-board organizer-tools-board">
+  <div class="section-head">
+    <div>
+      <h2>Organizator urodzin</h2>
+      <p class="subtitle">Nowa rezerwacja, edycja oraz narzędzia dnia.</p>
+    </div>
+    <div class="organizer-tools">
+      <a class="button secondary" href="/schema?role={escape(role)}&day={escape(day)}">Struktura bazy</a>
+      <a class="button secondary" href="/export">Eksport CSV</a>
+    </div>
+  </div>
+</section>
 """
 
 
@@ -5446,7 +5941,7 @@ def default_form_values(target_day: date) -> dict[str, object]:
     }
 
 
-def row_to_form_values(row: sqlite3.Row) -> dict[str, object]:
+def row_to_form_values(row: DbRow) -> dict[str, object]:
     values = dict(row)
     values["reservation_date"] = format_date(row["start_at"])
     values["party_start_time"] = format_time(row["start_at"])
@@ -5674,7 +6169,7 @@ def render_birthday_children_fields(values: dict[str, object], errors: dict[str,
 """
 
 
-def reservation_duration_meta(row: sqlite3.Row | dict[str, object]) -> tuple[str, str]:
+def reservation_duration_meta(row: DbRow | dict[str, object]) -> tuple[str, str]:
     try:
         start = datetime.fromisoformat(str(row["start_at"]))
         end = datetime.fromisoformat(str(row["end_at"]))
@@ -5774,7 +6269,7 @@ def render_metric(value: int, label: str, icon_key: str) -> str:
     )
 
 
-def render_role_card_identity(row: sqlite3.Row | dict[str, object]) -> str:
+def render_role_card_identity(row: DbRow | dict[str, object]) -> str:
     children = birthday_children_from_row(row)
     names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
     name_markup = ", ".join(names) if names else "Brak solenizanta"
@@ -5795,7 +6290,7 @@ def render_role_card_identity(row: sqlite3.Row | dict[str, object]) -> str:
     """
 
 
-def render_role_extra_info(row: sqlite3.Row, notes: object = "") -> str:
+def render_role_extra_info(row: DbRow, notes: object = "") -> str:
     room = escape(display_location(row["child_location"]))
     adult = escape(display_locations(row["adult_location"]))
     parent = escape(str(row["parent_name"]))
@@ -5928,7 +6423,7 @@ def render_profile_room_tag(location: object) -> str:
     )
 
 
-def render_waiter_assignment(row: sqlite3.Row, role: str, day: str) -> str:
+def render_waiter_assignment(row: DbRow, role: str, day: str) -> str:
     if not can_assign_waiter(role):
         return ""
 
@@ -5974,7 +6469,7 @@ def render_waiter_assignment(row: sqlite3.Row, role: str, day: str) -> str:
     """
 
 
-def render_profile_identity(row: sqlite3.Row | dict[str, object]) -> str:
+def render_profile_identity(row: DbRow | dict[str, object]) -> str:
     children = birthday_children_from_row(row)
 
     names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
@@ -5998,7 +6493,7 @@ def render_profile_identity(row: sqlite3.Row | dict[str, object]) -> str:
     """
 
 
-def render_profile_guardian(row: sqlite3.Row | dict[str, object]) -> str:
+def render_profile_guardian(row: DbRow | dict[str, object]) -> str:
     parent_raw = row["parent_name"] if not isinstance(row, dict) else row.get("parent_name", "")
     parent = escape(str(parent_raw))
     if not parent:
@@ -6006,7 +6501,7 @@ def render_profile_guardian(row: sqlite3.Row | dict[str, object]) -> str:
     return f'<div class="profile-guardian">{PROFILE_USER_ICON}<span>{parent}</span></div>'
 
 
-def render_profile_header(row: sqlite3.Row | dict[str, object]) -> str:
+def render_profile_header(row: DbRow | dict[str, object]) -> str:
     return render_profile_identity(row) + render_profile_guardian(row)
 
 
@@ -6028,13 +6523,14 @@ def render_status_badge(status: str, cancellation_reason: str = "") -> str:
 
 
 def render_reservation_details(
-    row: sqlite3.Row,
+    row: DbRow,
     include_notes: bool = True,
     show_status: bool = False,
     footer_markup: str = "",
     role: str = "",
     day: str = "today",
     assign_waiter: bool = False,
+    color: str = "",
 ) -> str:
     start_label = escape(format_time(row["start_at"]))
 
@@ -6095,10 +6591,12 @@ def render_reservation_details(
 
     footer = f'<footer class="timeline-footer">{footer_markup}</footer>' if footer_markup else ""
     waiter_markup = render_waiter_assignment(row, role, day) if assign_waiter else ""
+    color_attr = f' style="--reservation-color: {escape(color)}"' if color else ""
+    color_class = " has-color" if color else ""
 
     return f"""
       <article class="timeline-card{cancelled_class}">
-        <header class="timeline-header">
+        <header class="timeline-header{color_class}"{color_attr}>
           <time class="timeline-start" datetime="{escape(str(row['start_at']))}">{start_label}</time>
           {render_profile_identity(row)}
           {waiter_markup}
@@ -6257,84 +6755,66 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str], *, compa
     statuses = availability_for(
         str(values.get("reservation_date", "")),
     )
-    room_nodes = []
-    for name, x, y, width, height in ROOM_LAYOUT:
-        status = statuses.get(name, {"status": "free", "label": "Wolne"})
-        classes = ["room-node"]
+    view_x, view_y, view_w, view_h = PLAN_VIEWBOX
+    plan_url = room_plan_asset_url()
+
+    nodes = []
+    for number, cx, cy, width, height in PLAN_HOTSPOTS:
+        location = location_for_plan_number(int(number))
+        if not location:
+            continue
+        status = statuses.get(location, {"status": "free", "label": "Wolne", "color": ""})
+        is_room = int(number) <= 6
+        classes = ["plan-node", "room-node" if is_room else "table-node"]
+        color = str(status.get("color") or "")
+        style_attr = ""
         if status["status"] == "occupied":
             classes.append("is-busy")
-        label_lines = split_svg_label(name)
-        line_markup = "".join(
-            f'<tspan x="{x + width / 2:.1f}" dy="{0 if index == 0 else 15}">{escape(line)}</tspan>'
-            for index, line in enumerate(label_lines)
-        )
-        room_nodes.append(
-            f"""
-    <g class="{' '.join(classes)}" data-location="{escape(name)}" aria-label="{escape(name)}">
-      <title>{escape(status["label"])}</title>
-      <rect x="{x}" y="{y}" width="{width}" height="{height}"></rect>
-      <text text-anchor="middle" x="{x + width / 2:.1f}" y="{y + height / 2 - (len(label_lines) - 1) * 7:.1f}">{line_markup}</text>
-    </g>
-"""
-        )
+            if color:
+                style_attr = f' style="--node-color: {escape(color)}"'
 
-    zones = []
-    for name, subtitle, x, y, width, height in ADULT_ZONE_LAYOUT:
-        zone_locations = ADULT_LOCATION_GROUPS.get(name, [])
-        busy_count = sum(
-            1 for location in zone_locations if statuses.get(location, {}).get("status") == "occupied"
-        )
-        classes = ["room-zone"]
-        if name == "Trójkąt":
-            shape = '<polygon points="628,82 800,82 872,166 872,330 628,330"></polygon>'
+        # Near-square tables follow the original circular markers; rooms stay rectangular.
+        label_size = max(10.0, min(width, height) * (0.38 if is_room else 0.52))
+        if not is_room and abs(width - height) <= 4:
+            radius = min(width, height) / 2
+            field = (
+                f'<circle class="plan-field" cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}"></circle>'
+            )
         else:
-            shape = f'<rect x="{x}" y="{y}" width="{width}" height="{height}"></rect>'
-        zones.append(
-            f"""
-    <g class="{' '.join(classes)}" aria-label="{escape(name)}: {escape(subtitle)}">
-      <title>{escape(name)}: {busy_count} zajęte</title>
-      {shape}
-      <text text-anchor="middle" x="{x + width / 2:.1f}" y="{y + 24:.1f}">{escape(name)}</text>
-      <text class="zone-subtitle" text-anchor="middle" x="{x + width / 2:.1f}" y="{y + 42:.1f}">{escape(subtitle)}</text>
-    </g>
-"""
-        )
+            x = cx - width / 2
+            y = cy - height / 2
+            rx = min(width, height) * (0.18 if is_room else 0.45)
+            field = (
+                f'<rect class="plan-field" x="{x:.1f}" y="{y:.1f}" '
+                f'width="{width:.1f}" height="{height:.1f}" rx="{rx:.1f}" ry="{rx:.1f}"></rect>'
+            )
 
-    table_nodes = []
-    for number, x, y in TABLE_LAYOUT:
-        area = TABLE_ZONE_BY_NUMBER[number]
-        location = f"{area} - Stolik {number}"
-        status = statuses.get(location, {"status": "free", "label": "Wolne"})
-        classes = ["table-node"]
-        if status["status"] == "occupied":
-            classes.append("is-busy")
-        table_nodes.append(
+        tip = str(status.get("tip") or "")
+        tip_attr = f' data-tip="{escape(tip)}"' if tip else ' data-tip=""'
+        nodes.append(
             f"""
-    <g class="{' '.join(classes)}" data-location="{escape(location)}" aria-label="{escape(location)}">
+    <g id="plan-object-{int(number)}" class="{' '.join(classes)}" data-location="{escape(location)}" data-plan-number="{int(number)}" role="button" tabindex="0" aria-label="{escape(location)}"{style_attr}{tip_attr}>
       <title>{escape(status["label"])}</title>
-      <circle cx="{x}" cy="{y}" r="16"></circle>
-      <text text-anchor="middle" x="{x}" y="{y + 5}" font-size="11">{number}</text>
+      {field}
+      <text class="plan-label" x="{cx:.1f}" y="{cy:.1f}" font-size="{label_size:.1f}">{int(number)}</text>
     </g>
 """
         )
 
     svg_markup = f"""
-        <svg class="room-plan" viewBox="0 0 940 560" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
-          <path d="M40 252 H250 V338 H40 Z" class="plan-outline"></path>
-          <path d="M280 148 H592 V338 H280 Z" class="plan-outline"></path>
-          <path d="M628 76 H804 L880 164 V338 H628 Z" class="plan-outline"></path>
-          <path d="M736 338 H912 V532 H736 Z" class="plan-outline"></path>
-          <text class="plan-caption" x="92" y="392" font-size="13" font-weight="900">Pokoje / loże tematyczne</text>
-          {''.join(zones)}
-          {''.join(table_nodes)}
-          {''.join(room_nodes)}
+        <svg class="room-plan" viewBox="{view_x:.1f} {view_y:.1f} {view_w:.1f} {view_h:.1f}" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
+          <rect class="plan-canvas" x="{view_x:.1f}" y="{view_y:.1f}" width="{view_w:.1f}" height="{view_h:.1f}"></rect>
+          <image class="plan-base" href="{escape(plan_url)}" x="0" y="0" width="1440" height="810" preserveAspectRatio="xMidYMid meet"></image>
+          <g class="plan-objects" aria-label="Stoliki i salki">
+            {''.join(nodes)}
+          </g>
         </svg>
 """
 
     if compact:
         return f"""
 <div class="plan-block" id="room-plan">
-  <div class="plan-block-title">PLAN SALI</div>
+  <button type="button" class="plan-block-title" data-open-plan-fs aria-label="Otwórz plan sali na pełnym ekranie">PLAN SALI</button>
   {svg_markup}
   <div class="plan-legend plan-legend-bottom">
     <span><span class="legend-key key-free"></span>WOLNE</span>
@@ -6429,7 +6909,7 @@ def render_form(
     plan_markup = render_room_plan(values, errors) if include_plan else ""
 
     return f"""
-<section>
+<section class="role-board organizer-form-board">
   <div class="section-head">
     <div>
       <h2>{title}</h2>
@@ -6459,16 +6939,21 @@ def render_form(
       <div class="form-category">
         <h3 class="category-title">Goście</h3>
         <div class="category-fields">
-          <label>
-            Liczba dzieci
-            <input type="number" name="children_count" min="1" max="120" value="{escape(values.get("children_count", ""))}" required>
-            {error_for(errors, "children_count")}
-          </label>
-          <label>
-            Liczba dorosłych
-            <input type="number" name="adults_count" min="0" max="120" value="{escape(values.get("adults_count", ""))}" required>
-            {error_for(errors, "adults_count")}
-          </label>
+          <div class="guest-count-block">
+            <span class="guest-count-title">Liczba</span>
+            <div class="guest-count-grid">
+              <label class="guest-count-field">
+                dzieci
+                <input class="guest-count-input" type="number" name="children_count" min="1" max="120" value="{escape(values.get("children_count", ""))}" required>
+                {error_for(errors, "children_count")}
+              </label>
+              <label class="guest-count-field">
+                dorosłych
+                <input class="guest-count-input" type="number" name="adults_count" min="0" max="120" value="{escape(values.get("adults_count", ""))}" required>
+                {error_for(errors, "adults_count")}
+              </label>
+            </div>
+          </div>
           <label class="full">
             Rodzic / osoba rezerwująca
             <input name="parent_name" autocomplete="name" value="{escape(values.get("parent_name", ""))}" required>
@@ -6544,7 +7029,7 @@ def render_form(
 """
 
 
-def service_pills(row: sqlite3.Row) -> str:
+def service_pills(row: DbRow) -> str:
     items = []
     if is_enabled(row, "animation_enabled"):
         animation_label = "Animacja"
@@ -6584,7 +7069,7 @@ def service_pills(row: sqlite3.Row) -> str:
     )
 
 
-def render_metrics(rows: list[sqlite3.Row]) -> str:
+def render_metrics(rows: list[DbRow]) -> str:
     active = [row for row in rows if row["status"] == "active"]
     animation_count = sum(1 for row in active if is_enabled(row, "animation_enabled"))
     workshops = sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled"))
@@ -6603,10 +7088,11 @@ def render_metrics(rows: list[sqlite3.Row]) -> str:
 """
 
 
-def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
+def render_manager_view(rows: list[DbRow], role: str, day: str) -> str:
     target_day = selected_day(day)
     weekday = WEEKDAY_LABELS[target_day.weekday()]
     day_label = f"{weekday} · {target_day.strftime('%d.%m')}"
+    colors = reservation_color_map(rows)
     if not rows:
         body = '<div class="empty">Brak rezerwacji w wybranym dniu.</div>'
     else:
@@ -6618,6 +7104,7 @@ def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
                 role=role,
                 day=day,
                 assign_waiter=True,
+                color=colors.get(int(row["id"]), ""),
             )
             for row in rows
         ]
@@ -6629,7 +7116,7 @@ def render_manager_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
 """
 
 
-def render_animator_view(rows: list[sqlite3.Row]) -> str:
+def render_animator_view(rows: list[DbRow]) -> str:
     banquets = []
     for row in rows:
         if row["status"] != "active":
@@ -6704,7 +7191,7 @@ def render_animator_view(rows: list[sqlite3.Row]) -> str:
 """
 
 
-def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
+def render_kitchen_view(rows: list[DbRow]) -> str:
     active = [row for row in rows if row["status"] == "active"]
     banquet_entries: list[tuple[str, str]] = []
 
@@ -6789,7 +7276,11 @@ def render_kitchen_view(rows: list[sqlite3.Row]) -> str:
 """
 
 
-def render_organizer_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
+def render_organizer_view(rows: list[DbRow], role: str, day: str) -> str:
+    target_day = selected_day(day)
+    weekday = WEEKDAY_LABELS[target_day.weekday()]
+    day_label = f"{weekday} · {target_day.strftime('%d.%m')}"
+    colors = reservation_color_map(rows)
     if not rows:
         body = '<div class="empty">Brak rezerwacji w wybranym dniu.</div>'
     else:
@@ -6811,23 +7302,28 @@ def render_organizer_view(rows: list[sqlite3.Row], role: str, day: str) -> str:
                     include_notes=True,
                     show_status=True,
                     footer_markup=actions,
+                    color=colors.get(int(row["id"]), ""),
                 )
             )
         body = "".join(cards)
 
     return f"""
+<section class="role-board organizer-board">
   <div class="section-head">
     <div>
       <h2>Rezerwacje dnia</h2>
-      <p class="subtitle">Zarządzanie rezerwacjami, statusami i dodatkami dla wybranego dnia.</p>
+      <p class="subtitle">{escape(day_label)} · zarządzanie rezerwacjami, statusami i dodatkami.</p>
     </div>
     <span class="count">{len(rows)} pozycji</span>
   </div>
-  {body}
+  <div class="organizer-day-list">
+    {body}
+  </div>
+</section>
 """
 
 
-def render_role_view(role: str, rows: list[sqlite3.Row], day: str) -> str:
+def render_role_view(role: str, rows: list[DbRow], day: str) -> str:
     if role == "animators":
         return render_animator_view(rows)
     if role == "kitchen":
@@ -6862,7 +7358,7 @@ def render_schema_summary() -> str:
   <div class="section-head">
     <div>
       <h2>Proponowana struktura bazy danych</h2>
-      <p class="subtitle">W prototypie działa SQLite. Ten sam model można przenieść 1:1 do PostgreSQL/Supabase.</p>
+      <p class="subtitle">Baza produkcyjna: PostgreSQL (Supabase).</p>
     </div>
   </div>
   <div class="section-body">
@@ -6907,11 +7403,10 @@ def render_home(
 
     content = render_nav(page_role, day)
     if role == "organizer":
-        content += render_organizer_tools(role, day) + f"""
-<div class="stack">
+        content += f"""
+<div class="stack organizer-layout">
+  {render_organizer_tools(role, day)}
   {render_form(values, errors, role, day, include_plan=True)}
-</div>
-<div class="stack">
   {render_role_view(role, rows, day)}
 </div>
 {room_plan_script()}
@@ -7280,8 +7775,11 @@ def room_plan_script() -> str:
 
   function applyAvailability(locations) {
     nodes.forEach((node) => {
-      const info = locations[node.dataset.location] || { status: "free", label: "Wolne" };
+      const info = locations[node.dataset.location] || { status: "free", label: "Wolne", color: "", tip: "" };
       node.classList.toggle("is-busy", info.status === "occupied");
+      if (info.color) node.style.setProperty("--node-color", info.color);
+      else node.style.removeProperty("--node-color");
+      node.dataset.tip = info.tip || "";
       const title = node.querySelector("title");
       if (title) title.textContent = info.label;
     });
@@ -7373,10 +7871,7 @@ def room_plan_script() -> str:
   roomNodes.forEach((node) => {
     node.style.cursor = "pointer";
     node.addEventListener("click", () => {
-      if (node.classList.contains("is-busy")) {
-        window.alert("Ta sala jest zajęta w wybranym dniu.");
-        return;
-      }
+      if (node.classList.contains("is-busy")) return;
       setChildLocation(node.dataset.location);
     });
   });
@@ -7384,10 +7879,7 @@ def room_plan_script() -> str:
   tableNodes.forEach((node) => {
     node.style.cursor = "pointer";
     node.addEventListener("click", () => {
-      if (node.classList.contains("is-busy")) {
-        window.alert("Ten stolik jest zajęty w wybranym dniu.");
-        return;
-      }
+      if (node.classList.contains("is-busy")) return;
       toggleAdultTable(node.dataset.location);
     });
   });
@@ -7724,6 +8216,28 @@ class ReservationHandler(BaseHTTPRequestHandler):
                 )
                 return
             self.send_bytes(b"", status=HTTPStatus.NOT_FOUND, content_type="image/png")
+            return
+
+        if parsed.path == "/room-plan.png":
+            if ROOM_PLAN_PNG_PATH.exists():
+                self.send_bytes(
+                    ROOM_PLAN_PNG_PATH.read_bytes(),
+                    content_type="image/png",
+                    extra_headers={"Cache-Control": "public, max-age=31536000, immutable"},
+                )
+                return
+            self.send_bytes(b"", status=HTTPStatus.NOT_FOUND, content_type="image/png")
+            return
+
+        if parsed.path == "/room-plan.svg":
+            if ROOM_PLAN_SVG_PATH.exists():
+                self.send_bytes(
+                    ROOM_PLAN_SVG_PATH.read_bytes(),
+                    content_type="image/svg+xml; charset=utf-8",
+                    extra_headers={"Cache-Control": "public, max-age=31536000, immutable"},
+                )
+                return
+            self.send_bytes(b"", status=HTTPStatus.NOT_FOUND, content_type="image/svg+xml; charset=utf-8")
             return
 
         if parsed.path == "/ca.crt":
@@ -8271,12 +8785,15 @@ def https_context() -> ssl.SSLContext:
 
 def run() -> None:
     init_db()
-    server = None
     selected_port = PORT
-    use_https = os.environ.get("IKIDS_HTTPS", "").strip() == "1"
+    # Fly/Docker: HTTP behind platform TLS. Local HTTPS only with IKIDS_HTTPS=1.
+    behind_proxy = bool(os.environ.get("FLY_APP_NAME")) or os.environ.get("IKIDS_HTTP", "").strip() == "1"
+    use_https = (not behind_proxy) and os.environ.get("IKIDS_HTTPS", "").strip() == "1"
     context = https_context() if use_https else None
     server_class = ThreadingHTTPSServer if use_https else ThreadingHTTPServer
-    for candidate_port in range(PORT, PORT + 20):
+    port_candidates = [PORT] if behind_proxy else list(range(PORT, PORT + 20))
+    server = None
+    for candidate_port in port_candidates:
         try:
             if context is not None:
                 server = server_class((HOST, candidate_port), ReservationHandler, context)
@@ -8288,7 +8805,7 @@ def run() -> None:
             if exc.errno != errno.EADDRINUSE:
                 raise
     if server is None:
-        raise RuntimeError(f"Nie znaleziono wolnego portu w zakresie {PORT}-{PORT + 19}.")
+        raise RuntimeError(f"Nie znaleziono wolnego portu (start {PORT}).")
 
     protocol = "https" if use_https else "http"
     print(f"{APP_TITLE} działa pod adresem {protocol}://{HOST}:{selected_port}")

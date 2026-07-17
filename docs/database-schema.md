@@ -1,6 +1,6 @@
 # iKids Park - docelowa struktura bazy danych
 
-Rekomendowany wariant produkcyjny: PostgreSQL, najlepiej Supabase, z Row Level Security dla ról aplikacyjnych. W prototypie `main.py` używa SQLite i tego samego modelu logicznego.
+Rekomendowany wariant produkcyjny: PostgreSQL (Supabase). Aplikacja (`main.py`) łączy się przez `DATABASE_URL` (psycopg).
 
 ## Tabele
 

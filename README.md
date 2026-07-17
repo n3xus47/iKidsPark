@@ -1,62 +1,56 @@
 # iKids Park - Rezerwacje urodzin
 
-Wewnętrzna aplikacja webowa do obsługi rezerwacji urodzinowych. Prototyp działa bez zależności zewnętrznych na Python HTTP Server + SQLite, ale model danych jest przygotowany pod łatwe przeniesienie do PostgreSQL/Supabase.
+Aplikacja webowa do obsługi rezerwacji urodzinowych. Backend: Python HTTP Server + **PostgreSQL (Supabase)** + hosting **Fly.io** (Docker).
 
-## Uruchomienie
+## Architektura
+
+- **Baza:** Supabase Postgres (`DATABASE_URL`)
+- **Aplikacja (live):** kontener Docker na Fly.io → https://ikidspark.fly.dev
+- **Lokalnie:** `python3 main.py` (HTTP) albo `IKIDS_HTTPS=1` z lokalnym CA
+
+## Lokalnie (dev)
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # wklej DATABASE_URL (pooler Supabase)
 python3 main.py
 ```
 
-Aplikacja domyślnie działa w przeglądarce pod adresem `http://127.0.0.1:8000`. Jeśli port 8000 jest zajęty, serwer automatycznie wybierze kolejny wolny port i wypisze go w terminalu.
+Domyślnie: `http://127.0.0.1:8000` (kolejny wolny port, jeśli 8000 zajęty).
 
-Żeby wejść z telefonu, podłącz telefon i komputer do tej samej sieci i otwórz `http://<IP-komputera>:8000`. Przy hotspocie Windows tworzonym z komputera adresem komputera jest zwykle `192.168.137.1`, więc telefon powinien otworzyć `http://192.168.137.1:8000`.
+Z telefonu w tej samej sieci: `http://<IP-komputera>:8000`.
 
-Opcjonalny tryb HTTPS można włączyć poleceniem `IKIDS_HTTPS=1 python3 main.py`. W tym trybie na telefonie trzeba zainstalować i zaufać certyfikatowi CA `ikids-local-ca.crt`; inaczej przeglądarka może pokazać `ERR_CERT_AUTHORITY_INVALID`.
+Opcjonalny HTTPS lokalny: `IKIDS_HTTPS=1 python3 main.py` (+ zaufanie `ikids-local-ca.crt` na telefonie).
 
-## Działanie w sieci lokalnej
+## Fly.io (produkcja / testy publiczne)
 
-Aplikacja działa jako PWA/przeglądarkowy panel na jednym lokalnym serwerze. Komputer, na którym uruchomiono `python3 main.py`, jest serwerem i trzyma lokalną bazę `reservations.db`. Telefony, tablety i inne komputery nie mają osobnej kopii danych - otwierają tę samą aplikację przez przeglądarkę i zapisują do tej samej bazy na serwerze.
+Adres: **https://ikidspark.fly.dev**
 
-Przykład dla hotspotu Windows z komputera:
-
-```text
-http://192.168.137.1:8000
+```bash
+export PATH="$HOME/.fly/bin:$PATH"
+./scripts/fly-deploy.sh
 ```
 
-Przykład dla zwykłej domowej sieci Wi-Fi:
+Przydatne:
 
-```text
-http://192.168.0.60:8000
+```bash
+fly status -a ikidspark
+fly logs -a ikidspark
+fly deploy -a ikidspark
 ```
 
-Adres `192.168.0.60` jest tylko przykładem - w domu trzeba użyć aktualnego adresu IP komputera w tej samej sieci co telefon. Rezerwacja dodana na laptopie jest widoczna na telefonie po wejściu na ten sam serwer i odświeżeniu widoku. Analogicznie rezerwacja dodana z telefonu zapisuje się w tej samej bazie na laptopie.
+Kod lokalny **nie** aktualizuje się sam na Fly — po zmianach trzeba `fly deploy`.
 
-Jeśli telefon nie otwiera strony mimo poprawnego adresu, najczęściej blokuje ją Zapora Windows. Trzeba wtedy zezwolić na połączenia przychodzące TCP na port `8000` dla Pythona lub dodać regułę:
+## Pliki deploy
 
-```powershell
-New-NetFirewallRule -DisplayName "iKids Park HTTP 8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000 -Profile Any
-```
+- `Dockerfile`, `fly.toml`, `scripts/fly-deploy.sh`
+- `supabase/schema.sql`, `supabase/seed_from_sqlite.sql`
 
-## PWA i skrót na ekranie
-
-Przycisk `Pobierz` korzysta z mechanizmu PWA w przeglądarce. Nie instaluje pliku APK. Skrót na telefonie używa ikon `/app-icon-*.png`, które są generowane z `logo.png` na białym tle, z marginesem dopasowanym do masek ikon Androida/iOS. Jeśli ikona skrótu się nie odświeża, trzeba usunąć stary skrót/PWA z telefonu, wyczyścić dane strony w przeglądarce i dodać skrót ponownie.
-
-## Zakres
+## Zakres funkcji
 
 - role: Kierownik/Recepcja, Animatorzy, Cukiernia, Kuchnia,
-- szybkie filtry: Dziś, Jutro, Pojutrze,
-- formularz dodawania i pełnej edycji rezerwacji,
-- status Aktywna/Anulowana z wymaganym powodem anulowania,
-- historia zmian rezerwacji,
-- plan sali SVG z podglądem wolne/zajęte,
-- API dostępności na żywo: `/api/availability`,
-- blokada nakładających się rezerwacji tej samej salki lub stolika,
-- blokada atrakcji w oknie 17:50-18:10 wokół godziny scenicznej 18:00.
-
-## Struktura bazy
-
-W aplikacji dostępna jest strona `/schema` z proponowanym schematem PostgreSQL/Supabase. Najważniejsze tabele:
-
-- `reservations` - jeden agregat rezerwacji z zakresem czasu, lokalizacjami, usługami, statusem i anulowaniem,
-- `reservation_history` - historia append-only z pełnym snapshotem JSON po każdej zmianie.
+- filtry dni, formularz rezerwacji, anulowanie, historia,
+- plan sali SVG, API `/api/availability`,
+- blokady nakładających się lokalizacji i atrakcji.
