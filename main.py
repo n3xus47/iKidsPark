@@ -32,7 +32,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
 # Bump only when service-worker logic changes. Icon URLs use logo mtime separately.
-PWA_CACHE_NAME = "ikidspark-pwa-v15"
+PWA_CACHE_NAME = "ikidspark-pwa-v16"
 PWA_ICON_SIZES = (192, 512)
 PWA_MANIFEST_ID = "/"
 DbRow = dict[str, Any]
@@ -1660,7 +1660,7 @@ def date_title(target_day: date) -> str:
     )
 
 
-_APP_ICON_CACHE: dict[int, bytes] = {}
+_APP_ICON_CACHE: dict[tuple[int, bool], bytes] = {}
 _APP_ICON_LOCK = threading.Lock()
 _BOOT_READY = threading.Event()
 _BOOT_ERROR: str | None = None
@@ -1668,20 +1668,58 @@ _BOOT_ERROR: str | None = None
 
 def boot_wait_page(message: str = "Uruchamianie iKids Park…") -> bytes:
     safe = escape(message)
+    icon_src = f"/app-icon-512.png?v={pwa_icon_version()}"
     return f"""<!doctype html>
 <html lang="pl">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
   <meta http-equiv="refresh" content="2">
   <title>iKids Park</title>
   <style>
-    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family: system-ui, sans-serif;
-      background: linear-gradient(160deg, #e8f6fc, #ffffff 55%); color:#0f3a4d; }}
-    p {{ font-size:1.05rem; letter-spacing:.02em; }}
+    html, body {{
+      margin: 0;
+      min-height: 100%;
+      height: 100%;
+      background: #ffffff;
+    }}
+    body {{
+      display: grid;
+      place-items: center;
+      font-family: system-ui, sans-serif;
+      color: #8a8a8a;
+    }}
+    .boot {{
+      display: grid;
+      justify-items: center;
+      gap: 18px;
+      padding: 24px;
+    }}
+    .boot img {{
+      width: min(58vw, 220px);
+      height: auto;
+      display: block;
+      border: 0;
+      /* brak karty / cienia — białe tło logo zlewa się z ekranem */
+      background: transparent;
+      border-radius: 0;
+      box-shadow: none;
+    }}
+    .boot p {{
+      margin: 0;
+      font-size: 0.95rem;
+      letter-spacing: .02em;
+      color: #9a9a9a;
+    }}
   </style>
 </head>
-<body><p>{safe}</p></body>
+<body>
+  <div class="boot">
+    <img src="{icon_src}" alt="iKids Park" width="512" height="512">
+    <p>{safe}</p>
+  </div>
+</body>
 </html>""".encode("utf-8")
 
 
@@ -1689,8 +1727,8 @@ def pwa_icon_version() -> str:
     """Stable until the logo file changes — avoids endless WebAPK reinstalls from cache bumps."""
     for path in (PWA_LOGO_PATH, LOGO_PATH):
         if path.exists():
-            return f"{int(path.stat().st_mtime)}-{path.stat().st_size}"
-    return PWA_CACHE_NAME
+            return f"{int(path.stat().st_mtime)}-{path.stat().st_size}-splash2"
+    return f"{PWA_CACHE_NAME}-splash2"
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -1793,11 +1831,47 @@ def _resize_rgba(
     return out
 
 
-def app_icon_png(size: int = 512) -> bytes:
-    """Serve a correctly sized PWA icon from pwalogo.png (or logo.png fallback)."""
+def _whiten_near_white(pixels: list[tuple[int, int, int, int]], threshold: int = 248) -> list[tuple[int, int, int, int]]:
+    """Force near-white pixels to pure #fff so splash tiles don't show gray fringes."""
+    out: list[tuple[int, int, int, int]] = []
+    for r, g, b, a in pixels:
+        if r >= threshold and g >= threshold and b >= threshold:
+            out.append((255, 255, 255, 255))
+        else:
+            out.append((r, g, b, a))
+    return out
+
+
+def _knockout_white_to_transparent(
+    pixels: list[tuple[int, int, int, int]],
+    threshold: int = 248,
+) -> list[tuple[int, int, int, int]]:
+    """Make white background transparent so splash shows only the gray logo on white bg."""
+    out: list[tuple[int, int, int, int]] = []
+    for r, g, b, a in pixels:
+        if r >= threshold and g >= threshold and b >= threshold:
+            out.append((255, 255, 255, 0))
+        else:
+            # Soften residual light fringe against transparent bg
+            luma = (r + g + b) / 3
+            if luma > 200:
+                alpha = max(0, min(255, int(255 * (1 - (luma - 200) / 55))))
+                out.append((r, g, b, alpha))
+            else:
+                out.append((r, g, b, a))
+    return out
+
+
+def app_icon_png(size: int = 512, *, solid: bool = False) -> bytes:
+    """PWA icon from pwalogo.png.
+
+    solid=False (default): transparent background — splash/launcher „any” shows only gray logo.
+    solid=True: pure white background — maskable / apple-touch / favicon.
+    """
     target = 512 if size >= 512 else 192
+    cache_key = (target, solid)
     with _APP_ICON_LOCK:
-        cached = _APP_ICON_CACHE.get(target)
+        cached = _APP_ICON_CACHE.get(cache_key)
         if cached is not None:
             return cached
         source_bytes: bytes | None = None
@@ -1806,19 +1880,25 @@ def app_icon_png(size: int = 512) -> bytes:
         elif LOGO_PATH.exists():
             source_bytes = LOGO_PATH.read_bytes()
         if source_bytes is None:
-            payload = _encode_png_rgba(target, target, [(255, 255, 255, 255)] * (target * target))
-            _APP_ICON_CACHE[target] = payload
+            if solid:
+                payload = _encode_png_rgba(target, target, [(255, 255, 255, 255)] * (target * target))
+            else:
+                payload = _encode_png_rgba(target, target, [(255, 255, 255, 0)] * (target * target))
+            _APP_ICON_CACHE[cache_key] = payload
             return payload
         decoded = _decode_png_rgba(source_bytes)
         if decoded is None:
-            # Already a valid PNG we cannot re-encode; serve as-is for 512 only.
-            payload = source_bytes if target == 512 else source_bytes
-            _APP_ICON_CACHE[target] = payload
+            payload = source_bytes
+            _APP_ICON_CACHE[cache_key] = payload
             return payload
         src_w, src_h, src = decoded
         pixels = _resize_rgba(src_w, src_h, src, target)
+        if solid:
+            pixels = _whiten_near_white(pixels)
+        else:
+            pixels = _knockout_white_to_transparent(pixels)
         payload = _encode_png_rgba(target, target, pixels)
-        _APP_ICON_CACHE[target] = payload
+        _APP_ICON_CACHE[cache_key] = payload
         return payload
 
 
@@ -1826,16 +1906,24 @@ def manifest_response() -> bytes:
     icon_v = pwa_icon_version()
     icons: list[dict[str, str]] = []
     for size in PWA_ICON_SIZES:
-        src = f"/app-icon-{size}.png?v={icon_v}"
-        for purpose in ("any", "maskable"):
-            icons.append(
-                {
-                    "src": src,
-                    "sizes": f"{size}x{size}",
-                    "type": "image/png",
-                    "purpose": purpose,
-                }
-            )
+        # Transparent „any” — Android splash blends into white background_color (no square tile).
+        icons.append(
+            {
+                "src": f"/app-icon-{size}.png?v={icon_v}",
+                "sizes": f"{size}x{size}",
+                "type": "image/png",
+                "purpose": "any",
+            }
+        )
+        # Solid white maskable — home-screen adaptive icon still looks correct.
+        icons.append(
+            {
+                "src": f"/app-icon-{size}-solid.png?v={icon_v}",
+                "sizes": f"{size}x{size}",
+                "type": "image/png",
+                "purpose": "maskable",
+            }
+        )
     manifest = {
         "name": APP_TITLE,
         "short_name": APP_SHORT_TITLE,
@@ -1858,7 +1946,14 @@ def manifest_response() -> bytes:
 
 def service_worker_response() -> bytes:
     icon_v = pwa_icon_version()
-    icon_assets = ",\n  ".join(json.dumps(f"/app-icon-{size}.png?v={icon_v}") for size in PWA_ICON_SIZES)
+    icon_assets = ",\n  ".join(
+        json.dumps(url)
+        for size in PWA_ICON_SIZES
+        for url in (
+            f"/app-icon-{size}.png?v={icon_v}",
+            f"/app-icon-{size}-solid.png?v={icon_v}",
+        )
+    )
     payload = """const IKIDS_CACHE = "__CACHE_NAME__";
 const STATIC_ASSETS = [
   "/offline",
@@ -1939,8 +2034,8 @@ def offline_response() -> bytes:
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/app-icon-192.png?v={pwa_icon_version()}" type="image/png">
-  <link rel="apple-touch-icon" href="/app-icon-192.png?v={pwa_icon_version()}">
+  <link rel="icon" href="/app-icon-192-solid.png?v={pwa_icon_version()}" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192-solid.png?v={pwa_icon_version()}">
   <title>{APP_SHORT_TITLE} offline</title>
   <style>
     body {{
@@ -2492,8 +2587,8 @@ def page_template(
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/app-icon-192.png?v={pwa_icon_version()}" type="image/png">
-  <link rel="apple-touch-icon" href="/app-icon-192.png?v={pwa_icon_version()}">
+  <link rel="icon" href="/app-icon-192-solid.png?v={pwa_icon_version()}" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192-solid.png?v={pwa_icon_version()}">
   <title>{APP_TITLE}</title>
   <style>
     :root {{
@@ -5876,7 +5971,7 @@ def page_template(
   </header>
   <div class="install-popup" data-install-popup hidden>
     <div class="install-popup__card" role="dialog" aria-modal="true" aria-labelledby="install-popup-title">
-      <img class="install-popup__icon" src="/app-icon-192.png?v={pwa_icon_version()}" alt="">
+      <img class="install-popup__icon" src="/app-icon-192-solid.png?v={pwa_icon_version()}" alt="">
       <p class="install-popup__title" id="install-popup-title">Dodaj do telefonu</p>
       <p class="install-popup__step" data-install-step></p>
       <button type="button" class="install-popup__close" data-install-popup-close>OK</button>
@@ -8643,17 +8738,15 @@ def csv_response() -> bytes:
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
-def icon_size_for_path(path: str) -> int | None:
-    filenames = {
-        f"/app-icon-{size}.png": size
-        for size in PWA_ICON_SIZES
-    }
-    filenames.update({
-        f"/static/icon-{size}.png": size
-        for size in PWA_ICON_SIZES
-    })
-    filenames["/favicon.ico"] = 192
-    return filenames.get(path)
+def icon_spec_for_path(path: str) -> tuple[int, bool] | None:
+    """Return (size, solid) for icon URL paths."""
+    mapping: dict[str, tuple[int, bool]] = {}
+    for size in PWA_ICON_SIZES:
+        mapping[f"/app-icon-{size}.png"] = (size, False)
+        mapping[f"/app-icon-{size}-solid.png"] = (size, True)
+        mapping[f"/static/icon-{size}.png"] = (size, True)
+    mapping["/favicon.ico"] = (192, True)
+    return mapping.get(path)
 
 
 class ReservationHandler(BaseHTTPRequestHandler):
@@ -8763,10 +8856,11 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.send_bytes(b"", status=HTTPStatus.GONE, content_type="text/plain; charset=utf-8")
             return
 
-        icon_size = icon_size_for_path(parsed.path)
-        if icon_size is not None:
+        icon_spec = icon_spec_for_path(parsed.path)
+        if icon_spec is not None:
+            size, solid = icon_spec
             self.send_bytes(
-                app_icon_png(icon_size),
+                app_icon_png(size, solid=solid),
                 content_type="image/png",
                 extra_headers={"Cache-Control": f"public, max-age=86400, immutable"},
             )
@@ -8850,7 +8944,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if icon_size_for_path(parsed.path) is not None:
+        if icon_spec_for_path(parsed.path) is not None:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/png")
             self.send_header("Cache-Control", "public, max-age=86400, immutable")
@@ -9333,8 +9427,10 @@ def run() -> None:
             print("Baza gotowa.", flush=True)
             _BOOT_ERROR = None
             _BOOT_READY.set()
-            app_icon_png(192)
-            app_icon_png(512)
+            app_icon_png(192, solid=False)
+            app_icon_png(512, solid=False)
+            app_icon_png(192, solid=True)
+            app_icon_png(512, solid=True)
             print("Ikona PWA gotowa.", flush=True)
         except Exception as exc:
             _BOOT_ERROR = f"Błąd startu: {exc}"
