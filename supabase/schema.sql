@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     animation_enabled INTEGER NOT NULL DEFAULT 0,
     animation_type TEXT,
     animation_at TEXT,
+    animations_json TEXT,
     cake_enabled INTEGER NOT NULL DEFAULT 0,
     cake_theme TEXT,
     cake_at TEXT,

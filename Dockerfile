@@ -15,7 +15,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
-COPY logo.png logox221.png 14.svg ./
+COPY logo.png logox221.png pwalogo.png 14.svg ./
 COPY assets ./assets
 COPY supabase ./supabase
 

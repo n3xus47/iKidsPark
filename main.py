@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import zlib
 from datetime import date, datetime, time, timedelta
 from http import HTTPStatus
@@ -30,12 +31,15 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
-PWA_CACHE_NAME = "ikidspark-pwa-v10"
-PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
+# Bump only when service-worker logic changes. Icon URLs use logo mtime separately.
+PWA_CACHE_NAME = "ikidspark-pwa-v15"
+PWA_ICON_SIZES = (192, 512)
+PWA_MANIFEST_ID = "/"
 DbRow = dict[str, Any]
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 LOGO_PATH = Path(__file__).with_name("logo.png")
 MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
+PWA_LOGO_PATH = Path(__file__).with_name("pwalogo.png")
 ROOM_PLAN_SVG_PATH = Path(__file__).with_name("14.svg")
 ROOM_PLAN_PNG_PATH = Path(__file__).with_name("assets") / "room-plan.png"
 SOURCE_PATH = Path(__file__)
@@ -367,14 +371,15 @@ ROLE_NAV_ICONS = {
 }
 
 WAITERS = (
-    "Anna Kowalska",
-    "Jan Nowak",
-    "Katarzyna Wiśniewska",
-    "Piotr Wójcik",
-    "Magdalena Kamińska",
-    "Tomasz Lewandowski",
-    "Aleksandra Zielińska",
-    "Michał Szymański",
+    "Ilya Tumilovich",
+    "Hanna Hodmash",
+    "Adrian Rybińczuk",
+    "Nicole Piotrowiak",
+    "Patrycja Zewar",
+    "Julia Wojciechowka",
+    "Paweł Osiałkowski",
+    "Kain Niżnik",
+    "Jan Ostrykiewicz",
 )
 
 SERVICE_OVERLAP_MESSAGE = "Godziny dodatków w tej rezerwacji nie mogą się nakładać."
@@ -411,7 +416,13 @@ def adapt_sql(query: str) -> str:
 
 
 def connect() -> psycopg.Connection:
-    return psycopg.connect(require_database_url(), row_factory=dict_row)
+    # Transaction pooler (PgBouncer) rejects prepared statements.
+    return psycopg.connect(
+        require_database_url(),
+        row_factory=dict_row,
+        prepare_threshold=None,
+        connect_timeout=10,
+    )
 
 
 def create_schema(conn: psycopg.Connection) -> None:
@@ -432,6 +443,7 @@ def create_schema(conn: psycopg.Connection) -> None:
             animation_enabled INTEGER NOT NULL DEFAULT 0,
             animation_type TEXT,
             animation_at TEXT,
+            animations_json TEXT,
             cake_enabled INTEGER NOT NULL DEFAULT 0,
             cake_theme TEXT,
             cake_at TEXT,
@@ -510,6 +522,7 @@ def migrate_location_names(conn: psycopg.Connection) -> None:
 def init_db() -> None:
     with connect() as conn:
         create_schema(conn)
+        conn.execute("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS animations_json TEXT")
         migrate_location_names(conn)
 
 
@@ -589,16 +602,23 @@ def week_dates(target_day: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range(7)]
 
 
-def calendar_week_pages(anchor_day: date, year: int | None = None) -> list[tuple[int, list[date]]]:
-    anchor_year = year or anchor_day.year
-    year_start = date(anchor_year, 1, 1)
-    year_end = date(anchor_year, 12, 31)
+def calendar_week_pages(
+    anchor_day: date,
+    year: int | None = None,
+    *,
+    radius: int = 8,
+    include_day: date | None = None,
+) -> list[tuple[int, list[date]]]:
+    """Build a short week strip around today (not the whole year — that crushed mobile loads)."""
+    del year  # kept for call-site compatibility
+    offsets = set(range(-radius, radius + 1))
+    if include_day is not None:
+        offsets.add(week_page_offset_for_day(anchor_day, include_day))
     pages: list[tuple[int, list[date]]] = []
-    for offset in range(-52, 53):
+    for offset in sorted(offsets):
         center = anchor_day + timedelta(days=7 * offset)
         days = [center + timedelta(days=delta) for delta in range(-3, 4)]
-        if all(year_start <= day <= year_end for day in days):
-            pages.append((offset, days))
+        pages.append((offset, days))
     return pages
 
 
@@ -633,6 +653,71 @@ def parse_birthday_children(data: dict[str, object]) -> list[dict[str, object]]:
             age = None
         children.append({"name": name, "age": age})
     return children
+
+
+def _as_str_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def parse_animations(data: dict[str, object]) -> list[dict[str, object]]:
+    types = _as_str_list(data.get("animation_type"))
+    starts = _as_str_list(data.get("animation_at"))
+    length = max(len(types), len(starts), 0)
+    animations: list[dict[str, object]] = []
+    for index in range(length):
+        anim_type = str(types[index] if index < len(types) else "").strip()
+        anim_at = str(starts[index] if index < len(starts) else "").strip()
+        if not anim_type and not anim_at:
+            continue
+        animations.append({"type": anim_type, "at": anim_at})
+    return animations
+
+
+def animations_json_value(animations: list[dict[str, object]]) -> str:
+    payload = [{"type": item["type"], "at": item["at"]} for item in animations]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def animations_from_row(row: DbRow | dict[str, object]) -> list[dict[str, object]]:
+    keys = row.keys() if hasattr(row, "keys") else row
+    raw_json = row["animations_json"] if "animations_json" in keys else None
+    if raw_json:
+        try:
+            parsed = json.loads(str(raw_json))
+            if isinstance(parsed, list) and parsed:
+                items: list[dict[str, object]] = []
+                for item in parsed:
+                    anim_type = str(item.get("type", "")).strip()
+                    anim_at = str(item.get("at", "")).strip()
+                    if anim_type or anim_at:
+                        items.append({"type": anim_type, "at": anim_at})
+                if items:
+                    return items
+        except json.JSONDecodeError:
+            pass
+    enabled = is_enabled(row, "animation_enabled")
+    anim_type = str(row["animation_type"] or "").strip() if "animation_type" in keys else ""
+    anim_at = row["animation_at"] if "animation_at" in keys else None
+    if enabled or anim_type or anim_at:
+        return [{"type": anim_type, "at": anim_at or ""}]
+    return []
+
+
+def animations_for_form(row_or_values: DbRow | dict[str, object]) -> list[dict[str, object]]:
+    items = animations_from_row(row_or_values)
+    formatted: list[dict[str, object]] = []
+    for item in items:
+        at_value = item.get("at", "")
+        if isinstance(at_value, str) and "T" in at_value:
+            at_label = format_time(at_value)
+        else:
+            at_label = format_time(at_value) if at_value else str(at_value or "")
+        formatted.append({"type": item.get("type", ""), "at": at_label})
+    return formatted
 
 
 def birthday_children_from_row(row: DbRow | dict[str, object]) -> list[dict[str, object]]:
@@ -751,7 +836,14 @@ def service_time_windows(values: dict[str, object]) -> list[tuple[str, time, tim
         end_dt = datetime.combine(date.today(), start) + timedelta(minutes=duration)
         windows.append((field, start, end_dt.time()))
 
-    if values.get("animation_enabled"):
+    if values.get("animations"):
+        for item in values.get("animations") or []:
+            add_window(
+                "animation_at",
+                parse_time_value(str(item.get("at") or "")),
+                SERVICE_DURATIONS["animation_at"],
+            )
+    elif values.get("animation_enabled"):
         add_window("animation_at", parse_time_value(field_time(values, "animation_at")), SERVICE_DURATIONS["animation_at"])
     if values.get("cake_enabled"):
         add_window("cake_at", parse_time_value(field_time(values, "cake_at")), SERVICE_DURATIONS["cake_at"])
@@ -1044,11 +1136,31 @@ def validate_reservation(
     mascot_enabled = checked_bool(data, "mascot_enabled")
     balloons_enabled = checked_bool(data, "balloons_enabled")
 
-    animation_type = data.get("animation_type", "").strip()
-    if animation_enabled and animation_type not in ANIMATION_TYPES:
-        errors["animation_type"] = "Wybierz animację z listy."
-    if not animation_enabled:
-        animation_type = ""
+    parsed_animations = parse_animations(data) if animation_enabled else []
+    animations: list[dict[str, object]] = []
+    for index, item in enumerate(parsed_animations):
+        anim_type = str(item.get("type") or "").strip()
+        anim_at_raw = str(item.get("at") or "").strip()
+        if anim_type not in ANIMATION_TYPES:
+            errors["animation_type"] = "Wybierz każdą animację z listy."
+        anim_time = parse_time_value(anim_at_raw)
+        if anim_time is None:
+            errors["animation_at"] = "Podaj godzinę startu każdej animacji (HH:MM)."
+        else:
+            if overlaps_stage_block(anim_time, SERVICE_DURATIONS["animation_at"]):
+                errors["animation_at"] = STAGE_BLOCK_MESSAGE
+            animations.append(
+                {
+                    "type": anim_type,
+                    "at": anim_time.strftime("%H:%M"),
+                    "at_iso": combine_day_time(reservation_day, anim_time),
+                }
+            )
+    if animation_enabled and not animations:
+        errors["animation_type"] = "Dodaj co najmniej jedną animację albo wyłącz dodatek."
+
+    animation_type = str(animations[0]["type"]) if animations else ""
+    animation_time = parse_time_value(str(animations[0]["at"])) if animations else None
 
     fruit_plates = 0
     if fruit_enabled:
@@ -1084,7 +1196,6 @@ def validate_reservation(
     if not balloons_enabled:
         balloons_description = ""
 
-    animation_time = parse_time_field(data, errors, "animation_at", "Start animacji", bool(animation_enabled))
     cake_time = parse_time_field(data, errors, "cake_at", "Start tortu", bool(cake_enabled))
     fruit_time = party_start_time
     drinks_time = None
@@ -1100,7 +1211,6 @@ def validate_reservation(
     mascot_time = parse_time_field(data, errors, "mascot_at", "Start maskotki", bool(mascot_enabled))
 
     for field, value, duration in (
-        ("animation_at", animation_time, SERVICE_DURATIONS["animation_at"]),
         ("cake_at", cake_time, SERVICE_DURATIONS["cake_at"]),
         ("culinary_workshops_at", workshops_time, SERVICE_DURATIONS["culinary_workshops_at"]),
         ("pinata_at", pinata_time, SERVICE_DURATIONS["pinata_at"]),
@@ -1125,8 +1235,9 @@ def validate_reservation(
 
     overlap_fields = find_internal_time_overlaps(
         {
-            "animation_enabled": animation_enabled,
-            "animation_at": animation_time.strftime("%H:%M") if animation_time else "",
+            "animations": [{"type": item["type"], "at": item["at"]} for item in animations],
+            "animation_enabled": 1 if animations else 0,
+            "animation_at": animations[0]["at"] if animations else "",
             "cake_enabled": cake_enabled,
             "cake_at": cake_time.strftime("%H:%M") if cake_time else "",
             "culinary_workshops_enabled": culinary_workshops_enabled,
@@ -1150,6 +1261,13 @@ def validate_reservation(
     if status == "active":
         cancellation_reason = ""
 
+    form_animations = [{"type": item["type"], "at": item["at"]} for item in animations]
+    if animation_enabled and not form_animations and parsed_animations:
+        form_animations = [
+            {"type": str(item.get("type") or ""), "at": str(item.get("at") or "")}
+            for item in parsed_animations
+        ]
+
     cleaned: dict[str, object] = {
         "id": reservation_id,
         "reservation_date": data.get("reservation_date", "").strip(),
@@ -1165,9 +1283,15 @@ def validate_reservation(
         "birthday_children": birthday_children,
         "child_location": child_location,
         "adult_location": adult_location,
-        "animation_enabled": animation_enabled,
+        "animation_enabled": 1 if animation_enabled else 0,
         "animation_type": animation_type or None,
-        "animation_at": combine_day_time(reservation_day, animation_time) if animation_enabled else None,
+        "animation_at": animations[0]["at_iso"] if animations else None,
+        "animations": form_animations,
+        "animations_json": animations_json_value(
+            [{"type": item["type"], "at": item["at_iso"]} for item in animations]
+        )
+        if animations
+        else "[]",
         "cake_enabled": cake_enabled,
         "cake_theme": cake_theme or None,
         "cake_at": combine_day_time(reservation_day, cake_time) if cake_enabled else None,
@@ -1252,6 +1376,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["animation_enabled"],
         values["animation_type"],
         values["animation_at"],
+        values.get("animations_json") or "[]",
         values["cake_enabled"],
         values["cake_theme"],
         values["cake_at"],
@@ -1287,7 +1412,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
                 parent_name = ?, birthday_child_name = ?, birthday_child_age = ?,
                 birthday_children_json = ?,
                 child_location = ?, adult_location = ?, animation_enabled = ?, animation_type = ?,
-                animation_at = ?,
+                animation_at = ?, animations_json = ?,
                 cake_enabled = ?, cake_theme = ?, cake_at = ?,
                 fruit_enabled = ?, fruit_plates = ?, fruit_at = ?,
                 drinks_enabled = ?, drinks_at = ?, culinary_workshops_enabled = ?,
@@ -1313,7 +1438,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         INSERT INTO reservations (
             start_at, end_at, children_count, adults_count, parent_name,
             birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
-            animation_enabled, animation_type, animation_at, cake_enabled, cake_theme, cake_at,
+            animation_enabled, animation_type, animation_at, animations_json, cake_enabled, cake_theme, cake_at,
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
             culinary_workshops_enabled, culinary_workshops_type, culinary_workshops_at,
             pinata_enabled, pinata_theme, pinata_at,
@@ -1323,7 +1448,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             notes, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -1535,211 +1660,251 @@ def date_title(target_day: date) -> str:
     )
 
 
-def app_icon_png(size: int = 512) -> bytes:
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + kind
-            + data
-            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-        )
+_APP_ICON_CACHE: dict[int, bytes] = {}
+_APP_ICON_LOCK = threading.Lock()
+_BOOT_READY = threading.Event()
+_BOOT_ERROR: str | None = None
 
-    def encode_png_rgba(width: int, height: int, pixels: list[tuple[int, int, int, int]]) -> bytes:
-        rows = bytearray()
-        for y in range(height):
-            rows.append(0)
-            start = y * width
-            for r, g, b, a in pixels[start:start + width]:
-                rows.extend((r, g, b, a))
-        raw = bytes(rows)
-        return (
-            b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw, level=9))
-            + chunk(b"IEND", b"")
-        )
 
-    def decode_logo_png() -> tuple[int, int, list[tuple[int, int, int, int]]] | None:
-        if not LOGO_PATH.exists():
-            return None
-        data = LOGO_PATH.read_bytes()
-        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-            return None
+def boot_wait_page(message: str = "Uruchamianie iKids Park…") -> bytes:
+    safe = escape(message)
+    return f"""<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="2">
+  <title>iKids Park</title>
+  <style>
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family: system-ui, sans-serif;
+      background: linear-gradient(160deg, #e8f6fc, #ffffff 55%); color:#0f3a4d; }}
+    p {{ font-size:1.05rem; letter-spacing:.02em; }}
+  </style>
+</head>
+<body><p>{safe}</p></body>
+</html>""".encode("utf-8")
 
-        pos = 8
-        width = height = bit_depth = color_type = interlace = None
-        compressed = bytearray()
-        while pos + 8 <= len(data):
-            length = struct.unpack(">I", data[pos:pos + 4])[0]
-            kind = data[pos + 4:pos + 8]
-            body = data[pos + 8:pos + 8 + length]
-            pos += 12 + length
-            if kind == b"IHDR":
-                width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", body)
-            elif kind == b"IDAT":
-                compressed.extend(body)
-            elif kind == b"IEND":
-                break
 
-        if bit_depth != 8 or color_type != 6 or interlace != 0 or not width or not height:
-            return None
+def pwa_icon_version() -> str:
+    """Stable until the logo file changes — avoids endless WebAPK reinstalls from cache bumps."""
+    for path in (PWA_LOGO_PATH, LOGO_PATH):
+        if path.exists():
+            return f"{int(path.stat().st_mtime)}-{path.stat().st_size}"
+    return PWA_CACHE_NAME
 
-        stride = width * 4
-        raw = zlib.decompress(bytes(compressed))
-        rows: list[bytearray] = []
-        offset = 0
 
-        def paeth(a: int, b: int, c: int) -> int:
-            p = a + b - c
-            pa = abs(p - a)
-            pb = abs(p - b)
-            pc = abs(p - c)
-            if pa <= pb and pa <= pc:
-                return a
-            if pb <= pc:
-                return b
-            return c
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
-        for y in range(height):
-            filter_type = raw[offset]
-            offset += 1
-            row = bytearray(raw[offset:offset + stride])
-            offset += stride
-            prev = rows[y - 1] if y else bytearray(stride)
-            for x in range(stride):
-                left = row[x - 4] if x >= 4 else 0
-                up = prev[x]
-                up_left = prev[x - 4] if x >= 4 else 0
-                if filter_type == 1:
-                    row[x] = (row[x] + left) & 0xFF
-                elif filter_type == 2:
-                    row[x] = (row[x] + up) & 0xFF
-                elif filter_type == 3:
-                    row[x] = (row[x] + ((left + up) // 2)) & 0xFF
-                elif filter_type == 4:
-                    row[x] = (row[x] + paeth(left, up, up_left)) & 0xFF
-            rows.append(row)
 
-        pixels = [
-            (row[x], row[x + 1], row[x + 2], row[x + 3])
-            for row in rows
-            for x in range(0, stride, 4)
-        ]
-        return width, height, pixels
-
-    decoded = decode_logo_png()
-    if decoded is None:
-        return encode_png_rgba(size, size, [(255, 255, 255, 255)] * (size * size))
-
-    src_w, src_h, src = decoded
-    visible = [
-        (i % src_w, i // src_w)
-        for i, (_, _, _, alpha) in enumerate(src)
-        if alpha > 8
-    ]
-    if not visible:
-        return encode_png_rgba(size, size, [(255, 255, 255, 255)] * (size * size))
-
-    min_x = min(x for x, _ in visible)
-    max_x = max(x for x, _ in visible)
-    min_y = min(y for _, y in visible)
-    max_y = max(y for _, y in visible)
-    crop_w = max_x - min_x + 1
-    crop_h = max_y - min_y + 1
-    max_logo_size = max(1, int(size * 0.68))
-    scale = min(max_logo_size / crop_w, max_logo_size / crop_h)
-    logo_w = max(1, int(crop_w * scale))
-    logo_h = max(1, int(crop_h * scale))
-    left = (size - logo_w) // 2
-    top = (size - logo_h) // 2
-    output = [(255, 255, 255, 255)] * (size * size)
-
-    for y in range(logo_h):
-        sy = min_y + min(crop_h - 1, int((y + 0.5) / scale))
-        for x in range(logo_w):
-            sx = min_x + min(crop_w - 1, int((x + 0.5) / scale))
-            r, g, b, a = src[sy * src_w + sx]
-            alpha = a / 255
-            idx = (top + y) * size + left + x
-            output[idx] = (
-                round(r * alpha + 255 * (1 - alpha)),
-                round(g * alpha + 255 * (1 - alpha)),
-                round(b * alpha + 255 * (1 - alpha)),
-                255,
-            )
-
+def _encode_png_rgba(width: int, height: int, pixels: list[tuple[int, int, int, int]]) -> bytes:
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        start = y * width
+        for r, g, b, a in pixels[start : start + width]:
+            rows.extend((r, g, b, a))
     return (
-        encode_png_rgba(size, size, output)
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(bytes(rows), level=6))
+        + _png_chunk(b"IEND", b"")
     )
 
 
+def _decode_png_rgba(data: bytes) -> tuple[int, int, list[tuple[int, int, int, int]]] | None:
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    pos = 8
+    width = height = bit_depth = color_type = interlace = None
+    compressed = bytearray()
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        kind = data[pos + 4 : pos + 8]
+        body = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            compressed.extend(body)
+        elif kind == b"IEND":
+            break
+    if bit_depth != 8 or interlace != 0 or width is None or height is None or color_type not in {2, 6}:
+        return None
+    channels = 4 if color_type == 6 else 3
+    stride = width * channels
+    raw = zlib.decompress(bytes(compressed))
+    rows: list[bytearray] = []
+    offset = 0
+
+    def paeth(a: int, b: int, c: int) -> int:
+        p = a + b - c
+        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+        if pa <= pb and pa <= pc:
+            return a
+        if pb <= pc:
+            return b
+        return c
+
+    for y in range(height):
+        filter_type = raw[offset]
+        offset += 1
+        row = bytearray(raw[offset : offset + stride])
+        offset += stride
+        prev = rows[y - 1] if y else bytearray(stride)
+        for x in range(stride):
+            left = row[x - channels] if x >= channels else 0
+            up = prev[x]
+            up_left = prev[x - channels] if x >= channels else 0
+            if filter_type == 1:
+                row[x] = (row[x] + left) & 0xFF
+            elif filter_type == 2:
+                row[x] = (row[x] + up) & 0xFF
+            elif filter_type == 3:
+                row[x] = (row[x] + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                row[x] = (row[x] + paeth(left, up, up_left)) & 0xFF
+        rows.append(row)
+
+    pixels: list[tuple[int, int, int, int]] = []
+    for row in rows:
+        for x in range(0, stride, channels):
+            if channels == 4:
+                pixels.append((row[x], row[x + 1], row[x + 2], row[x + 3]))
+            else:
+                pixels.append((row[x], row[x + 1], row[x + 2], 255))
+    return width, height, pixels
+
+
+def _resize_rgba(
+    src_w: int,
+    src_h: int,
+    src: list[tuple[int, int, int, int]],
+    size: int,
+) -> list[tuple[int, int, int, int]]:
+    if src_w == size and src_h == size:
+        return src
+    out: list[tuple[int, int, int, int]] = []
+    for y in range(size):
+        sy = min(src_h - 1, (y * src_h) // size)
+        for x in range(size):
+            sx = min(src_w - 1, (x * src_w) // size)
+            out.append(src[sy * src_w + sx])
+    return out
+
+
+def app_icon_png(size: int = 512) -> bytes:
+    """Serve a correctly sized PWA icon from pwalogo.png (or logo.png fallback)."""
+    target = 512 if size >= 512 else 192
+    with _APP_ICON_LOCK:
+        cached = _APP_ICON_CACHE.get(target)
+        if cached is not None:
+            return cached
+        source_bytes: bytes | None = None
+        if PWA_LOGO_PATH.exists():
+            source_bytes = PWA_LOGO_PATH.read_bytes()
+        elif LOGO_PATH.exists():
+            source_bytes = LOGO_PATH.read_bytes()
+        if source_bytes is None:
+            payload = _encode_png_rgba(target, target, [(255, 255, 255, 255)] * (target * target))
+            _APP_ICON_CACHE[target] = payload
+            return payload
+        decoded = _decode_png_rgba(source_bytes)
+        if decoded is None:
+            # Already a valid PNG we cannot re-encode; serve as-is for 512 only.
+            payload = source_bytes if target == 512 else source_bytes
+            _APP_ICON_CACHE[target] = payload
+            return payload
+        src_w, src_h, src = decoded
+        pixels = _resize_rgba(src_w, src_h, src, target)
+        payload = _encode_png_rgba(target, target, pixels)
+        _APP_ICON_CACHE[target] = payload
+        return payload
+
+
 def manifest_response() -> bytes:
+    icon_v = pwa_icon_version()
+    icons: list[dict[str, str]] = []
+    for size in PWA_ICON_SIZES:
+        src = f"/app-icon-{size}.png?v={icon_v}"
+        for purpose in ("any", "maskable"):
+            icons.append(
+                {
+                    "src": src,
+                    "sizes": f"{size}x{size}",
+                    "type": "image/png",
+                    "purpose": purpose,
+                }
+            )
     manifest = {
         "name": APP_TITLE,
         "short_name": APP_SHORT_TITLE,
         "description": "Panel rezerwacji urodzin i atrakcji iKids Park.",
+        "id": PWA_MANIFEST_ID,
         "start_url": "/",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait-primary",
-        "background_color": "#b4b4b4",
+        "background_color": "#ffffff",
         "theme_color": "#ffffff",
-        "icons": [
-            {
-                "src": f"/app-icon-{size}.png?v={PWA_CACHE_NAME}",
-                "sizes": f"{size}x{size}",
-                "type": "image/png",
-                "purpose": "any maskable",
-            }
-            for size in PWA_ICON_SIZES
-        ],
+        "icons": icons,
         "categories": ["business", "productivity"],
         "lang": "pl",
         "dir": "ltr",
+        "prefer_related_applications": False,
     }
     return json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def service_worker_response() -> bytes:
-    icon_assets = ",\n  ".join(json.dumps(f"/app-icon-{size}.png?v={PWA_CACHE_NAME}") for size in PWA_ICON_SIZES)
+    icon_v = pwa_icon_version()
+    icon_assets = ",\n  ".join(json.dumps(f"/app-icon-{size}.png?v={icon_v}") for size in PWA_ICON_SIZES)
     payload = """const IKIDS_CACHE = "__CACHE_NAME__";
 const STATIC_ASSETS = [
-  "/",
   "/offline",
   "/favicon.ico",
-  "/manifest.webmanifest",
-  "/static/manifest.json",
   __ICON_ASSETS__
 ];
 
+function fetchWithTimeout(url, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { signal: ctrl.signal, cache: "reload" }).finally(() => clearTimeout(timer));
+}
+
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(IKIDS_CACHE)
-      .then((cache) => cache.addAll(STATIC_ASSETS))
-      .catch(() => undefined)
-  );
-  self.skipWaiting();
+  // Never use cache.addAll — one hung request freezes Chrome on "Instaluje aplikację…".
+  event.waitUntil((async () => {
+    try {
+      const cache = await caches.open(IKIDS_CACHE);
+      await Promise.all(STATIC_ASSETS.map(async (url) => {
+        try {
+          const response = await fetchWithTimeout(url, 8000);
+          if (response && response.ok) await cache.put(url, response);
+        } catch (_) {}
+      }));
+    } catch (_) {}
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) => Promise.all(
-      keys.filter((key) => key !== IKIDS_CACHE).map((key) => caches.delete(key))
-    ))
-  );
-  self.clients.claim();
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter((key) => key !== IKIDS_CACHE).map((key) => caches.delete(key)));
+    await self.clients.claim();
+  })());
 });
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
 
-  const requestUrl = new URL(event.request.url);
   if (event.request.mode === "navigate") {
     event.respondWith(
       fetch(event.request)
         .then((response) => {
           const copy = response.clone();
-          caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy));
+          caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy)).catch(() => undefined);
           return response;
         })
         .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/offline")))
@@ -1751,9 +1916,9 @@ self.addEventListener("fetch", (event) => {
     caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
       if (!response || response.status !== 200 || response.type !== "basic") return response;
       const copy = response.clone();
-      caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy));
+      caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy)).catch(() => undefined);
       return response;
-    }))
+    }).catch(() => cached))
   );
 });
 """
@@ -1774,8 +1939,8 @@ def offline_response() -> bytes:
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}" type="image/png">
-  <link rel="apple-touch-icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}">
+  <link rel="icon" href="/app-icon-192.png?v={pwa_icon_version()}" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192.png?v={pwa_icon_version()}">
   <title>{APP_SHORT_TITLE} offline</title>
   <style>
     body {{
@@ -1820,10 +1985,17 @@ def pwa_install_script() -> str:
   <script>
     (() => {
       const installButton = document.querySelector("[data-install-app]");
-      if (!installButton) return;
+      const popup = document.querySelector("[data-install-popup]");
+      const step = document.querySelector("[data-install-step]");
+      const closeBtn = document.querySelector("[data-install-popup-close]");
+      if (!installButton || !popup || !step) return;
 
       let deferredPrompt = null;
       const standaloneQuery = window.matchMedia("(display-mode: standalone)");
+      const ua = window.navigator.userAgent || "";
+      const isAppleMobile = /iphone|ipad|ipod/i.test(ua)
+        || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      const isAndroid = /android/i.test(ua);
 
       function isStandalone() {
         return standaloneQuery.matches || window.navigator.standalone === true;
@@ -1833,41 +2005,56 @@ def pwa_install_script() -> str:
         installButton.hidden = isStandalone();
       }
 
+      function openPopup(text) {
+        step.textContent = text;
+        popup.hidden = false;
+        document.documentElement.classList.add("install-popup-open");
+      }
+
+      function closePopup() {
+        popup.hidden = true;
+        document.documentElement.classList.remove("install-popup-open");
+      }
+
+      function helpText() {
+        if (isAppleMobile) return "Udostępnij → Dodaj do ekranu początkowego";
+        if (isAndroid) return "Menu ⋮ → Zainstaluj aplikację";
+        return "W pasku adresu: Zainstaluj aplikację";
+      }
+
       window.addEventListener("beforeinstallprompt", (event) => {
         event.preventDefault();
         deferredPrompt = event;
         updateButton();
       });
 
+      window.addEventListener("appinstalled", () => {
+        deferredPrompt = null;
+        closePopup();
+        updateButton();
+      });
+
       installButton.addEventListener("click", async () => {
         if (isStandalone()) return;
-
         if (deferredPrompt) {
-          deferredPrompt.prompt();
-          await deferredPrompt.userChoice.catch(() => undefined);
+          try {
+            deferredPrompt.prompt();
+            await deferredPrompt.userChoice;
+          } catch (_) {}
           deferredPrompt = null;
           updateButton();
           return;
         }
+        openPopup(helpText());
+      });
 
-        const isAppleMobile = /iphone|ipad|ipod/i.test(window.navigator.userAgent);
-        if (isAppleMobile) {
-          window.alert("Aby zainstalować aplikację: Udostępnij -> Dodaj do ekranu początkowego.");
-          return;
-        }
-
-        if (!window.isSecureContext) {
-          window.alert("Automatyczna instalacja jest blokowana na lokalnym adresie HTTP. W Chrome użyj menu z trzema kropkami i wybierz: Dodaj do ekranu głównego.");
-          return;
-        }
-
-        window.alert("Jeśli instalacja nie pojawi się automatycznie, użyj opcji przeglądarki: Zainstaluj aplikację lub Dodaj do ekranu głównego.");
+      closeBtn?.addEventListener("click", closePopup);
+      popup.addEventListener("click", (event) => {
+        if (event.target === popup) closePopup();
       });
 
       if ("serviceWorker" in navigator && window.isSecureContext) {
-        window.addEventListener("load", () => {
-          navigator.serviceWorker.register("/sw.js").catch(() => undefined);
-        });
+        navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => undefined);
       }
 
       standaloneQuery.addEventListener?.("change", updateButton);
@@ -2220,20 +2407,25 @@ def fast_navigation_script() -> str:
 
       function prefetch(href) {
         const url = toUrl(href);
-        if (!isRouteUrl(url) || pageCache.has(url.href) || url.href === window.location.href) return;
-        fetchPage(url).catch(() => {});
+        if (!isRouteUrl(url) || pageCache.has(url.href) || url.href === window.location.href) return Promise.resolve();
+        return fetchPage(url).catch(() => undefined);
       }
 
       function schedulePrefetch() {
         window.clearTimeout(prefetchTimer);
         prefetchTimer = window.setTimeout(() => {
-          const links = Array.from(document.querySelectorAll(".tabs a[href], .date-day[href], .organizer-tools a[href], .timeline-card a[href]"))
+          // Never prefetch date-day links — 14 full HTML pages were freezing the single Fly VM.
+          const links = Array.from(document.querySelectorAll(".tabs a[href]"))
             .filter((link) => isRouteUrl(toUrl(link.href)))
-            .slice(0, 14);
-          const run = () => links.forEach((link) => prefetch(link.href));
-          if ("requestIdleCallback" in window) window.requestIdleCallback(run, { timeout: 1200 });
-          else window.setTimeout(run, 250);
-        }, 180);
+            .slice(0, 4);
+          const run = async () => {
+            for (const link of links) {
+              await prefetch(link.href);
+            }
+          };
+          if ("requestIdleCallback" in window) window.requestIdleCallback(() => { run(); }, { timeout: 2000 });
+          else window.setTimeout(run, 400);
+        }, 400);
       }
 
       window.IKIDSNavigate = (href, options) => {
@@ -2300,8 +2492,8 @@ def page_template(
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="{APP_SHORT_TITLE}">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}" type="image/png">
-  <link rel="apple-touch-icon" href="/app-icon-192.png?v={PWA_CACHE_NAME}">
+  <link rel="icon" href="/app-icon-192.png?v={pwa_icon_version()}" type="image/png">
+  <link rel="apple-touch-icon" href="/app-icon-192.png?v={pwa_icon_version()}">
   <title>{APP_TITLE}</title>
   <style>
     :root {{
@@ -2463,6 +2655,81 @@ def page_template(
 
     .install-button[hidden] {{
       display: none;
+    }}
+
+    .install-popup {{
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background:
+        radial-gradient(circle at 20% 15%, color-mix(in srgb, var(--brand) 28%, transparent), transparent 42%),
+        radial-gradient(circle at 85% 80%, color-mix(in srgb, var(--orange) 22%, transparent), transparent 40%),
+        rgba(255, 255, 255, 0.55);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }}
+
+    .install-popup[hidden] {{
+      display: none !important;
+    }}
+
+    .install-popup__card {{
+      width: min(100%, 320px);
+      padding: 22px 20px 16px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--surface);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.12);
+      text-align: center;
+    }}
+
+    .install-popup__icon {{
+      width: 56px;
+      height: 56px;
+      margin: 0 auto 12px;
+      border-radius: 14px;
+      display: block;
+      object-fit: cover;
+      border: 1px solid var(--line);
+    }}
+
+    .install-popup__title {{
+      margin: 0 0 8px;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--ink);
+    }}
+
+    .install-popup__step {{
+      margin: 0 0 16px;
+      font-size: 0.98rem;
+      line-height: 1.35;
+      color: var(--muted);
+      font-weight: 550;
+    }}
+
+    .install-popup__close {{
+      width: 100%;
+      border: 0;
+      border-radius: 10px;
+      padding: 11px 14px;
+      background: var(--brand);
+      color: #fff;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+
+    .install-popup__close:hover {{
+      background: var(--brand-dark);
+    }}
+
+    html.install-popup-open {{
+      overflow: hidden;
     }}
 
     .date-month-label {{
@@ -3294,6 +3561,7 @@ def page_template(
 
     .service-catalog {{
       grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
     }}
 
     .service-catalog-item {{
@@ -3301,6 +3569,7 @@ def page_template(
       background: var(--field-strong);
       display: grid;
       gap: 0;
+      align-self: start;
     }}
 
     .service-catalog-head, .service-catalog-body {{
@@ -3315,8 +3584,72 @@ def page_template(
       border-bottom: 1px solid var(--line);
     }}
 
+    .service-catalog-item:not(.is-open) .service-catalog-head {{
+      border-bottom: 0;
+    }}
+
     .service-catalog-body.is-hidden {{
       display: none;
+    }}
+
+    .service-toggle-btn {{
+      box-sizing: border-box;
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      border: 1px solid rgba(101, 163, 13, 0.55);
+      border-radius: 8px;
+      background: var(--ok);
+      color: #ffffff;
+      font-size: 1.45rem;
+      font-weight: 800;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-grid;
+      place-items: center;
+      -webkit-tap-highlight-color: transparent;
+    }}
+
+    .service-toggle-btn:hover,
+    .service-toggle-btn:focus-visible {{
+      outline: 3px solid var(--focus);
+      filter: brightness(1.05);
+    }}
+
+    .service-toggle-btn.is-active {{
+      background: var(--danger);
+      border-color: rgba(220, 38, 38, 0.65);
+    }}
+
+    .service-toggle-btn .service-toggle-minus {{
+      display: none;
+    }}
+
+    .service-toggle-btn.is-active .service-toggle-plus {{
+      display: none;
+    }}
+
+    .service-toggle-btn.is-active .service-toggle-minus {{
+      display: block;
+    }}
+
+    .animation-list {{
+      display: grid;
+      gap: 12px;
+    }}
+
+    .animation-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.9fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+    }}
+
+    .animation-row .service-extra {{
+      margin: 0;
     }}
 
     .service-enabled-input {{
@@ -4085,6 +4418,7 @@ def page_template(
 
     .category-fields.services {{
       grid-template-columns: repeat(3, minmax(0, 1fr));
+      align-items: start;
     }}
 
     .full {{
@@ -5079,6 +5413,10 @@ def page_template(
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
 
+      .animation-row {{
+        grid-template-columns: 1fr;
+      }}
+
       .metrics {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
@@ -5527,7 +5865,7 @@ def page_template(
       <div class="brand">
         <img class="logo" src="{logo_src}" alt="iKids Park">
       </div>
-      <button class="install-button" type="button" data-install-app aria-label="Pobierz aplikację">
+      <button class="install-button" type="button" data-install-app aria-label="Zainstaluj aplikację">
         <svg class="install-button__icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M11 3a1 1 0 0 1 2 0v8.586l2.293-2.293a1 1 0 0 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L11 11.586V3z"/>
           <path d="M5 18a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z"/>
@@ -5536,6 +5874,14 @@ def page_template(
       </button>
     </div>
   </header>
+  <div class="install-popup" data-install-popup hidden>
+    <div class="install-popup__card" role="dialog" aria-modal="true" aria-labelledby="install-popup-title">
+      <img class="install-popup__icon" src="/app-icon-192.png?v={pwa_icon_version()}" alt="">
+      <p class="install-popup__title" id="install-popup-title">Dodaj do telefonu</p>
+      <p class="install-popup__step" data-install-step></p>
+      <button type="button" class="install-popup__close" data-install-popup-close>OK</button>
+    </div>
+  </div>
   <main>
     {alert}
     {content}
@@ -5845,7 +6191,7 @@ def render_nav(page_role: str, day: str) -> str:
 
     strip_anchor_day = date.today()
     active_week_offset = week_page_offset_for_day(strip_anchor_day, target_day)
-    week_pages = calendar_week_pages(strip_anchor_day, strip_anchor_day.year)
+    week_pages = calendar_week_pages(strip_anchor_day, include_day=target_day)
     week_blocks = []
     for week_offset, week_days in week_pages:
         week_attrs = [
@@ -5914,6 +6260,8 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "animation_enabled": 0,
         "animation_type": "",
         "animation_at": "",
+        "animations": [],
+        "animations_json": "[]",
         "cake_enabled": 0,
         "cake_theme": "",
         "cake_at": "",
@@ -5946,6 +6294,7 @@ def row_to_form_values(row: DbRow) -> dict[str, object]:
     values["reservation_date"] = format_date(row["start_at"])
     values["party_start_time"] = format_time(row["start_at"])
     values["birthday_children"] = birthday_children_from_row(row)
+    values["animations"] = animations_for_form(row)
     for field in (
         "animation_at",
         "cake_at",
@@ -6543,9 +6892,9 @@ def render_reservation_details(
         status_markup = f'<div class="timeline-status">{render_status_badge(status, cancellation_reason)}</div>'
 
     animator_items: list[tuple[str, str]] = []
-    if is_enabled(row, "animation_enabled"):
-        label = escape(row["animation_type"] or "Animacja")
-        window = escape(format_service_window(row["animation_at"], SERVICE_DURATIONS["animation_at"]))
+    for item in animations_from_row(row):
+        label = escape(str(item.get("type") or "Animacja"))
+        window = escape(format_service_window(item.get("at"), SERVICE_DURATIONS["animation_at"]))
         animator_items.append((label, window))
     if is_enabled(row, "pinata_enabled"):
         label = escape(f"Piniata: {row['pinata_theme'] or '(brak)'}")
@@ -6611,15 +6960,46 @@ def render_reservation_details(
 
 
 def render_animation_type_select(values: dict[str, object], errors: dict[str, str]) -> str:
+    animations = values.get("animations")
+    if not isinstance(animations, list) or not animations:
+        if int(values.get("animation_enabled") or 0) == 1 or values.get("animation_type"):
+            animations = [{"type": values.get("animation_type", ""), "at": values.get("animation_at", "")}]
+        else:
+            animations = [{"type": "", "at": ""}]
+    rows = []
+    for item in animations:
+        rows.append(
+            f"""
+        <div class="animation-row">
+          <label class="service-extra">
+            Rodzaj animacji
+            <select name="animation_type">
+              <option value="">Wybierz animację</option>
+              {render_grouped_options(ANIMATION_GROUPS, item.get("type", ""))}
+            </select>
+          </label>
+          <label class="service-extra">
+            Start
+            <div class="service-time">
+              <input type="text" inputmode="numeric" autocomplete="off" placeholder="00:00" maxlength="5" name="animation_at" value="{escape(item.get("at", ""))}" data-time-input="1" data-duration-minutes="{SERVICE_DURATIONS["animation_at"]}" aria-label="Start animacji">
+              <span class="service-end"></span>
+            </div>
+          </label>
+          <button type="button" class="service-toggle-btn is-active remove-animation-row" aria-label="Usuń animację">
+            <span class="service-toggle-plus" aria-hidden="true">+</span>
+            <span class="service-toggle-minus" aria-hidden="true">−</span>
+          </button>
+        </div>
+"""
+        )
     return f"""
-        <label class="service-extra">
-          Rodzaj animacji
-          <select name="animation_type">
-            <option value="">Wybierz animację</option>
-            {render_grouped_options(ANIMATION_GROUPS, values.get("animation_type"))}
-          </select>
-          {error_for(errors, "animation_type")}
-        </label>
+        <div class="animation-list" id="animation-list" data-animation-duration="{SERVICE_DURATIONS["animation_at"]}">
+          {''.join(rows)}
+        </div>
+        <button type="button" class="button secondary" id="add-animation-row">+ Kolejna animacja</button>
+        <div class="overlap-hint is-hidden">Godziny się pokrywają</div>
+        {error_for(errors, "animation_type")}
+        {error_for(errors, "animation_at")}
 """
 
 
@@ -6735,17 +7115,21 @@ def render_service_option(
         else ""
     )
     body_class = "" if enabled else "is-hidden"
+    toggle_class = "service-toggle-btn is-active" if enabled else "service-toggle-btn"
+    toggle_label = "Usuń dodatek" if enabled else "Dodaj dodatek"
     return f"""
-      <div class="service-catalog-item" data-service="{escape(enabled_field)}">
+      <div class="service-catalog-item{' is-open' if enabled else ''}" data-service="{escape(enabled_field)}">
         <div class="service-catalog-head">
           <span>{escape(label)}{duration_label}</span>
-          <button type="button" class="button secondary service-add-btn" data-target="{escape(enabled_field)}">Dodaj</button>
+          <button type="button" class="{toggle_class}" data-target="{escape(enabled_field)}" aria-label="{toggle_label}" aria-pressed="{'true' if enabled else 'false'}">
+            <span class="service-toggle-plus" aria-hidden="true">+</span>
+            <span class="service-toggle-minus" aria-hidden="true">−</span>
+          </button>
         </div>
         <div class="service-catalog-body {body_class}">
           <input type="checkbox" class="service-enabled-input" name="{escape(enabled_field)}" value="1"{checked(values.get(enabled_field))}>
           {time_markup}
           {extra_markup}
-          <button type="button" class="button secondary service-remove-btn">Usuń dodatek</button>
         </div>
       </div>
 """
@@ -6991,10 +7375,10 @@ def render_form(
 
       <div class="form-category wide">
         <h3 class="category-title">Atrakcje i dodatki</h3>
-        <p class="subtitle location-hint">Przy każdej opcji kliknij „Dodaj”, wybierz godzinę i rodzaj.</p>
+        <p class="subtitle location-hint">Przy każdej opcji kliknij zielony plus, wybierz godzinę i rodzaj. Czerwony minus usuwa dodatek.</p>
         <div id="service-overlap-notice" class="overlap-notice is-hidden">Godziny się pokrywają</div>
         <div class="category-fields services service-catalog">
-          {render_service_option(values, errors, "animation_enabled", "animation_at", "Animacja", SERVICE_DURATIONS["animation_at"], render_animation_type_select(values, errors))}
+          {render_service_option(values, errors, "animation_enabled", "animation_at", "Animacja", SERVICE_DURATIONS["animation_at"], render_animation_type_select(values, errors), show_time=False)}
           {render_service_option(values, errors, "cake_enabled", "cake_at", "Tort", SERVICE_DURATIONS["cake_at"], render_cake_theme_input(values, errors))}
           {render_service_option(values, errors, "fruit_enabled", "fruit_at", "Owoce", None, render_fruit_plates_input(values, errors), show_time=False)}
           {render_service_option(values, errors, "culinary_workshops_enabled", "culinary_workshops_at", "Warsztaty kulinarne", SERVICE_DURATIONS["culinary_workshops_at"], render_workshop_type_select(values, errors))}
@@ -7031,11 +7415,9 @@ def render_form(
 
 def service_pills(row: DbRow) -> str:
     items = []
-    if is_enabled(row, "animation_enabled"):
-        animation_label = "Animacja"
-        if row["animation_type"]:
-            animation_label = f"Animacja: {row['animation_type']}"
-        items.append((animation_label, row["animation_at"], SERVICE_DURATIONS["animation_at"]))
+    for item in animations_from_row(row):
+        animation_label = f"Animacja: {item.get('type')}" if item.get("type") else "Animacja"
+        items.append((animation_label, item.get("at"), SERVICE_DURATIONS["animation_at"]))
     if is_enabled(row, "cake_enabled"):
         cake_label = f"Tort: {row['cake_theme'] or '(brak)'}"
         items.append((cake_label, row["cake_at"], SERVICE_DURATIONS["cake_at"]))
@@ -7071,7 +7453,7 @@ def service_pills(row: DbRow) -> str:
 
 def render_metrics(rows: list[DbRow]) -> str:
     active = [row for row in rows if row["status"] == "active"]
-    animation_count = sum(1 for row in active if is_enabled(row, "animation_enabled"))
+    animation_count = sum(len(animations_from_row(row)) for row in active)
     workshops = sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled"))
     cakes = sum(1 for row in active if is_enabled(row, "cake_enabled"))
     pinatas = sum(1 for row in active if is_enabled(row, "pinata_enabled"))
@@ -7123,8 +7505,8 @@ def render_animator_view(rows: list[DbRow]) -> str:
             continue
 
         tasks = []
-        if is_enabled(row, "animation_enabled"):
-            tasks.append((row["animation_at"], row["animation_type"] or "Animacja"))
+        for item in animations_from_row(row):
+            tasks.append((item.get("at"), item.get("type") or "Animacja"))
         if is_enabled(row, "pinata_enabled"):
             tasks.append((row["pinata_at"], f"Piniata: {row['pinata_theme'] or '(brak)'}"))
         if is_enabled(row, "mascot_enabled"):
@@ -7341,7 +7723,7 @@ def render_schema_summary() -> str:
         "parent_name",
         "birthday_child_name / birthday_child_age",
         "child_location / adult_location",
-        "animation_enabled / animation_type / animation_at",
+        "animation_enabled / animation_type / animation_at / animations_json",
         "cake_enabled / cake_theme / cake_at",
         "fruit_enabled / fruit_plates / fruit_at",
         "culinary_workshops_enabled / culinary_workshops_type / culinary_workshops_at",
@@ -7454,11 +7836,16 @@ def room_plan_script() -> str:
   const tableNodes = Array.from(document.querySelectorAll(".table-node"));
   const nodes = [...roomNodes, ...tableNodes];
   const catalogItems = Array.from(document.querySelectorAll(".service-catalog-item"));
-  const timeInputs = Array.from(document.querySelectorAll("[data-time-input]"));
   const overlapNotice = document.getElementById("service-overlap-notice");
   const birthdayList = document.getElementById("birthday-children-list");
   const addBirthdayBtn = document.getElementById("add-birthday-child");
+  const animationList = document.getElementById("animation-list");
+  const addAnimationBtn = document.getElementById("add-animation-row");
   let timer = null;
+
+  function allTimeInputs() {
+    return Array.from(document.querySelectorAll("[data-time-input]"));
+  }
 
   function getAdultSelectValues() {
     return Array.from(adultSelect?.selectedOptions || []).map((option) => option.value);
@@ -7485,6 +7872,16 @@ def room_plan_script() -> str:
   function setChildLocation(location) {
     if (!childSelect || !location) return;
     childSelect.value = location;
+    paintSelectedLocations();
+  }
+
+  function toggleChildLocation(location) {
+    if (!childSelect || !location) return;
+    if (location === EMPTY_LOCATION || childSelect.value === location) {
+      childSelect.value = EMPTY_LOCATION;
+    } else {
+      childSelect.value = location;
+    }
     paintSelectedLocations();
   }
 
@@ -7595,7 +7992,7 @@ def room_plan_script() -> str:
           toggleAdultTable(location);
           return;
         }
-        setChildLocation(location);
+        toggleChildLocation(location);
       });
     });
   }
@@ -7716,6 +8113,7 @@ def room_plan_script() -> str:
   }
 
   function validateServiceOverlaps() {
+    const timeInputs = allTimeInputs();
     const windows = timeInputs
       .map((input) => serviceWindow(input))
       .filter((windowValue) => windowValue && windowValue.duration);
@@ -7746,30 +8144,44 @@ def room_plan_script() -> str:
     return !hasOverlap;
   }
 
+  function updateTimeEndLabel(input) {
+    const end = input?.closest(".service-time")?.querySelector(".service-end");
+    if (!input || !input.value || input.disabled) {
+      if (end) end.textContent = "";
+      return;
+    }
+    const duration = Number(input.dataset.durationMinutes || 0);
+    if (!duration) return;
+    const startMinutes = toMinutes(input.value);
+    if (startMinutes === null) {
+      if (end) end.textContent = "";
+      return;
+    }
+    if (end) end.textContent = `koniec ${formatTime(startMinutes + duration)}`;
+  }
+
   function updateCatalogItem(item) {
     const checkbox = item.querySelector(".service-enabled-input");
     const body = item.querySelector(".service-catalog-body");
-    const timeInput = item.querySelector("[data-time-input]");
+    const toggleBtn = item.querySelector(".service-catalog-head .service-toggle-btn");
+    const timeInputs = Array.from(item.querySelectorAll("[data-time-input]"));
     const extraInputs = Array.from(item.querySelectorAll(".service-extra select, .service-extra input"));
-    const end = item.querySelector(".service-end");
     const enabled = checkbox?.checked;
+    item.classList.toggle("is-open", !!enabled);
     if (body) body.classList.toggle("is-hidden", !enabled);
-    if (timeInput) timeInput.disabled = !enabled;
+    if (toggleBtn) {
+      toggleBtn.classList.toggle("is-active", !!enabled);
+      toggleBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
+      toggleBtn.setAttribute("aria-label", enabled ? "Usuń dodatek" : "Dodaj dodatek");
+    }
+    timeInputs.forEach((timeInput) => { timeInput.disabled = !enabled; });
     extraInputs.forEach((input) => { input.disabled = !enabled; });
     if (!enabled) {
-      if (end) end.textContent = "";
-      return;
-    }
-    if (!timeInput || !timeInput.value) {
-      if (end) end.textContent = "";
+      timeInputs.forEach((timeInput) => updateTimeEndLabel(timeInput));
       validateServiceOverlaps();
       return;
     }
-    const duration = Number(timeInput.dataset.durationMinutes || 0);
-    if (!duration) return;
-    const [hours, minutes] = timeInput.value.split(":").map(Number);
-    if (Number.isNaN(hours) || Number.isNaN(minutes)) return;
-    if (end) end.textContent = `koniec ${formatTime(hours * 60 + minutes + duration)}`;
+    timeInputs.forEach((timeInput) => updateTimeEndLabel(timeInput));
     validateServiceOverlaps();
   }
 
@@ -7820,6 +8232,49 @@ def room_plan_script() -> str:
     });
   }
 
+  function animationOptionsHtml() {
+    const existing = animationList?.querySelector("select[name='animation_type']");
+    if (existing) return existing.innerHTML;
+    return '<option value="">Wybierz animację</option>';
+  }
+
+  function bindAnimationRow(row) {
+    row.querySelector(".remove-animation-row")?.addEventListener("click", () => {
+      const rows = animationList?.querySelectorAll(".animation-row") || [];
+      if (rows.length <= 1) {
+        row.querySelectorAll("select").forEach((select) => { select.selectedIndex = 0; });
+        row.querySelectorAll("input").forEach((input) => { input.value = ""; });
+        updateTimeEndLabel(row.querySelector("[data-time-input]"));
+        validateServiceOverlaps();
+        return;
+      }
+      row.remove();
+      const item = animationList?.closest(".service-catalog-item");
+      if (item) updateCatalogItem(item);
+      else validateServiceOverlaps();
+    });
+    row.querySelectorAll("[data-time-input]").forEach((input) => {
+      input.addEventListener("input", () => {
+        const item = input.closest(".service-catalog-item");
+        if (item) updateCatalogItem(item);
+        else {
+          updateTimeEndLabel(input);
+          validateServiceOverlaps();
+        }
+      });
+      input.addEventListener("blur", () => {
+        normalizeTimeInput(input);
+        const item = input.closest(".service-catalog-item");
+        if (item) updateCatalogItem(item);
+      });
+    });
+  }
+
+  function bindAnimations() {
+    if (!animationList) return;
+    animationList.querySelectorAll(".animation-row").forEach((row) => bindAnimationRow(row));
+  }
+
   if (addBirthdayBtn && birthdayList) {
     addBirthdayBtn.addEventListener("click", () => {
       const row = document.createElement("div");
@@ -7835,32 +8290,73 @@ def room_plan_script() -> str:
     bindBirthdayChildren();
   }
 
+  if (addAnimationBtn && animationList) {
+    addAnimationBtn.addEventListener("click", () => {
+      const duration = animationList.dataset.animationDuration || "60";
+      const row = document.createElement("div");
+      row.className = "animation-row";
+      row.innerHTML = `
+        <label class="service-extra">
+          Rodzaj animacji
+          <select name="animation_type">${animationOptionsHtml()}</select>
+        </label>
+        <label class="service-extra">
+          Start
+          <div class="service-time">
+            <input type="text" inputmode="numeric" autocomplete="off" placeholder="00:00" maxlength="5" name="animation_at" value="" data-time-input="1" data-duration-minutes="${duration}" aria-label="Start animacji">
+            <span class="service-end"></span>
+          </div>
+        </label>
+        <button type="button" class="service-toggle-btn is-active remove-animation-row" aria-label="Usuń animację">
+          <span class="service-toggle-plus" aria-hidden="true">+</span>
+          <span class="service-toggle-minus" aria-hidden="true">−</span>
+        </button>
+      `;
+      const select = row.querySelector("select[name='animation_type']");
+      if (select) select.selectedIndex = 0;
+      animationList.appendChild(row);
+      bindAnimationRow(row);
+      const item = animationList.closest(".service-catalog-item");
+      if (item) updateCatalogItem(item);
+      row.querySelector("[data-time-input]")?.focus();
+    });
+    bindAnimations();
+  }
+
   catalogItems.forEach((item) => {
     const checkbox = item.querySelector(".service-enabled-input");
-    const addBtn = item.querySelector(".service-add-btn");
-    const removeBtn = item.querySelector(".service-remove-btn");
-    const timeInput = item.querySelector("[data-time-input]");
-    addBtn?.addEventListener("click", () => {
-      if (checkbox) checkbox.checked = true;
+    const toggleBtn = item.querySelector(".service-catalog-head .service-toggle-btn");
+    toggleBtn?.addEventListener("click", () => {
+      const enabling = !(checkbox?.checked);
+      if (checkbox) checkbox.checked = enabling;
+      if (!enabling) {
+        item.querySelectorAll("[data-time-input]").forEach((input) => { input.value = ""; });
+        item.querySelectorAll(".service-extra input, .service-extra select").forEach((input) => {
+          if (input.tagName === "SELECT") input.selectedIndex = 0;
+          else input.value = "";
+        });
+        item.querySelectorAll(".overlap-hint").forEach((hint) => hint.classList.add("is-hidden"));
+        if (item.dataset.service === "animation_enabled" && animationList) {
+          const rows = Array.from(animationList.querySelectorAll(".animation-row"));
+          rows.slice(1).forEach((row) => row.remove());
+        }
+      }
       updateCatalogItem(item);
-      timeInput?.focus();
-    });
-    removeBtn?.addEventListener("click", () => {
-      if (checkbox) checkbox.checked = false;
-      if (timeInput) timeInput.value = "";
-      item.querySelectorAll(".service-extra input, .service-extra select").forEach((input) => {
-        if (input.tagName === "SELECT") input.selectedIndex = 0;
-        else input.value = "";
-      });
-      item.querySelector(".overlap-hint")?.classList.add("is-hidden");
-      updateCatalogItem(item);
+      if (enabling) {
+        const focusTarget = item.querySelector("[data-time-input]");
+        focusTarget?.focus();
+      }
     });
     checkbox?.addEventListener("change", () => updateCatalogItem(item));
-    timeInput?.addEventListener("input", () => updateCatalogItem(item));
+    item.querySelectorAll("[data-time-input]").forEach((input) => {
+      if (input.closest(".animation-row")) return;
+      input.addEventListener("input", () => updateCatalogItem(item));
+    });
     updateCatalogItem(item);
   });
 
-  timeInputs.forEach((input) => {
+  allTimeInputs().forEach((input) => {
+    if (input.closest(".animation-row")) return;
     input.addEventListener("blur", () => {
       normalizeTimeInput(input);
       const item = input.closest(".service-catalog-item");
@@ -7872,7 +8368,7 @@ def room_plan_script() -> str:
     node.style.cursor = "pointer";
     node.addEventListener("click", () => {
       if (node.classList.contains("is-busy")) return;
-      setChildLocation(node.dataset.location);
+      toggleChildLocation(node.dataset.location);
     });
   });
 
@@ -7942,6 +8438,7 @@ CREATE TABLE reservations (
   animation_enabled BOOLEAN NOT NULL DEFAULT false,
   animation_type TEXT,
   animation_at TIMESTAMPTZ,
+  animations_json TEXT,
   cake_enabled BOOLEAN NOT NULL DEFAULT false,
   cake_theme TEXT,
   cake_at TIMESTAMPTZ,
@@ -8057,7 +8554,7 @@ def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length).decode("utf-8")
     parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values if key in {"adult_location", "birthday_child_name", "birthday_child_age"} else values[-1] for key, values in parsed.items()}
+    return {key: values if key in {"adult_location", "birthday_child_name", "birthday_child_age", "animation_type", "animation_at"} else values[-1] for key, values in parsed.items()}
 
 
 def csv_response() -> bytes:
@@ -8114,9 +8611,12 @@ def csv_response() -> bytes:
                 row["birthday_child_age"],
                 row["child_location"],
                 display_locations(row["adult_location"]),
-                "Tak" if is_enabled(row, "animation_enabled") else "Nie",
-                row["animation_type"] or "",
-                format_service_window(row["animation_at"], SERVICE_DURATIONS["animation_at"]),
+                "Tak" if animations_from_row(row) else "Nie",
+                "; ".join(str(item.get("type") or "") for item in animations_from_row(row)),
+                "; ".join(
+                    format_service_window(item.get("at"), SERVICE_DURATIONS["animation_at"])
+                    for item in animations_from_row(row)
+                ),
                 "Tak" if is_enabled(row, "cake_enabled") else "Nie",
                 row["cake_theme"] or "",
                 format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]),
@@ -8152,7 +8652,7 @@ def icon_size_for_path(path: str) -> int | None:
         f"/static/icon-{size}.png": size
         for size in PWA_ICON_SIZES
     })
-    filenames["/favicon.ico"] = 48
+    filenames["/favicon.ico"] = 192
     return filenames.get(path)
 
 
@@ -8185,6 +8685,16 @@ class ReservationHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in {"/sw.js", "/static/sw.js", "/manifest.webmanifest", "/static/manifest.json", "/offline"}:
+            pass
+        elif parsed.path.startswith("/app-icon-") or parsed.path in {"/favicon.ico", "/logo.png", "/menu-logo.png"}:
+            pass
+        elif not _BOOT_READY.is_set():
+            message = _BOOT_ERROR or "Uruchamianie iKids Park…"
+            status = HTTPStatus.SERVICE_UNAVAILABLE if _BOOT_ERROR else HTTPStatus.OK
+            self.send_bytes(boot_wait_page(message), status=status)
+            return
+
         query = parse_qs(parsed.query)
         role = normalize_page_role(query.get("role", ["manager"])[0])
         day = normalize_day(query.get("day", ["today"])[0])
@@ -8258,7 +8768,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.send_bytes(
                 app_icon_png(icon_size),
                 content_type="image/png",
-                extra_headers={"Cache-Control": "no-store"},
+                extra_headers={"Cache-Control": f"public, max-age=86400, immutable"},
             )
             return
 
@@ -8343,7 +8853,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
         if icon_size_for_path(parsed.path) is not None:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/png")
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", "public, max-age=86400, immutable")
             self.end_headers()
             return
 
@@ -8373,6 +8883,10 @@ class ReservationHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if not _BOOT_READY.is_set() or _BOOT_ERROR:
+            message = _BOOT_ERROR or "Uruchamianie iKids Park…"
+            self.send_bytes(boot_wait_page(message), status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         raw_role = query.get("role", ["manager"])[0]
@@ -8470,6 +8984,8 @@ class ThreadingHTTPSServer(ThreadingHTTPServer):
 
 
 def maybe_reload_dev_server() -> None:
+    if os.environ.get("FLY_APP_NAME") or os.environ.get("IKIDS_HTTP", "").strip() == "1":
+        return
     global SOURCE_MTIME
     current_mtime = SOURCE_PATH.stat().st_mtime
     if current_mtime == SOURCE_MTIME:
@@ -8784,7 +9300,6 @@ def https_context() -> ssl.SSLContext:
 
 
 def run() -> None:
-    init_db()
     selected_port = PORT
     # Fly/Docker: HTTP behind platform TLS. Local HTTPS only with IKIDS_HTTPS=1.
     behind_proxy = bool(os.environ.get("FLY_APP_NAME")) or os.environ.get("IKIDS_HTTP", "").strip() == "1"
@@ -8808,15 +9323,34 @@ def run() -> None:
         raise RuntimeError(f"Nie znaleziono wolnego portu (start {PORT}).")
 
     protocol = "https" if use_https else "http"
-    print(f"{APP_TITLE} działa pod adresem {protocol}://{HOST}:{selected_port}")
+    print(f"{APP_TITLE} nasłuchuje na {protocol}://{HOST}:{selected_port}", flush=True)
+
+    def boot() -> None:
+        global _BOOT_ERROR
+        try:
+            print("Inicjalizacja bazy...", flush=True)
+            init_db()
+            print("Baza gotowa.", flush=True)
+            _BOOT_ERROR = None
+            _BOOT_READY.set()
+            app_icon_png(192)
+            app_icon_png(512)
+            print("Ikona PWA gotowa.", flush=True)
+        except Exception as exc:
+            _BOOT_ERROR = f"Błąd startu: {exc}"
+            print(_BOOT_ERROR, flush=True)
+            _BOOT_READY.set()
+
+    # Bind first so Fly health/proxy does not sit on "connection refused" during slow DB init.
+    threading.Thread(target=boot, daemon=True, name="ikids-boot").start()
     if use_https:
-        print(f"Lokalne CA do zaufania na telefonie: {CA_CERT_PATH}")
-        print(f"Certyfikat serwera: {CERT_PATH}")
-        print(f"CA można pobrać z telefonu pod adresem {protocol}://<IP-komputera>:{selected_port}/ca.crt")
-    else:
-        print(f"Na telefonie otworz: http://<IP-komputera>:{selected_port}")
-        print(f"Hotspot Windows zwykle uzywa: http://192.168.137.1:{selected_port}")
-    print("Zatrzymaj serwer skrótem Ctrl+C.")
+        print(f"Lokalne CA do zaufania na telefonie: {CA_CERT_PATH}", flush=True)
+        print(f"Certyfikat serwera: {CERT_PATH}", flush=True)
+        print(f"CA można pobrać z telefonu pod adresem {protocol}://<IP-komputera>:{selected_port}/ca.crt", flush=True)
+    elif not behind_proxy:
+        print(f"Na telefonie otworz: http://<IP-komputera>:{selected_port}", flush=True)
+        print(f"Hotspot Windows zwykle uzywa: http://192.168.137.1:{selected_port}", flush=True)
+    print("Zatrzymaj serwer skrótem Ctrl+C.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
