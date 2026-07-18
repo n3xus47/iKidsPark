@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -33,10 +34,13 @@ APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
 # Bump only when service-worker logic changes. Icon URLs use logo mtime separately.
 PWA_CACHE_NAME = "ikidspark-pwa-v16"
-PWA_ICON_SIZES = (192, 512)
+PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
 PWA_MANIFEST_ID = "/"
 DbRow = dict[str, Any]
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_MODE = os.environ.get("IKIDS_DB_MODE", "").strip().lower()
+USE_LOCAL_SQLITE = DB_MODE == "sqlite" or (not DATABASE_URL and DB_MODE != "supabase")
+LOCAL_DB_PATH = Path(__file__).with_name(os.environ.get("IKIDS_LOCAL_DB_PATH", "reservations-local.db"))
 LOGO_PATH = Path(__file__).with_name("logo.png")
 MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
 PWA_LOGO_PATH = Path(__file__).with_name("pwalogo.png")
@@ -85,6 +89,10 @@ PARTY_ROOMS = [
     "5. Zima",
     "6. Football",
 ]
+
+ROOM_CAPACITY = {
+    "6. Football": 24,
+}
 
 TABLE_NUMBERS = tuple(range(7, 78))
 TABLE_GROUP_NUMBERS = {
@@ -412,10 +420,18 @@ def require_database_url() -> str:
 
 def adapt_sql(query: str) -> str:
     """Convert ? placeholders to psycopg %s."""
+    if USE_LOCAL_SQLITE:
+        return query
     return query.replace("?", "%s")
 
 
-def connect() -> psycopg.Connection:
+def connect() -> psycopg.Connection | sqlite3.Connection:
+    if USE_LOCAL_SQLITE:
+        conn = sqlite3.connect(LOCAL_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        return conn
     # Transaction pooler (PgBouncer) rejects prepared statements.
     return psycopg.connect(
         require_database_url(),
@@ -425,16 +441,39 @@ def connect() -> psycopg.Connection:
     )
 
 
-def create_schema(conn: psycopg.Connection) -> None:
-    conn.execute(
+def table_columns(conn: psycopg.Connection | sqlite3.Connection, table: str) -> set[str]:
+    if USE_LOCAL_SQLITE:
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    rows = conn.execute(
         """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = ?
+        """.replace("?", "%s"),
+        (table,),
+    ).fetchall()
+    return {row["column_name"] for row in rows}
+
+
+def normalize_db_row(row: Any) -> DbRow:
+    return dict(row)
+
+
+def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
+    reservation_id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if USE_LOCAL_SQLITE else "BIGSERIAL PRIMARY KEY"
+    history_id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if USE_LOCAL_SQLITE else "BIGSERIAL PRIMARY KEY"
+    conn.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS reservations (
-            id BIGSERIAL PRIMARY KEY,
+            id {reservation_id_type},
             start_at TEXT NOT NULL,
             end_at TEXT NOT NULL,
             children_count INTEGER NOT NULL,
             adults_count INTEGER NOT NULL,
+            guest_total INTEGER,
+            reservation_type TEXT NOT NULL DEFAULT 'banquet',
             parent_name TEXT NOT NULL,
+            parent_phone TEXT,
             birthday_child_name TEXT NOT NULL,
             birthday_child_age INTEGER NOT NULL,
             birthday_children_json TEXT,
@@ -446,6 +485,10 @@ def create_schema(conn: psycopg.Connection) -> None:
             animations_json TEXT,
             cake_enabled INTEGER NOT NULL DEFAULT 0,
             cake_theme TEXT,
+            cake_weight TEXT,
+            cake_sponge TEXT,
+            cake_filling TEXT,
+            cake_cream TEXT,
             cake_at TEXT,
             fruit_enabled INTEGER NOT NULL DEFAULT 0,
             fruit_plates INTEGER,
@@ -475,9 +518,9 @@ def create_schema(conn: psycopg.Connection) -> None:
         """
     )
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS reservation_history (
-            id BIGSERIAL PRIMARY KEY,
+            id {history_id_type},
             reservation_id BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
             action TEXT NOT NULL,
             changed_by_role TEXT NOT NULL,
@@ -506,7 +549,28 @@ def create_schema(conn: psycopg.Connection) -> None:
     )
 
 
-def migrate_location_names(conn: psycopg.Connection) -> None:
+def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
+    columns = table_columns(conn, "reservations")
+    schema_columns = {
+        "animations_json": "TEXT",
+        "cake_weight": "TEXT",
+        "cake_sponge": "TEXT",
+        "cake_filling": "TEXT",
+        "cake_cream": "TEXT",
+        "guest_total": "INTEGER",
+        "reservation_type": "TEXT NOT NULL DEFAULT 'banquet'",
+        "parent_phone": "TEXT",
+    }
+    for column, definition in schema_columns.items():
+        if column in columns:
+            continue
+        if USE_LOCAL_SQLITE:
+            conn.execute(f"ALTER TABLE reservations ADD COLUMN {column} {definition}")
+        else:
+            conn.execute(f"ALTER TABLE reservations ADD COLUMN IF NOT EXISTS {column} {definition}")
+
+
+def migrate_location_names(conn: psycopg.Connection | sqlite3.Connection) -> None:
     for old_name, new_name in LEGACY_CHILD_LOCATION_RENAMES.items():
         conn.execute(
             adapt_sql("UPDATE reservations SET child_location = ? WHERE child_location = ?"),
@@ -522,7 +586,7 @@ def migrate_location_names(conn: psycopg.Connection) -> None:
 def init_db() -> None:
     with connect() as conn:
         create_schema(conn)
-        conn.execute("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS animations_json TEXT")
+        ensure_current_schema(conn)
         migrate_location_names(conn)
 
 
@@ -532,17 +596,21 @@ def now_iso() -> str:
 
 def db_rows(query: str, params: tuple = ()) -> list[DbRow]:
     with connect() as conn:
-        return list(conn.execute(adapt_sql(query), params).fetchall())
+        return [normalize_db_row(row) for row in conn.execute(adapt_sql(query), params).fetchall()]
 
 
 def db_one(query: str, params: tuple = ()) -> DbRow | None:
     with connect() as conn:
-        return conn.execute(adapt_sql(query), params).fetchone()
+        row = conn.execute(adapt_sql(query), params).fetchone()
+        return normalize_db_row(row) if row is not None else None
 
 
 def execute(query: str, params: tuple = ()) -> int:
     sql = adapt_sql(query).rstrip().rstrip(";")
     with connect() as conn:
+        if USE_LOCAL_SQLITE:
+            result = conn.execute(sql, params)
+            return int(result.lastrowid or 0)
         if sql.lstrip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
             sql = f"{sql} RETURNING id"
         result = conn.execute(sql, params)
@@ -755,18 +823,68 @@ def format_birthday_children(row: DbRow | dict[str, object]) -> str:
     return ", ".join(parts)
 
 
+def int_row_value(row: DbRow | dict[str, object], field: str) -> int:
+    try:
+        value = row.get(field, 0)
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def guest_count_label(row: DbRow | dict[str, object]) -> str:
+    if is_table_reservation(row):
+        total = int_row_value(row, "guest_total") or int_row_value(row, "children_count") + int_row_value(row, "adults_count")
+        return f"{total} os."
+    children = int_row_value(row, "children_count")
+    adults = int_row_value(row, "adults_count")
+    total = children + adults
+    return f"{total} os. ({children} dzieci, {adults} dorosłych)"
+
+
+def workshop_children_label(row: DbRow | dict[str, object]) -> str:
+    return f"{int_row_value(row, 'children_count')} dzieci"
+
+
+def reservation_type(row: DbRow | dict[str, object]) -> str:
+    value = str(row.get("reservation_type") or "banquet").strip()
+    return value if value in {"banquet", "table"} else "banquet"
+
+
+def is_table_reservation(row: DbRow | dict[str, object]) -> bool:
+    return reservation_type(row) == "table"
+
+
+def cake_detail_parts(row: DbRow | dict[str, object]) -> list[str]:
+    labels = (
+        ("Waga", "cake_weight"),
+        ("Biszkopt", "cake_sponge"),
+        ("Nadzienie", "cake_filling"),
+        ("Krem", "cake_cream"),
+    )
+    parts: list[str] = []
+    for label, field in labels:
+        value_text = str(row.get(field) or "").strip()
+        if value_text:
+            parts.append(f"{label}: {value_text}")
+    return parts
+
+
+def cake_details_label(row: DbRow | dict[str, object]) -> str:
+    return " · ".join(cake_detail_parts(row))
+
+
 def reservation_plan_tip(row: DbRow | dict[str, object]) -> str:
-    children = birthday_children_from_row(row)
-    if children:
-        child = children[0]
-        name = str(child.get("name") or "").strip() or "Solenizant"
-        age = child.get("age")
-        child_part = f"{name}, {age} lat" if age not in (None, "") else name
+    if is_table_reservation(row):
+        child_part = f"Rezerwacja: {str(row.get('parent_name') or '').strip() or 'gość'}"
     else:
-        if isinstance(row, dict):
-            child_part = str(row.get("birthday_child_name") or "Solenizant").strip()
+        children = birthday_children_from_row(row)
+        if children:
+            child = children[0]
+            name = str(child.get("name") or "").strip() or "Solenizant"
+            age = child.get("age")
+            child_part = f"{name}, {age} lat" if age not in (None, "") else name
         else:
-            child_part = str(row["birthday_child_name"] or "Solenizant").strip()
+            child_part = str(row.get("birthday_child_name") or "Solenizant").strip()
     if isinstance(row, dict):
         waiter = str(row.get("assigned_waiter") or "").strip()
     else:
@@ -800,6 +918,7 @@ def render_banquet_header(row: DbRow | dict[str, object]) -> str:
         start_at = row["start_at"]
     start = escape(format_time(start_at))
     solenizant = format_birthday_children(row)
+    guests = escape(guest_count_label(row))
     return f"""
       <div class="banquet-header">
         <div class="banquet-header-item">
@@ -813,6 +932,10 @@ def render_banquet_header(row: DbRow | dict[str, object]) -> str:
         <div class="banquet-header-item">
           <span class="banquet-header-label">Start</span>
           <span class="banquet-header-value">{start}</span>
+        </div>
+        <div class="banquet-header-item">
+          <span class="banquet-header-label">Goście</span>
+          <span class="banquet-header-value">{guests}</span>
         </div>
         <div class="banquet-header-item">
           <span class="banquet-header-label">Rodzic</span>
@@ -1017,11 +1140,25 @@ def joined_locations(values: object) -> str:
     return LOCATION_SEPARATOR.join(location_values(values))
 
 
+def compact_table_locations(locations: list[str]) -> list[str]:
+    grouped: dict[str, list[str]] = {}
+    plain_locations: list[str] = []
+    for location in locations:
+        area, separator, table_number = location.partition(" - Stolik ")
+        if separator and table_number.strip():
+            grouped.setdefault(area, []).append(table_number.strip())
+        else:
+            plain_locations.append(location)
+
+    compacted = [f"{area}: {', '.join(numbers)}" for area, numbers in grouped.items()]
+    return compacted + plain_locations
+
+
 def display_locations(value: object) -> str:
     locations = location_values(value)
     if not locations:
         return EMPTY_LOCATION
-    return ", ".join(locations)
+    return ", ".join(compact_table_locations(locations))
 
 
 def reservation_locations(row: DbRow | dict[str, object]) -> set[str]:
@@ -1055,10 +1192,17 @@ def reservation_color_map(rows: list[DbRow]) -> dict[int, str]:
 
 
 def room_plan_asset_url() -> str:
-    if ROOM_PLAN_SVG_PATH.exists():
-        return f"/room-plan.svg?v={int(ROOM_PLAN_SVG_PATH.stat().st_mtime)}"
+    plan_version = int(
+        max(
+            Path(__file__).stat().st_mtime,
+            ROOM_PLAN_PNG_PATH.stat().st_mtime if ROOM_PLAN_PNG_PATH.exists() else 0,
+            ROOM_PLAN_SVG_PATH.stat().st_mtime if ROOM_PLAN_SVG_PATH.exists() else 0,
+        )
+    )
     if ROOM_PLAN_PNG_PATH.exists():
-        return f"/room-plan.png?v={int(ROOM_PLAN_PNG_PATH.stat().st_mtime)}"
+        return f"/room-plan.png?v={plan_version}"
+    if ROOM_PLAN_SVG_PATH.exists():
+        return f"/room-plan.svg?v={plan_version}"
     return "/room-plan.svg"
 
 
@@ -1108,8 +1252,12 @@ def validate_reservation(
     reservation_id: int | None = None,
 ) -> tuple[dict[str, object], dict[str, str]]:
     errors: dict[str, str] = {}
+    form_reservation_type = str(data.get("reservation_type", "banquet")).strip()
+    if form_reservation_type not in {"banquet", "table"}:
+        form_reservation_type = "banquet"
+    is_table = form_reservation_type == "table"
     reservation_day = parse_date(data.get("reservation_date", ""), errors, "reservation_date", "Data")
-    party_start_time = parse_time_field(data, errors, "party_start_time", "Godzina startu imprezy", required=True)
+    party_start_time = parse_time_field(data, errors, "party_start_time", "Godzina", required=True)
     start_at = combine_day_time(reservation_day, party_start_time) or ""
     end_at = (
         datetime.combine(reservation_day + timedelta(days=1), time.min).isoformat(timespec="minutes")
@@ -1117,7 +1265,7 @@ def validate_reservation(
         else ""
     )
 
-    child_location = normalize_location(data.get("child_location", ""))
+    child_location = EMPTY_LOCATION if is_table else normalize_location(data.get("child_location", ""))
     if child_location != EMPTY_LOCATION and child_location not in ALL_LOCATIONS:
         errors["child_location"] = "Wybierz lokalizację dzieci z listy."
 
@@ -1125,16 +1273,18 @@ def validate_reservation(
     invalid_adult_locations = [location for location in adult_locations if location not in ALL_LOCATIONS]
     if invalid_adult_locations:
         errors["adult_location"] = "Wybierz lokalizacje dorosłych z listy."
+    if is_table and not adult_locations:
+        errors["adult_location"] = "Wybierz stolik dla rezerwacji."
     adult_location = joined_locations(adult_locations) if adult_locations else EMPTY_LOCATION
 
-    animation_enabled = checked_bool(data, "animation_enabled")
-    cake_enabled = checked_bool(data, "cake_enabled")
-    fruit_enabled = checked_bool(data, "fruit_enabled")
+    animation_enabled = 0 if is_table else checked_bool(data, "animation_enabled")
+    cake_enabled = 0 if is_table else checked_bool(data, "cake_enabled")
+    fruit_enabled = 0 if is_table else checked_bool(data, "fruit_enabled")
     drinks_enabled = 0
-    culinary_workshops_enabled = checked_bool(data, "culinary_workshops_enabled")
-    pinata_enabled = checked_bool(data, "pinata_enabled")
-    mascot_enabled = checked_bool(data, "mascot_enabled")
-    balloons_enabled = checked_bool(data, "balloons_enabled")
+    culinary_workshops_enabled = 0 if is_table else checked_bool(data, "culinary_workshops_enabled")
+    pinata_enabled = 0 if is_table else checked_bool(data, "pinata_enabled")
+    mascot_enabled = 0 if is_table else checked_bool(data, "mascot_enabled")
+    balloons_enabled = 0 if is_table else checked_bool(data, "balloons_enabled")
 
     parsed_animations = parse_animations(data) if animation_enabled else []
     animations: list[dict[str, object]] = []
@@ -1167,10 +1317,18 @@ def validate_reservation(
         fruit_plates = parse_int_field(data, errors, "fruit_plates", "Liczba talerzy owoców", 1, 200)
 
     cake_theme = data.get("cake_theme", "").strip()
+    cake_weight = data.get("cake_weight", "").strip()
+    cake_sponge = data.get("cake_sponge", "").strip()
+    cake_filling = data.get("cake_filling", "").strip()
+    cake_cream = data.get("cake_cream", "").strip()
     if cake_enabled and not cake_theme:
         cake_theme = "(brak)"
     if not cake_enabled:
         cake_theme = ""
+        cake_weight = ""
+        cake_sponge = ""
+        cake_filling = ""
+        cake_cream = ""
 
     workshops_type = data.get("culinary_workshops_type", "").strip()
     if culinary_workshops_enabled and workshops_type not in WORKSHOP_TYPES:
@@ -1219,19 +1377,26 @@ def validate_reservation(
         if overlaps_stage_block(value, duration):
             errors[field] = STAGE_BLOCK_MESSAGE
 
-    birthday_children = parse_birthday_children(data)
-    if not birthday_children:
-        errors["birthday_child_name"] = "Dodaj co najmniej jednego solenizanta."
-    for index, child in enumerate(birthday_children):
-        if not child["name"]:
-            errors["birthday_child_name"] = "Każdy solenizant musi mieć imię."
-        age = child.get("age")
-        if age is None:
-            errors["birthday_child_age"] = "Podaj wiek każdego solenizanta (1-18 lat)."
-        elif not isinstance(age, int) or age < 1 or age > 18:
-            errors["birthday_child_age"] = "Wiek solenizanta musi być w zakresie 1-18 lat."
-
-    primary_child = birthday_children[0] if birthday_children else {"name": "", "age": 1}
+    parent_name = parse_text_field(data, errors, "parent_name", "Rodzic / osoba rezerwująca")
+    parent_phone = data.get("parent_phone", "").strip()
+    if is_table:
+        guest_total = parse_int_field(data, errors, "guest_total", "Liczba gości", 1, 240)
+        birthday_children = []
+        primary_child = {"name": parent_name or "Rezerwacja stolika", "age": 1}
+    else:
+        guest_total = 0
+        birthday_children = parse_birthday_children(data)
+        if not birthday_children:
+            errors["birthday_child_name"] = "Dodaj co najmniej jednego solenizanta."
+        for index, child in enumerate(birthday_children):
+            if not child["name"]:
+                errors["birthday_child_name"] = "Każdy solenizant musi mieć imię."
+            age = child.get("age")
+            if age is None:
+                errors["birthday_child_age"] = "Podaj wiek każdego solenizanta (1-18 lat)."
+            elif not isinstance(age, int) or age < 1 or age > 18:
+                errors["birthday_child_age"] = "Wiek solenizanta musi być w zakresie 1-18 lat."
+        primary_child = birthday_children[0] if birthday_children else {"name": "", "age": 1}
 
     overlap_fields = find_internal_time_overlaps(
         {
@@ -1274,9 +1439,12 @@ def validate_reservation(
         "party_start_time": data.get("party_start_time", "").strip(),
         "start_at": start_at or "",
         "end_at": end_at or "",
-        "children_count": parse_int_field(data, errors, "children_count", "Liczba dzieci", 1, 120),
-        "adults_count": parse_int_field(data, errors, "adults_count", "Liczba dorosłych", 0, 120),
-        "parent_name": parse_text_field(data, errors, "parent_name", "Rodzic / osoba rezerwująca"),
+        "children_count": guest_total if is_table else parse_int_field(data, errors, "children_count", "Liczba dzieci", 1, 120),
+        "adults_count": 0 if is_table else parse_int_field(data, errors, "adults_count", "Liczba dorosłych", 0, 120),
+        "guest_total": guest_total if is_table else None,
+        "reservation_type": form_reservation_type,
+        "parent_name": parent_name,
+        "parent_phone": parent_phone,
         "birthday_child_name": str(primary_child["name"]),
         "birthday_child_age": int(primary_child["age"] or 1),
         "birthday_children_json": birthday_children_json_value(birthday_children) if birthday_children else "[]",
@@ -1294,6 +1462,10 @@ def validate_reservation(
         else "[]",
         "cake_enabled": cake_enabled,
         "cake_theme": cake_theme or None,
+        "cake_weight": cake_weight or None,
+        "cake_sponge": cake_sponge or None,
+        "cake_filling": cake_filling or None,
+        "cake_cream": cake_cream or None,
         "cake_at": combine_day_time(reservation_day, cake_time) if cake_enabled else None,
         "fruit_enabled": fruit_enabled,
         "fruit_plates": fruit_plates if fruit_enabled else None,
@@ -1319,6 +1491,10 @@ def validate_reservation(
         "status": status,
         "cancellation_reason": cancellation_reason,
     }
+
+    capacity = ROOM_CAPACITY.get(child_location)
+    if capacity is not None and int(cleaned["children_count"] or 0) > capacity:
+        errors["children_count"] = f"Ta sala mieści maksymalnie {capacity} dzieci."
 
     if (
         status == "active"
@@ -1367,7 +1543,10 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["end_at"],
         values["children_count"],
         values["adults_count"],
+        values["guest_total"],
+        values["reservation_type"],
         values["parent_name"],
+        values["parent_phone"],
         values["birthday_child_name"],
         values["birthday_child_age"],
         values["birthday_children_json"],
@@ -1379,6 +1558,10 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values.get("animations_json") or "[]",
         values["cake_enabled"],
         values["cake_theme"],
+        values["cake_weight"],
+        values["cake_sponge"],
+        values["cake_filling"],
+        values["cake_cream"],
         values["cake_at"],
         values["fruit_enabled"],
         values["fruit_plates"],
@@ -1409,11 +1592,13 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             """
             UPDATE reservations
             SET start_at = ?, end_at = ?, children_count = ?, adults_count = ?,
-                parent_name = ?, birthday_child_name = ?, birthday_child_age = ?,
+                guest_total = ?, reservation_type = ?,
+                parent_name = ?, parent_phone = ?, birthday_child_name = ?, birthday_child_age = ?,
                 birthday_children_json = ?,
                 child_location = ?, adult_location = ?, animation_enabled = ?, animation_type = ?,
                 animation_at = ?, animations_json = ?,
-                cake_enabled = ?, cake_theme = ?, cake_at = ?,
+                cake_enabled = ?, cake_theme = ?, cake_weight = ?, cake_sponge = ?,
+                cake_filling = ?, cake_cream = ?, cake_at = ?,
                 fruit_enabled = ?, fruit_plates = ?, fruit_at = ?,
                 drinks_enabled = ?, drinks_at = ?, culinary_workshops_enabled = ?,
                 culinary_workshops_type = ?, culinary_workshops_at = ?,
@@ -1436,9 +1621,10 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
     new_id = execute(
         """
         INSERT INTO reservations (
-            start_at, end_at, children_count, adults_count, parent_name,
-            birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
-            animation_enabled, animation_type, animation_at, animations_json, cake_enabled, cake_theme, cake_at,
+            start_at, end_at, children_count, adults_count, guest_total, reservation_type, parent_name,
+            parent_phone, birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
+            animation_enabled, animation_type, animation_at, animations_json, cake_enabled, cake_theme,
+            cake_weight, cake_sponge, cake_filling, cake_cream, cake_at,
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
             culinary_workshops_enabled, culinary_workshops_type, culinary_workshops_at,
             pinata_enabled, pinata_theme, pinata_at,
@@ -1448,7 +1634,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             notes, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -3659,6 +3845,55 @@ def page_template(
       align-items: start;
     }}
 
+    .reservation-type-switch {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      background: var(--field-strong);
+    }}
+
+    .reservation-type-switch legend {{
+      padding: 0 4px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 900;
+      text-transform: uppercase;
+    }}
+
+    .reservation-type-switch label {{
+      width: auto;
+      min-height: 36px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--field);
+    }}
+
+    .reservation-type-switch input {{
+      width: 18px;
+      height: 18px;
+      min-height: 18px;
+      accent-color: var(--brand);
+    }}
+
+    .table-only {{
+      display: none;
+    }}
+
+    #reservation-form.is-table-reservation .table-only {{
+      display: grid;
+    }}
+
+    #reservation-form.is-table-reservation .banquet-only {{
+      display: none !important;
+    }}
+
     .service-catalog-item {{
       border: 1px solid var(--line);
       background: var(--field-strong);
@@ -3829,9 +4064,7 @@ def page_template(
     }}
 
     .timeline-header.has-color .timeline-start,
-    .timeline-header.has-color .profile-name,
-    .timeline-header.has-color .waiter-assignment-label,
-    .timeline-header.has-color .waiter-assignment-label strong {{
+    .timeline-header.has-color .profile-name {{
       color: #ffffff;
     }}
 
@@ -3849,14 +4082,32 @@ def page_template(
       display: flex;
       align-items: center;
       gap: 8px;
-      flex-wrap: wrap;
-      flex: 0 0 auto;
+      flex-wrap: nowrap;
+      flex: 1 1 420px;
+      justify-content: flex-end;
+      margin-left: auto;
+      min-width: 0;
     }}
 
     .waiter-assignment-label {{
-      font-size: 0.88rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 36px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--field-strong);
+      font-size: 0.84rem;
       color: var(--muted);
       white-space: nowrap;
+      min-width: 0;
+    }}
+
+    .timeline-header.has-color .waiter-assignment-label {{
+      background: #ffffff;
+      border-color: rgba(0, 0, 0, 0.08);
+      color: #374151;
     }}
 
     .waiter-assignment-label strong {{
@@ -3864,11 +4115,37 @@ def page_template(
       font-weight: 800;
     }}
 
+    .timeline-header.has-color .waiter-assignment-label strong {{
+      color: #000000;
+    }}
+
     .waiter-picker {{
       position: relative;
+      flex: 0 0 auto;
+    }}
+
+    .waiter-assignment .inline-form {{
+      flex: 0 0 auto;
+    }}
+
+    .waiter-picker > summary,
+    .waiter-remove-btn {{
+      box-sizing: border-box;
+      width: 86px;
+      height: 36px;
+      min-height: 36px;
+      padding: 0 12px;
+      border-radius: 999px;
+      font-family: inherit;
+      font-size: 0.84rem;
+      font-weight: 800;
+      line-height: 1;
     }}
 
     .waiter-picker > summary {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       list-style: none;
       cursor: pointer;
     }}
@@ -3915,8 +4192,7 @@ def page_template(
     }}
 
     .waiter-remove-btn {{
-      min-height: 36px;
-      padding: 8px 12px;
+      color: var(--danger);
     }}
 
     .timeline-start {{
@@ -3970,6 +4246,12 @@ def page_template(
       color: var(--muted);
     }}
 
+    .animator-card .profile-tag-guests,
+    .kitchen-card .profile-tag-guests {{
+      color: #000000;
+      font-weight: 650;
+    }}
+
     .profile-tag-room {{
       font-weight: 500;
     }}
@@ -4017,12 +4299,19 @@ def page_template(
     .profile-guardian {{
       display: inline-flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 8px;
       margin-left: auto;
       font-size: 0.95rem;
       color: var(--muted);
       line-height: 1.35;
       flex: 0 0 auto;
+    }}
+
+    .profile-phone {{
+      color: var(--muted);
+      font-size: 0.84rem;
+      font-weight: 800;
     }}
 
     .profile-guardian-svg {{
@@ -4960,6 +5249,27 @@ def page_template(
     .role-card-head .profile-name {{
       font-size: 1.28rem;
       font-weight: 900;
+    }}
+
+    .role-guest-summary {{
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      max-width: 100%;
+      padding: 6px 10px;
+      border: 1px solid rgba(122, 154, 18, 0.24);
+      border-radius: 999px;
+      background: rgba(122, 154, 18, 0.1);
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 800;
+      line-height: 1.25;
+      white-space: normal;
+    }}
+
+    .role-guest-summary strong {{
+      color: var(--ink);
+      margin-left: 4px;
     }}
 
     .banquet-title, .kitchen-title {{
@@ -5911,6 +6221,30 @@ def page_template(
         order: 3;
       }}
 
+      .timeline-header .waiter-assignment {{
+        width: 100%;
+        flex-basis: 100%;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        margin-left: 0;
+      }}
+
+      .waiter-picker {{
+        flex: 1 1 150px;
+      }}
+
+      .waiter-picker > summary, .waiter-remove-btn {{
+        width: 100%;
+      }}
+
+      .waiter-options {{
+        position: static;
+        min-width: 0;
+        width: 100%;
+        margin-top: 8px;
+        box-shadow: none;
+      }}
+
       .timeline-header .profile-guardian {{
         order: 4;
         margin-left: 0;
@@ -6345,7 +6679,10 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "party_start_time": "",
         "children_count": "",
         "adults_count": "",
+        "guest_total": "",
+        "reservation_type": "banquet",
         "parent_name": "",
+        "parent_phone": "",
         "birthday_child_name": "",
         "birthday_child_age": "",
         "birthday_children": [{"name": "", "age": ""}],
@@ -6359,6 +6696,10 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "animations_json": "[]",
         "cake_enabled": 0,
         "cake_theme": "",
+        "cake_weight": "",
+        "cake_sponge": "",
+        "cake_filling": "",
+        "cake_cream": "",
         "cake_at": "",
         "fruit_enabled": 0,
         "fruit_plates": "",
@@ -6713,23 +7054,43 @@ def render_metric(value: int, label: str, icon_key: str) -> str:
     )
 
 
-def render_role_card_identity(row: DbRow | dict[str, object]) -> str:
-    children = birthday_children_from_row(row)
-    names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
-    name_markup = ", ".join(names) if names else "Brak solenizanta"
-    age_tags = "".join(
-        f'<span class="profile-tag profile-tag-age">{escape(format_age_label(child.get("age")))}</span>'
-        for child in children
-        if format_age_label(child.get("age"))
-    )
+def render_role_card_identity(
+    row: DbRow | dict[str, object],
+    *,
+    show_guest_summary: bool = True,
+    show_children_tag: bool = False,
+    show_total_guests_tag: bool = False,
+) -> str:
+    if is_table_reservation(row):
+        kicker = "Rezerwacja stolika"
+        name_markup = escape(str(row.get("parent_name") or "gość"))
+        age_tags = ""
+    else:
+        kicker = "Solenizant"
+        children = birthday_children_from_row(row)
+        names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
+        name_markup = ", ".join(names) if names else "Brak solenizanta"
+        age_tags = "".join(
+            f'<span class="profile-tag profile-tag-age">{escape(format_age_label(child.get("age")))}</span>'
+            for child in children
+            if format_age_label(child.get("age"))
+        )
+    if show_children_tag and not is_table_reservation(row):
+        age_tags += f'<span class="profile-tag profile-tag-guests">{escape(int_row_value(row, "children_count"))} dzieci</span>'
+    if show_total_guests_tag:
+        total_guests = int_row_value(row, "guest_total") or int_row_value(row, "children_count") + int_row_value(row, "adults_count")
+        age_tags += f'<span class="profile-tag profile-tag-guests">{escape(total_guests)} osób</span>'
     tags_block = f'<div class="profile-tags">{age_tags}</div>' if age_tags else ""
+    guests = escape(guest_count_label(row))
+    guest_summary = f'<div class="role-guest-summary">Goście: <strong>{guests}</strong></div>' if show_guest_summary else ""
     return f"""
       <div class="role-card-head">
-        <span class="role-card-kicker">Solenizant</span>
+        <span class="role-card-kicker">{kicker}</span>
         <div class="profile-identity">
           <h3 class="profile-name">{name_markup}</h3>
           {tags_block}
         </div>
+        {guest_summary}
       </div>
     """
 
@@ -6738,6 +7099,7 @@ def render_role_extra_info(row: DbRow, notes: object = "") -> str:
     room = escape(display_location(row["child_location"]))
     adult = escape(display_locations(row["adult_location"]))
     parent = escape(str(row["parent_name"]))
+    phone = escape(str(row.get("parent_phone") or ""))
     start = escape(format_time(row["start_at"]))
     children_count = escape(row["children_count"])
     adults_count = escape(row["adults_count"])
@@ -6782,6 +7144,10 @@ def render_role_extra_info(row: DbRow, notes: object = "") -> str:
           <div class="role-extra-item">
             <span class="role-extra-label">Rodzic</span>
             <span class="role-extra-value">{parent}</span>
+          </div>
+          <div class="role-extra-item">
+            <span class="role-extra-label">Telefon</span>
+            <span class="role-extra-value">{phone or EMPTY_LOCATION}</span>
           </div>
           <div class="role-extra-item">
             <span class="role-extra-label">Dzieci</span>
@@ -6914,20 +7280,28 @@ def render_waiter_assignment(row: DbRow, role: str, day: str) -> str:
 
 
 def render_profile_identity(row: DbRow | dict[str, object]) -> str:
-    children = birthday_children_from_row(row)
+    if is_table_reservation(row):
+        name_markup = f"Rezerwacja: {escape(str(row.get('parent_name') or 'gość'))}"
+        age_tags = ""
+    else:
+        children = birthday_children_from_row(row)
+        names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
+        name_markup = ", ".join(names) if names else "Brak solenizanta"
 
-    names = [escape(str(child["name"])) for child in children if str(child.get("name", "")).strip()]
-    name_markup = ", ".join(names) if names else "Brak solenizanta"
-
-    age_tags = "".join(
-        f'<span class="profile-tag profile-tag-age">{escape(format_age_label(child.get("age")))}</span>'
-        for child in children
-        if format_age_label(child.get("age"))
-    )
+        age_tags = "".join(
+            f'<span class="profile-tag profile-tag-age">{escape(format_age_label(child.get("age")))}</span>'
+            for child in children
+            if format_age_label(child.get("age"))
+        )
     child_location = row["child_location"] if not isinstance(row, dict) else row.get("child_location", "")
     room_tag = render_profile_room_tag(child_location)
     tags_markup = age_tags + room_tag
     tags_block = f'<div class="profile-tags">{tags_markup}</div>' if tags_markup else ""
+    guests_markup = f'<span class="profile-tag profile-tag-guests">{escape(guest_count_label(row))}</span>'
+    if tags_block:
+        tags_block = tags_block.replace("</div>", f"{guests_markup}</div>", 1)
+    else:
+        tags_block = f'<div class="profile-tags">{guests_markup}</div>'
 
     return f"""
       <div class="profile-identity">
@@ -6940,9 +7314,11 @@ def render_profile_identity(row: DbRow | dict[str, object]) -> str:
 def render_profile_guardian(row: DbRow | dict[str, object]) -> str:
     parent_raw = row["parent_name"] if not isinstance(row, dict) else row.get("parent_name", "")
     parent = escape(str(parent_raw))
+    phone = escape(str(row.get("parent_phone") or ""))
     if not parent:
         return ""
-    return f'<div class="profile-guardian">{PROFILE_USER_ICON}<span>{parent}</span></div>'
+    phone_markup = f'<span class="profile-phone">{phone}</span>' if phone else ""
+    return f'<div class="profile-guardian">{PROFILE_USER_ICON}<span>{parent}</span>{phone_markup}</div>'
 
 
 def render_profile_header(row: DbRow | dict[str, object]) -> str:
@@ -7013,10 +7389,13 @@ def render_reservation_details(
         left_chips.append(render_logistics_chip("kitchen", f"Owoce ({escape(plates)})"))
     if is_enabled(row, "cake_enabled"):
         label = escape(f"Tort: {row['cake_theme'] or '(brak)'}")
-        window = escape(format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]))
-        left_chips.append(render_logistics_chip("cake", label, window))
+        cake_meta = [format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"])]
+        details = cake_details_label(row)
+        if details:
+            cake_meta.append(details)
+        left_chips.append(render_logistics_chip("cake", label, escape(" · ".join(item for item in cake_meta if item))))
     if is_enabled(row, "culinary_workshops_enabled"):
-        label = escape(f"Warsztaty: {row['culinary_workshops_type'] or '(brak)'}")
+        label = escape(f"Warsztaty: {row['culinary_workshops_type'] or '(brak)'} ({workshop_children_label(row)})")
         window = escape(format_service_window(row["culinary_workshops_at"], SERVICE_DURATIONS["culinary_workshops_at"]))
         left_chips.append(render_logistics_chip("kitchen", label, window))
 
@@ -7114,6 +7493,22 @@ def render_cake_theme_input(values: dict[str, object], errors: dict[str, str]) -
           Motyw tortu
           <input name="cake_theme" value="{escape(values.get("cake_theme", ""))}" placeholder="(brak)">
           {error_for(errors, "cake_theme")}
+        </label>
+        <label class="service-extra">
+          Waga tortu
+          <input name="cake_weight" value="{escape(values.get("cake_weight", ""))}" placeholder="np. 2 kg">
+        </label>
+        <label class="service-extra">
+          Smak biszkoptu
+          <input name="cake_sponge" value="{escape(values.get("cake_sponge", ""))}" placeholder="np. waniliowy">
+        </label>
+        <label class="service-extra">
+          Nadzienie
+          <input name="cake_filling" value="{escape(values.get("cake_filling", ""))}" placeholder="np. truskawkowe">
+        </label>
+        <label class="service-extra">
+          Krem
+          <input name="cake_cream" value="{escape(values.get("cake_cream", ""))}" placeholder="np. śmietankowy">
         </label>
 """
 
@@ -7295,10 +7690,6 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str], *, compa
 <div class="plan-block" id="room-plan">
   <button type="button" class="plan-block-title" data-open-plan-fs aria-label="Otwórz plan sali na pełnym ekranie">PLAN SALI</button>
   {svg_markup}
-  <div class="plan-legend plan-legend-bottom">
-    <span><span class="legend-key key-free"></span>WOLNE</span>
-    <span><span class="legend-key key-busy"></span>ZAJĘTE</span>
-  </div>
 </div>
 """
 
@@ -7308,8 +7699,6 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str], *, compa
     <span class="location-accordion-head-main">
       <span class="location-accordion-label">Plan sali i dostępność na żywo</span>
       <span class="plan-legend-compact">
-        <span><span class="legend-key key-free"></span>wolne</span>
-        <span><span class="legend-key key-busy"></span>zajęte</span>
         <span><span class="legend-key key-selected"></span>wybrane</span>
       </span>
     </span>
@@ -7386,6 +7775,8 @@ def render_form(
     )
     cancellation_class = "full" if values.get("status") == "cancelled" else "full is-hidden"
     plan_markup = render_room_plan(values, errors) if include_plan else ""
+    current_type = reservation_type(values)
+    form_type_class = "is-table-reservation" if current_type == "table" else ""
 
     return f"""
 <section class="role-board organizer-form-board">
@@ -7395,12 +7786,23 @@ def render_form(
       <p class="subtitle">Rezerwacja blokuje wybrane lokalizacje na cały dzień. Godziny przy usługach są godzinami startu.</p>
     </div>
   </div>
-  <form method="post" action="/reservations?role={escape(role)}&day={escape(day)}" id="reservation-form">
+  <form method="post" action="/reservations?role={escape(role)}&day={escape(day)}" id="reservation-form" class="{form_type_class}">
     <input type="hidden" name="id" id="reservation_id" value="{escape(reservation_id)}">
     <div class="form-board">
       <div class="form-category">
         <h3 class="category-title">Termin</h3>
         <div class="category-fields single termin">
+          <fieldset class="reservation-type-switch full">
+            <legend>Typ wpisu</legend>
+            <label>
+              <input type="radio" name="reservation_type" value="banquet"{checked(1 if current_type == "banquet" else 0)}>
+              Bankiet
+            </label>
+            <label>
+              <input type="radio" name="reservation_type" value="table"{checked(1 if current_type == "table" else 0)}>
+              Rezerwacja stolika
+            </label>
+          </fieldset>
           <label>
             Data
             <input type="date" name="reservation_date" id="reservation_date" value="{escape(values.get("reservation_date", ""))}" required>
@@ -7421,24 +7823,35 @@ def render_form(
           <div class="guest-count-block">
             <span class="guest-count-title">Liczba</span>
             <div class="guest-count-grid">
-              <label class="guest-count-field">
+              <label class="guest-count-field banquet-only">
                 dzieci
                 <input class="guest-count-input" type="number" name="children_count" min="1" max="120" value="{escape(values.get("children_count", ""))}" required>
                 {error_for(errors, "children_count")}
               </label>
-              <label class="guest-count-field">
+              <label class="guest-count-field banquet-only">
                 dorosłych
                 <input class="guest-count-input" type="number" name="adults_count" min="0" max="120" value="{escape(values.get("adults_count", ""))}" required>
                 {error_for(errors, "adults_count")}
               </label>
+              <label class="guest-count-field table-only">
+                gości
+                <input class="guest-count-input" type="number" name="guest_total" min="1" max="240" value="{escape((values.get("guest_total") or values.get("children_count")) if current_type == "table" else values.get("guest_total", ""))}">
+                {error_for(errors, "guest_total")}
+              </label>
             </div>
           </div>
-          <label class="full">
+          <label>
             Rodzic / osoba rezerwująca
             <input name="parent_name" autocomplete="name" value="{escape(values.get("parent_name", ""))}" required>
             {error_for(errors, "parent_name")}
           </label>
-          {render_birthday_children_fields(values, errors)}
+          <label>
+            Telefon
+            <input name="parent_phone" autocomplete="tel" inputmode="tel" value="{escape(values.get("parent_phone", ""))}" placeholder="np. 500 000 000">
+          </label>
+          <div class="banquet-only full">
+            {render_birthday_children_fields(values, errors)}
+          </div>
         </div>
       </div>
 
@@ -7448,7 +7861,7 @@ def render_form(
           <div class="location-picker full" id="location-picker">
             <p class="subtitle location-hint">Wybierz lożę po lewej i stoliki po prawej (pojedynczo lub zakresem od–do), albo kliknij element na planie.</p>
             <div class="location-forms">
-              {render_child_location_picker(values.get("child_location"))}
+              <div class="banquet-only">{render_child_location_picker(values.get("child_location"))}</div>
               {render_adult_location_picker(values.get("adult_location"))}
             </div>
             <div class="location-confirm-bar">
@@ -7468,7 +7881,7 @@ def render_form(
         </div>
       </div>
 
-      <div class="form-category wide">
+      <div class="form-category wide banquet-only">
         <h3 class="category-title">Atrakcje i dodatki</h3>
         <p class="subtitle location-hint">Przy każdej opcji kliknij zielony plus, wybierz godzinę i rodzaj. Czerwony minus usuwa dodatek.</p>
         <div id="service-overlap-notice" class="overlap-notice is-hidden">Godziny się pokrywają</div>
@@ -7524,7 +7937,7 @@ def service_pills(row: DbRow) -> str:
     if is_enabled(row, "culinary_workshops_enabled"):
         workshop_label = "Warsztaty"
         if row["culinary_workshops_type"]:
-            workshop_label = f"Warsztaty: {row['culinary_workshops_type']}"
+            workshop_label = f"Warsztaty: {row['culinary_workshops_type']} ({workshop_children_label(row)})"
         items.append((workshop_label, row["culinary_workshops_at"], SERVICE_DURATIONS["culinary_workshops_at"]))
     if is_enabled(row, "pinata_enabled"):
         pinata_label = f"Piniata: {row['pinata_theme'] or '(brak)'}"
@@ -7644,7 +8057,7 @@ def render_animator_view(rows: list[DbRow]) -> str:
         banquet_cards.append(
             f"""
             <div class="banquet-card role-card animator-card">
-              {render_role_card_identity(row)}
+              {render_role_card_identity(row, show_guest_summary=False, show_children_tag=True)}
               <div class="banquet-tasks">{task_markup}</div>
               {render_role_extra_info(row, notes)}
             </div>
@@ -7686,10 +8099,15 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
 
         if has_cake:
             cake_window = format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"])
-            task_items.append((format_time(row["cake_at"]), "Tort", row["cake_theme"] or "(brak)", cake_window))
+            cake_meta = row["cake_theme"] or "(brak)"
+            cake_details = cake_details_label(row)
+            if cake_details:
+                cake_meta = f"{cake_meta} · {cake_details}"
+            task_items.append((format_time(row["cake_at"]), "Tort", cake_meta, cake_window))
 
         if has_workshops:
             workshop_name = row["culinary_workshops_type"] or "Warsztaty"
+            workshop_name = f"{workshop_name} ({workshop_children_label(row)})"
             workshop_window = format_service_window(
                 row["culinary_workshops_at"],
                 SERVICE_DURATIONS["culinary_workshops_at"],
@@ -7723,7 +8141,7 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
                 sort_time,
             f"""
             <div class="banquet-card role-card kitchen-card">
-              {render_role_card_identity(row)}
+              {render_role_card_identity(row, show_guest_summary=False, show_total_guests_tag=True)}
               <div class="banquet-tasks kitchen-orders">{task_markup}</div>
               {render_role_extra_info(row, row["notes"])}
             </div>
@@ -7815,11 +8233,13 @@ def render_schema_summary() -> str:
         "reservations.id",
         "start_at jako godzina startu imprezy / end_at techniczne",
         "children_count / adults_count",
-        "parent_name",
+        "guest_total / reservation_type",
+        "parent_name / parent_phone",
         "birthday_child_name / birthday_child_age",
         "child_location / adult_location",
         "animation_enabled / animation_type / animation_at / animations_json",
         "cake_enabled / cake_theme / cake_at",
+        "cake_weight / cake_sponge / cake_filling / cake_cream",
         "fruit_enabled / fruit_plates / fruit_at",
         "culinary_workshops_enabled / culinary_workshops_type / culinary_workshops_at",
         "pinata_enabled / pinata_theme / pinata_at",
@@ -7936,10 +8356,45 @@ def room_plan_script() -> str:
   const addBirthdayBtn = document.getElementById("add-birthday-child");
   const animationList = document.getElementById("animation-list");
   const addAnimationBtn = document.getElementById("add-animation-row");
+  const reservationTypeInputs = Array.from(document.querySelectorAll('input[name="reservation_type"]'));
+  const childrenCountInput = document.querySelector('input[name="children_count"]');
+  const adultsCountInput = document.querySelector('input[name="adults_count"]');
+  const guestTotalInput = document.querySelector('input[name="guest_total"]');
   let timer = null;
 
   function allTimeInputs() {
     return Array.from(document.querySelectorAll("[data-time-input]"));
+  }
+
+  function reservationType() {
+    return reservationTypeInputs.find((input) => input.checked)?.value || "banquet";
+  }
+
+  function isTableReservation() {
+    return reservationType() === "table";
+  }
+
+  function syncReservationType() {
+    const tableMode = isTableReservation();
+    form.classList.toggle("is-table-reservation", tableMode);
+    if (childrenCountInput) childrenCountInput.required = !tableMode;
+    if (adultsCountInput) adultsCountInput.required = !tableMode;
+    if (guestTotalInput) guestTotalInput.required = tableMode;
+    birthdayList?.querySelectorAll("input").forEach((input) => {
+      input.required = !tableMode;
+      input.disabled = tableMode;
+    });
+    if (childSelect) {
+      childSelect.disabled = tableMode;
+      if (tableMode) childSelect.value = EMPTY_LOCATION;
+    }
+    if (!tableMode && guestTotalInput && !guestTotalInput.value) {
+      const children = Number(childrenCountInput?.value || 0);
+      const adults = Number(adultsCountInput?.value || 0);
+      if (children || adults) guestTotalInput.value = String(children + adults);
+    }
+    updateLocationSummary();
+    validateServiceOverlaps();
   }
 
   function getAdultSelectValues() {
@@ -7981,6 +8436,10 @@ def room_plan_script() -> str:
   }
 
   function finalizeLocations() {
+    if (isTableReservation()) {
+      if (childSelect) childSelect.value = EMPTY_LOCATION;
+      return;
+    }
     if (childSelect && (!childSelect.value || childSelect.value.trim() === "")) {
       childSelect.value = EMPTY_LOCATION;
     }
@@ -8035,16 +8494,16 @@ def room_plan_script() -> str:
   function updateLocationSummary() {
     const childValue = childSelect?.value || EMPTY_LOCATION;
     const adultValues = getAdultSelectValues();
-    const childLabel = childValue === EMPTY_LOCATION ? EMPTY_LOCATION : childValue;
+    const childLabel = isTableReservation() ? "Rezerwacja stolika" : (childValue === EMPTY_LOCATION ? EMPTY_LOCATION : childValue);
     const adultLabel = adultValues.length ? adultValues.join(", ") : EMPTY_LOCATION;
 
-    if (childLocationBadge) childLocationBadge.textContent = shortChildLabel(childValue);
+    if (childLocationBadge) childLocationBadge.textContent = isTableReservation() ? "Stolik" : shortChildLabel(childValue);
     if (adultLocationBadge) {
       adultLocationBadge.textContent = adultValues.length ? `${adultValues.length} stol.` : EMPTY_LOCATION;
     }
     if (locationSummaryChild) {
       locationSummaryChild.textContent = childLabel;
-      locationSummaryChild.classList.toggle("is-empty", childValue === EMPTY_LOCATION);
+      locationSummaryChild.classList.toggle("is-empty", !isTableReservation() && childValue === EMPTY_LOCATION);
     }
     if (locationSummaryAdult) {
       locationSummaryAdult.textContent = adultLabel;
@@ -8477,6 +8936,7 @@ def room_plan_script() -> str:
 
   childSelect?.addEventListener("change", paintSelectedLocations);
   adultSelect?.addEventListener("change", paintSelectedLocations);
+  reservationTypeInputs.forEach((input) => input.addEventListener("change", syncReservationType));
   locationConfirmBtn?.addEventListener("click", confirmLocations);
   bindLocationAccordions();
   bindLocationChips();
@@ -8489,7 +8949,7 @@ def room_plan_script() -> str:
   });
 
   form.addEventListener("submit", (event) => {
-    timeInputs.forEach(normalizeTimeInput);
+    allTimeInputs().forEach(normalizeTimeInput);
     finalizeLocations();
     if (!validateServiceOverlaps()) {
       event.preventDefault();
@@ -8502,6 +8962,7 @@ def room_plan_script() -> str:
   });
 
   paintSelectedLocations();
+  syncReservationType();
   dateInput?.addEventListener("input", scheduleRefresh);
   if (statusSelect) statusSelect.addEventListener("change", syncCancellationRequirement);
   syncCancellationRequirement();
@@ -8525,7 +8986,10 @@ CREATE TABLE reservations (
   end_at TIMESTAMPTZ NOT NULL,
   children_count INT NOT NULL CHECK (children_count > 0),
   adults_count INT NOT NULL CHECK (adults_count >= 0),
+  guest_total INT,
+  reservation_type TEXT NOT NULL DEFAULT 'banquet',
   parent_name TEXT NOT NULL,
+  parent_phone TEXT,
   birthday_child_name TEXT NOT NULL,
   birthday_child_age INT NOT NULL,
   child_location TEXT NOT NULL,
@@ -8536,6 +9000,10 @@ CREATE TABLE reservations (
   animations_json TEXT,
   cake_enabled BOOLEAN NOT NULL DEFAULT false,
   cake_theme TEXT,
+  cake_weight TEXT,
+  cake_sponge TEXT,
+  cake_filling TEXT,
+  cake_cream TEXT,
   cake_at TIMESTAMPTZ,
   fruit_enabled BOOLEAN NOT NULL DEFAULT false,
   fruit_plates INT,
@@ -8658,11 +9126,14 @@ def csv_response() -> bytes:
     writer.writerow(
         [
             "ID",
+            "Typ",
             "Data",
             "Start imprezy",
+            "Goście razem",
             "Dzieci",
             "Dorośli",
             "Rodzic",
+            "Telefon",
             "Solenizant",
             "Wiek",
             "Sala dzieci",
@@ -8672,6 +9143,10 @@ def csv_response() -> bytes:
             "Animacja czas",
             "Tort",
             "Motyw tortu",
+            "Waga tortu",
+            "Smak biszkoptu",
+            "Nadzienie tortu",
+            "Krem tortu",
             "Tort czas",
             "Owoce",
             "Liczba talerzy owoców",
@@ -8697,11 +9172,14 @@ def csv_response() -> bytes:
         writer.writerow(
             [
                 row["id"],
+                "Rezerwacja stolika" if is_table_reservation(row) else "Bankiet",
                 format_date(row["start_at"]),
                 format_time(row["start_at"]),
+                row.get("guest_total") or int(row["children_count"] or 0) + int(row["adults_count"] or 0),
                 row["children_count"],
                 row["adults_count"],
                 row["parent_name"],
+                row.get("parent_phone") or "",
                 row["birthday_child_name"],
                 row["birthday_child_age"],
                 row["child_location"],
@@ -8714,6 +9192,10 @@ def csv_response() -> bytes:
                 ),
                 "Tak" if is_enabled(row, "cake_enabled") else "Nie",
                 row["cake_theme"] or "",
+                row["cake_weight"] or "",
+                row["cake_sponge"] or "",
+                row["cake_filling"] or "",
+                row["cake_cream"] or "",
                 format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]),
                 "Tak" if is_enabled(row, "fruit_enabled") else "Nie",
                 row["fruit_plates"] or "",
@@ -9417,6 +9899,11 @@ def run() -> None:
         raise RuntimeError(f"Nie znaleziono wolnego portu (start {PORT}).")
 
     protocol = "https" if use_https else "http"
+    if USE_LOCAL_SQLITE:
+        print(f"Tryb bazy: lokalny testowy SQLite ({LOCAL_DB_PATH})", flush=True)
+        print("Dane z tej bazy nie sa przenoszone na Supabase/Fly.", flush=True)
+    else:
+        print("Tryb bazy: Supabase/Postgres z DATABASE_URL", flush=True)
     print(f"{APP_TITLE} nasłuchuje na {protocol}://{HOST}:{selected_port}", flush=True)
 
     def boot() -> None:

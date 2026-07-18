@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .env
 reservations.db
+reservations-local.db
 reservations.db-shm
 reservations.db-wal
 *.db-wal

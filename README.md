@@ -14,6 +14,14 @@ Aplikacja webowa do obsługi rezerwacji urodzinowych. Backend: Python HTTP Serve
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python3 main.py
+```
+
+Bez `DATABASE_URL` aplikacja uruchamia lokalną, testową bazę SQLite w pliku `reservations-local.db`. Ten plik jest ignorowany przez git i nie jest przenoszony na Supabase/Fly.
+
+Jeśli chcesz lokalnie pracować na oficjalnej bazie Supabase, utwórz `.env` z `DATABASE_URL`:
+
+```bash
 cp .env.example .env   # wklej DATABASE_URL (pooler Supabase)
 python3 main.py
 ```

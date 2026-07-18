@@ -34,7 +34,10 @@ def row_payload(row: object) -> dict[str, object]:
         "party_start_time": main.format_time(row["start_at"]),
         "children_count": row["children_count"],
         "adults_count": row["adults_count"],
+        "guest_total": row.get("guest_total") or "",
+        "reservation_type": row.get("reservation_type") or "banquet",
         "parent_name": row["parent_name"],
+        "parent_phone": row.get("parent_phone") or "",
         "birthday_child_name": row["birthday_child_name"],
         "birthday_child_age": row["birthday_child_age"],
         "birthday_children": birthday_children,
@@ -45,6 +48,10 @@ def row_payload(row: object) -> dict[str, object]:
         "animation_at": main.format_time(row["animation_at"]),
         "cake_enabled": bool(row["cake_enabled"]),
         "cake_theme": row["cake_theme"] or "",
+        "cake_weight": row.get("cake_weight") or "",
+        "cake_sponge": row.get("cake_sponge") or "",
+        "cake_filling": row.get("cake_filling") or "",
+        "cake_cream": row.get("cake_cream") or "",
         "cake_at": main.format_time(row["cake_at"]),
         "fruit_enabled": bool(row["fruit_enabled"]),
         "fruit_plates": row["fruit_plates"] or "",
@@ -218,6 +225,31 @@ LOCAL_SCRIPT = r"""
     return locations.length ? locations.join(", ") : EMPTY;
   }
 
+  function guestText(row) {
+    if ((row.reservation_type || "banquet") === "table") {
+      return `${Number(row.guest_total || row.children_count || 0)} os.`;
+    }
+    const children = Number(row.children_count || 0);
+    const adults = Number(row.adults_count || 0);
+    return `${children + adults} os. (${children} dzieci, ${adults} dorosłych)`;
+  }
+
+  function workshopChildrenText(row) {
+    return `${Number(row.children_count || 0)} dzieci`;
+  }
+
+  function cakeDetails(row) {
+    return [
+      ["Waga", row.cake_weight],
+      ["Biszkopt", row.cake_sponge],
+      ["Nadzienie", row.cake_filling],
+      ["Krem", row.cake_cream],
+    ]
+      .filter(([, value]) => String(value || "").trim())
+      .map(([label, value]) => `${label}: ${value}`)
+      .join(" · ");
+  }
+
   function selectedRows() {
     const date = dayToDate(state.day);
     return state.rows
@@ -241,9 +273,12 @@ LOCAL_SCRIPT = r"""
     const right = [];
     if (locationText(row) !== EMPTY) left.push(chip("location", locationText(row), ""));
     if (row.fruit_enabled) left.push(chip("kitchen", `Owoce (${row.fruit_plates || 0} tal.)`, ""));
-    if (row.cake_enabled) left.push(chip("cake", `Tort: ${row.cake_theme || "(brak)"}`, formatWindow(row.cake_at, serviceDurations.cake_at)));
+    if (row.cake_enabled) {
+      const cakeMeta = [formatWindow(row.cake_at, serviceDurations.cake_at), cakeDetails(row)].filter(Boolean).join(" · ");
+      left.push(chip("cake", `Tort: ${row.cake_theme || "(brak)"}`, cakeMeta));
+    }
     if (row.culinary_workshops_enabled) {
-      left.push(chip("kitchen", `Warsztaty: ${row.culinary_workshops_type || "(brak)"}`, formatWindow(row.culinary_workshops_at, serviceDurations.culinary_workshops_at)));
+      left.push(chip("kitchen", `Warsztaty: ${row.culinary_workshops_type || "(brak)"} (${workshopChildrenText(row)})`, formatWindow(row.culinary_workshops_at, serviceDurations.culinary_workshops_at)));
     }
     if (row.animation_enabled) right.push(chip("attraction", `Animacja: ${row.animation_type || "(brak)"}`, formatWindow(row.animation_at, serviceDurations.animation_at)));
     if (row.pinata_enabled) right.push(chip("attraction", `Piniata: ${row.pinata_theme || "(brak)"}`, formatWindow(row.pinata_at, serviceDurations.pinata_at)));
@@ -281,6 +316,7 @@ LOCAL_SCRIPT = r"""
             <div class="profile-tags">
               ${ageLabel(row) ? `<span class="profile-tag profile-tag-age">${escapeHtml(ageLabel(row))}</span>` : ""}
               ${row.child_location && row.child_location !== EMPTY ? `<span class="profile-tag profile-tag-room profile-tag-room-default">${escapeHtml(row.child_location)}</span>` : ""}
+              <span class="profile-tag profile-tag-guests">${escapeHtml(guestText(row))}</span>
             </div>
           </div>
           <div class="profile-guardian"><span>${escapeHtml(row.parent_name)}</span></div>
@@ -430,9 +466,12 @@ LOCAL_SCRIPT = r"""
       id: getValue(form, "id") || String(Date.now()),
       reservation_date: getValue(form, "reservation_date"),
       party_start_time: getValue(form, "party_start_time"),
+      reservation_type: getValue(form, "reservation_type") || "banquet",
       children_count: Number(getValue(form, "children_count") || 0),
       adults_count: Number(getValue(form, "adults_count") || 0),
+      guest_total: Number(getValue(form, "guest_total") || 0),
       parent_name: getValue(form, "parent_name"),
+      parent_phone: getValue(form, "parent_phone"),
       birthday_child_name: first.name,
       birthday_child_age: first.age,
       birthday_children: children,
@@ -443,6 +482,10 @@ LOCAL_SCRIPT = r"""
       animation_at: getValue(form, "animation_at"),
       cake_enabled: getChecked(form, "cake_enabled"),
       cake_theme: getValue(form, "cake_theme") || "(brak)",
+      cake_weight: getValue(form, "cake_weight"),
+      cake_sponge: getValue(form, "cake_sponge"),
+      cake_filling: getValue(form, "cake_filling"),
+      cake_cream: getValue(form, "cake_cream"),
       cake_at: getValue(form, "cake_at"),
       fruit_enabled: getChecked(form, "fruit_enabled"),
       fruit_plates: getValue(form, "fruit_plates"),
@@ -558,13 +601,23 @@ LOCAL_SCRIPT = r"""
     set("id", row.id);
     set("reservation_date", row.reservation_date);
     set("party_start_time", row.party_start_time);
+    const type = row.reservation_type || "banquet";
+    document.querySelectorAll('[name="reservation_type"]').forEach((input) => {
+      input.checked = input.value === type;
+    });
     set("children_count", row.children_count);
     set("adults_count", row.adults_count);
+    set("guest_total", row.guest_total);
     set("parent_name", row.parent_name);
+    set("parent_phone", row.parent_phone);
     set("child_location", row.child_location || EMPTY);
     set("animation_type", row.animation_type);
     set("animation_at", row.animation_at);
     set("cake_theme", row.cake_theme);
+    set("cake_weight", row.cake_weight);
+    set("cake_sponge", row.cake_sponge);
+    set("cake_filling", row.cake_filling);
+    set("cake_cream", row.cake_cream);
     set("cake_at", row.cake_at);
     set("fruit_plates", row.fruit_plates);
     set("culinary_workshops_type", row.culinary_workshops_type);
