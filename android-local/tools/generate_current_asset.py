@@ -52,6 +52,7 @@ def row_payload(row: object) -> dict[str, object]:
         "cake_sponge": row.get("cake_sponge") or "",
         "cake_filling": row.get("cake_filling") or "",
         "cake_cream": row.get("cake_cream") or "",
+        "cake_image_data": row.get("cake_image_data") or "",
         "cake_at": main.format_time(row["cake_at"]),
         "fruit_enabled": bool(row["fruit_enabled"]),
         "fruit_plates": row["fruit_plates"] or "",
@@ -486,6 +487,7 @@ LOCAL_SCRIPT = r"""
       cake_sponge: getValue(form, "cake_sponge"),
       cake_filling: getValue(form, "cake_filling"),
       cake_cream: getValue(form, "cake_cream"),
+      cake_image_data: getValue(form, "cake_image_data"),
       cake_at: getValue(form, "cake_at"),
       fruit_enabled: getChecked(form, "fruit_enabled"),
       fruit_plates: getValue(form, "fruit_plates"),
@@ -618,6 +620,7 @@ LOCAL_SCRIPT = r"""
     set("cake_sponge", row.cake_sponge);
     set("cake_filling", row.cake_filling);
     set("cake_cream", row.cake_cream);
+    set("cake_image_data", row.cake_image_data);
     set("cake_at", row.cake_at);
     set("fruit_plates", row.fruit_plates);
     set("culinary_workshops_type", row.culinary_workshops_type);

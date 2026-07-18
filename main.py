@@ -489,6 +489,7 @@ def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
             cake_sponge TEXT,
             cake_filling TEXT,
             cake_cream TEXT,
+            cake_image_data TEXT,
             cake_at TEXT,
             fruit_enabled INTEGER NOT NULL DEFAULT 0,
             fruit_plates INTEGER,
@@ -557,6 +558,7 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
         "cake_sponge": "TEXT",
         "cake_filling": "TEXT",
         "cake_cream": "TEXT",
+        "cake_image_data": "TEXT",
         "guest_total": "INTEGER",
         "reservation_type": "TEXT NOT NULL DEFAULT 'banquet'",
         "parent_phone": "TEXT",
@@ -871,6 +873,13 @@ def cake_detail_parts(row: DbRow | dict[str, object]) -> list[str]:
 
 def cake_details_label(row: DbRow | dict[str, object]) -> str:
     return " · ".join(cake_detail_parts(row))
+
+
+def cake_image_markup(row: DbRow | dict[str, object]) -> str:
+    image_data = str(row.get("cake_image_data") or "").strip()
+    if not image_data.startswith(("data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,")):
+        return ""
+    return f'<img class="kitchen-cake-photo" src="{escape(image_data)}" alt="Zdjęcie tortu">'
 
 
 def reservation_plan_tip(row: DbRow | dict[str, object]) -> str:
@@ -1321,14 +1330,21 @@ def validate_reservation(
     cake_sponge = data.get("cake_sponge", "").strip()
     cake_filling = data.get("cake_filling", "").strip()
     cake_cream = data.get("cake_cream", "").strip()
+    cake_image_data = data.get("cake_image_data", "").strip()
     if cake_enabled and not cake_theme:
         cake_theme = "(brak)"
+    if cake_enabled and cake_image_data:
+        if not cake_image_data.startswith(("data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,")):
+            errors["cake_image_data"] = "Wybierz poprawne zdjęcie tortu."
+        elif len(cake_image_data) > 1_500_000:
+            errors["cake_image_data"] = "Zdjęcie tortu jest za duże. Wybierz mniejszy plik."
     if not cake_enabled:
         cake_theme = ""
         cake_weight = ""
         cake_sponge = ""
         cake_filling = ""
         cake_cream = ""
+        cake_image_data = ""
 
     workshops_type = data.get("culinary_workshops_type", "").strip()
     if culinary_workshops_enabled and workshops_type not in WORKSHOP_TYPES:
@@ -1466,6 +1482,7 @@ def validate_reservation(
         "cake_sponge": cake_sponge or None,
         "cake_filling": cake_filling or None,
         "cake_cream": cake_cream or None,
+        "cake_image_data": cake_image_data or None,
         "cake_at": combine_day_time(reservation_day, cake_time) if cake_enabled else None,
         "fruit_enabled": fruit_enabled,
         "fruit_plates": fruit_plates if fruit_enabled else None,
@@ -1562,6 +1579,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["cake_sponge"],
         values["cake_filling"],
         values["cake_cream"],
+        values["cake_image_data"],
         values["cake_at"],
         values["fruit_enabled"],
         values["fruit_plates"],
@@ -1598,7 +1616,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
                 child_location = ?, adult_location = ?, animation_enabled = ?, animation_type = ?,
                 animation_at = ?, animations_json = ?,
                 cake_enabled = ?, cake_theme = ?, cake_weight = ?, cake_sponge = ?,
-                cake_filling = ?, cake_cream = ?, cake_at = ?,
+                cake_filling = ?, cake_cream = ?, cake_image_data = ?, cake_at = ?,
                 fruit_enabled = ?, fruit_plates = ?, fruit_at = ?,
                 drinks_enabled = ?, drinks_at = ?, culinary_workshops_enabled = ?,
                 culinary_workshops_type = ?, culinary_workshops_at = ?,
@@ -1624,7 +1642,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             start_at, end_at, children_count, adults_count, guest_total, reservation_type, parent_name,
             parent_phone, birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
             animation_enabled, animation_type, animation_at, animations_json, cake_enabled, cake_theme,
-            cake_weight, cake_sponge, cake_filling, cake_cream, cake_at,
+            cake_weight, cake_sponge, cake_filling, cake_cream, cake_image_data, cake_at,
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
             culinary_workshops_enabled, culinary_workshops_type, culinary_workshops_at,
             pinata_enabled, pinata_theme, pinata_at,
@@ -1634,7 +1652,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             notes, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -4874,6 +4892,94 @@ def page_template(
       font-weight: 800;
     }}
 
+    .cake-photo-control {{
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+    }}
+
+    .cake-photo-file {{
+      display: none;
+    }}
+
+    .cake-photo-trigger {{
+      width: 44px;
+      height: 44px;
+      min-height: 44px;
+      padding: 0;
+      border-radius: 999px;
+      background: var(--surface-strong);
+      color: var(--ink);
+      border: 1px solid var(--line);
+      grid-column: 2;
+    }}
+
+    .cake-photo-trigger svg {{
+      width: 22px;
+      height: 22px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+
+    .cake-photo-menu {{
+      position: absolute;
+      right: 0;
+      top: calc(44px + 8px);
+      z-index: 20;
+      min-width: 150px;
+      display: grid;
+      gap: 4px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #ffffff;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+    }}
+
+    .cake-photo-menu button {{
+      min-height: 36px;
+      justify-content: flex-start;
+      background: transparent;
+      color: var(--ink);
+      border: 0;
+      padding: 8px 10px;
+      font-size: 0.86rem;
+      font-weight: 800;
+    }}
+
+    .cake-photo-menu button:hover {{
+      background: #f3f3f3;
+    }}
+
+    .cake-photo-preview {{
+      grid-column: 1 / -1;
+      display: grid;
+      gap: 8px;
+    }}
+
+    .cake-photo-preview img {{
+      width: 100%;
+      height: auto;
+      object-fit: contain;
+      border: 1px solid var(--line);
+      background: #ffffff;
+    }}
+
+    .cake-photo-preview button {{
+      justify-self: start;
+      min-height: 34px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: #f3f3f3;
+      color: var(--danger);
+      font-size: 0.82rem;
+    }}
+
     .service-time {{
       grid-template-columns: minmax(104px, 128px) minmax(86px, 1fr);
     }}
@@ -5385,6 +5491,16 @@ def page_template(
       font-weight: 700;
       line-height: 1.35;
       word-break: break-word;
+    }}
+
+    .kitchen-cake-photo {{
+      display: block;
+      width: min(260px, 100%);
+      height: auto;
+      object-fit: contain;
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      background: #ffffff;
     }}
 
     .role-extra {{
@@ -6700,6 +6816,7 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "cake_sponge": "",
         "cake_filling": "",
         "cake_cream": "",
+        "cake_image_data": "",
         "cake_at": "",
         "fruit_enabled": 0,
         "fruit_plates": "",
@@ -7488,7 +7605,30 @@ def render_fruit_plates_input(values: dict[str, object], errors: dict[str, str])
 
 
 def render_cake_theme_input(values: dict[str, object], errors: dict[str, str]) -> str:
+    cake_image = str(values.get("cake_image_data") or "")
+    preview_class = "cake-photo-preview" if cake_image else "cake-photo-preview is-hidden"
+    preview_image = f'<img src="{escape(cake_image)}" alt="Zdjęcie tortu">' if cake_image else '<img alt="Zdjęcie tortu">'
     return f"""
+        <div class="cake-photo-control service-extra">
+          <input type="hidden" name="cake_image_data" id="cake_image_data" value="{escape(cake_image)}">
+          <input type="file" id="cake_camera_input" accept="image/*" capture="environment" class="cake-photo-file" aria-hidden="true">
+          <input type="file" id="cake_gallery_input" accept="image/*" class="cake-photo-file" aria-hidden="true">
+          <button type="button" class="cake-photo-trigger" id="cake_photo_trigger" aria-label="Dodaj zdjęcie tortu">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h2l1.3-2h4.4l1.3 2h2A2.5 2.5 0 0 1 20 8.5v8A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5v-8Z"/>
+              <circle cx="12" cy="12.5" r="3.5"/>
+            </svg>
+          </button>
+          <div class="cake-photo-menu is-hidden" id="cake_photo_menu">
+            <button type="button" id="cake_camera_btn">Aparat</button>
+            <button type="button" id="cake_gallery_btn">Galeria</button>
+          </div>
+          <div class="{preview_class}" id="cake_photo_preview">
+            {preview_image}
+            <button type="button" id="cake_photo_remove" aria-label="Usuń zdjęcie tortu">Usuń zdjęcie</button>
+          </div>
+          {error_for(errors, "cake_image_data")}
+        </div>
         <label class="service-extra">
           Motyw tortu
           <input name="cake_theme" value="{escape(values.get("cake_theme", ""))}" placeholder="(brak)">
@@ -8103,7 +8243,7 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
             cake_details = cake_details_label(row)
             if cake_details:
                 cake_meta = f"{cake_meta} · {cake_details}"
-            task_items.append((format_time(row["cake_at"]), "Tort", cake_meta, cake_window))
+            task_items.append((format_time(row["cake_at"]), "Tort", cake_meta, cake_window, cake_image_markup(row)))
 
         if has_workshops:
             workshop_name = row["culinary_workshops_type"] or "Warsztaty"
@@ -8123,6 +8263,7 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
             meta = escape(item[2])
             if len(item) > 3 and item[3]:
                 meta = f"{meta} · {escape(item[3])}"
+            image_markup = item[4] if len(item) > 4 else ""
             task_blocks.append(
                 f"""
               <div class="banquet-task kitchen-task">
@@ -8130,6 +8271,7 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
                 <div class="task-detail">
                   <div class="task-label">{escape(item[1])}</div>
                   <div class="task-meta">{meta}</div>
+                  {image_markup}
                 </div>
               </div>
             """
@@ -8239,7 +8381,7 @@ def render_schema_summary() -> str:
         "child_location / adult_location",
         "animation_enabled / animation_type / animation_at / animations_json",
         "cake_enabled / cake_theme / cake_at",
-        "cake_weight / cake_sponge / cake_filling / cake_cream",
+        "cake_weight / cake_sponge / cake_filling / cake_cream / cake_image_data",
         "fruit_enabled / fruit_plates / fruit_at",
         "culinary_workshops_enabled / culinary_workshops_type / culinary_workshops_at",
         "pinata_enabled / pinata_theme / pinata_at",
@@ -8356,6 +8498,15 @@ def room_plan_script() -> str:
   const addBirthdayBtn = document.getElementById("add-birthday-child");
   const animationList = document.getElementById("animation-list");
   const addAnimationBtn = document.getElementById("add-animation-row");
+  const cakeImageInput = document.getElementById("cake_image_data");
+  const cakeCameraInput = document.getElementById("cake_camera_input");
+  const cakeGalleryInput = document.getElementById("cake_gallery_input");
+  const cakePhotoTrigger = document.getElementById("cake_photo_trigger");
+  const cakePhotoMenu = document.getElementById("cake_photo_menu");
+  const cakeCameraBtn = document.getElementById("cake_camera_btn");
+  const cakeGalleryBtn = document.getElementById("cake_gallery_btn");
+  const cakePhotoPreview = document.getElementById("cake_photo_preview");
+  const cakePhotoRemove = document.getElementById("cake_photo_remove");
   const reservationTypeInputs = Array.from(document.querySelectorAll('input[name="reservation_type"]'));
   const childrenCountInput = document.querySelector('input[name="children_count"]');
   const adultsCountInput = document.querySelector('input[name="adults_count"]');
@@ -8829,6 +8980,84 @@ def room_plan_script() -> str:
     animationList.querySelectorAll(".animation-row").forEach((row) => bindAnimationRow(row));
   }
 
+  function setCakePhotoPreview(dataUrl) {
+    if (!cakeImageInput || !cakePhotoPreview) return;
+    const image = cakePhotoPreview.querySelector("img");
+    cakeImageInput.value = dataUrl || "";
+    cakePhotoPreview.classList.toggle("is-hidden", !dataUrl);
+    if (image) {
+      if (dataUrl) image.src = dataUrl;
+      else image.removeAttribute("src");
+    }
+  }
+
+  function compressCakePhoto(file) {
+    return new Promise((resolve, reject) => {
+      if (!file || !file.type || !file.type.startsWith("image/")) {
+        reject(new Error("Wybierz zdjęcie."));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Nie udało się odczytać zdjęcia."));
+      reader.onload = () => {
+        const source = String(reader.result || "");
+        const image = new Image();
+        image.onerror = () => reject(new Error("Nie udało się przygotować zdjęcia."));
+        image.onload = () => {
+          const maxSide = 1100;
+          const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(image.width * scale));
+          canvas.height = Math.max(1, Math.round(image.height * scale));
+          const context = canvas.getContext("2d");
+          if (!context) {
+            reject(new Error("Nie udało się przygotować zdjęcia."));
+            return;
+          }
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/jpeg", 0.78));
+        };
+        image.src = source;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function bindCakePhotoInput(input) {
+    input?.addEventListener("change", () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      compressCakePhoto(file)
+        .then((dataUrl) => {
+          if (String(dataUrl).length > 1500000) {
+            window.alert("Zdjęcie jest za duże. Wybierz mniejszy plik.");
+            return;
+          }
+          setCakePhotoPreview(String(dataUrl));
+        })
+        .catch((error) => window.alert(error.message || "Nie udało się dodać zdjęcia."));
+      input.value = "";
+    });
+  }
+
+  function bindCakePhotoControls() {
+    if (!cakeImageInput) return;
+    cakePhotoTrigger?.addEventListener("click", () => {
+      cakePhotoMenu?.classList.toggle("is-hidden");
+    });
+    cakeCameraBtn?.addEventListener("click", () => {
+      cakePhotoMenu?.classList.add("is-hidden");
+      cakeCameraInput?.click();
+    });
+    cakeGalleryBtn?.addEventListener("click", () => {
+      cakePhotoMenu?.classList.add("is-hidden");
+      cakeGalleryInput?.click();
+    });
+    cakePhotoRemove?.addEventListener("click", () => setCakePhotoPreview(""));
+    bindCakePhotoInput(cakeCameraInput);
+    bindCakePhotoInput(cakeGalleryInput);
+  }
+
   if (addBirthdayBtn && birthdayList) {
     addBirthdayBtn.addEventListener("click", () => {
       const row = document.createElement("div");
@@ -8877,6 +9106,8 @@ def room_plan_script() -> str:
     bindAnimations();
   }
 
+  bindCakePhotoControls();
+
   catalogItems.forEach((item) => {
     const checkbox = item.querySelector(".service-enabled-input");
     const toggleBtn = item.querySelector(".service-catalog-head .service-toggle-btn");
@@ -8893,6 +9124,9 @@ def room_plan_script() -> str:
         if (item.dataset.service === "animation_enabled" && animationList) {
           const rows = Array.from(animationList.querySelectorAll(".animation-row"));
           rows.slice(1).forEach((row) => row.remove());
+        }
+        if (item.dataset.service === "cake_enabled") {
+          setCakePhotoPreview("");
         }
       }
       updateCatalogItem(item);
@@ -9004,6 +9238,7 @@ CREATE TABLE reservations (
   cake_sponge TEXT,
   cake_filling TEXT,
   cake_cream TEXT,
+  cake_image_data TEXT,
   cake_at TIMESTAMPTZ,
   fruit_enabled BOOLEAN NOT NULL DEFAULT false,
   fruit_plates INT,

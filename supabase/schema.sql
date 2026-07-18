@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     cake_sponge TEXT,
     cake_filling TEXT,
     cake_cream TEXT,
+    cake_image_data TEXT,
     cake_at TEXT,
     fruit_enabled INTEGER NOT NULL DEFAULT 0,
     fruit_plates INTEGER,
