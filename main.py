@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import psycopg
 from dotenv import load_dotenv
@@ -33,9 +34,10 @@ load_dotenv(Path(__file__).with_name(".env"))
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
 # Bump only when service-worker logic changes. Icon URLs use logo mtime separately.
-PWA_CACHE_NAME = "ikidspark-pwa-v16"
+PWA_CACHE_NAME = "ikidspark-pwa-v17"
 PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
 PWA_MANIFEST_ID = "/"
+APP_TIMEZONE = ZoneInfo(os.environ.get("IKIDS_TIMEZONE", "Europe/Warsaw"))
 DbRow = dict[str, Any]
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DB_MODE = os.environ.get("IKIDS_DB_MODE", "").strip().lower()
@@ -655,12 +657,16 @@ def normalize_day(day: str | None) -> str:
     return "today"
 
 
+def current_app_date() -> date:
+    return datetime.now(APP_TIMEZONE).date()
+
+
 def selected_day(day_key: str) -> date:
     if day_key in DAY_FILTERS:
         _, offset = DAY_FILTERS[day_key]
-        return date.today() + timedelta(days=offset)
+        return current_app_date() + timedelta(days=offset)
     parsed = parse_date_for_api(day_key)
-    return parsed if parsed is not None else date.today()
+    return parsed if parsed is not None else current_app_date()
 
 
 def week_start(target_day: date) -> date:
@@ -2171,6 +2177,10 @@ function fetchWithTimeout(url, ms) {
   return fetch(url, { signal: ctrl.signal, cache: "reload" }).finally(() => clearTimeout(timer));
 }
 
+function fetchFresh(request) {
+  return fetch(request, { cache: "no-store" });
+}
+
 self.addEventListener("install", (event) => {
   // Never use cache.addAll — one hung request freezes Chrome on "Instaluje aplikację…".
   event.waitUntil((async () => {
@@ -2200,13 +2210,7 @@ self.addEventListener("fetch", (event) => {
 
   if (event.request.mode === "navigate") {
     event.respondWith(
-      fetch(event.request)
-        .then((response) => {
-          const copy = response.clone();
-          caches.open(IKIDS_CACHE).then((cache) => cache.put(event.request, copy)).catch(() => undefined);
-          return response;
-        })
-        .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/offline")))
+      fetchFresh(event.request).catch(() => caches.match("/offline"))
     );
     return;
   }
@@ -6734,7 +6738,7 @@ def render_nav(page_role: str, day: str) -> str:
         role_links_by_key["organizer"],
     ]
 
-    strip_anchor_day = date.today()
+    strip_anchor_day = current_app_date()
     active_week_offset = week_page_offset_for_day(strip_anchor_day, target_day)
     week_pages = calendar_week_pages(strip_anchor_day, include_day=target_day)
     week_blocks = []
