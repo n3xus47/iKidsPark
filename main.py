@@ -34,7 +34,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
 # Bump only when service-worker logic changes. Icon URLs use logo mtime separately.
-PWA_CACHE_NAME = "ikidspark-pwa-v17"
+PWA_CACHE_NAME = "ikidspark-pwa-v18"
 PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
 PWA_MANIFEST_ID = "/"
 APP_TIMEZONE = ZoneInfo(os.environ.get("IKIDS_TIMEZONE", "Europe/Warsaw"))
@@ -2194,6 +2194,18 @@ function fetchFresh(request) {
   return fetch(request, { cache: "no-store" });
 }
 
+function shouldFetchFresh(request) {
+  const accept = request.headers.get("accept") || "";
+  if (request.headers.has("X-IKids-Navigation")) return true;
+  if (accept.includes("text/html")) return true;
+  try {
+    const url = new URL(request.url);
+    return url.pathname === "/" || url.pathname === "/schema" || url.pathname === "/history" || url.pathname.startsWith("/api/");
+  } catch (_) {
+    return false;
+  }
+}
+
 self.addEventListener("install", (event) => {
   // Never use cache.addAll — one hung request freezes Chrome on "Instaluje aplikację…".
   event.waitUntil((async () => {
@@ -2221,7 +2233,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
 
-  if (event.request.mode === "navigate") {
+  if (event.request.mode === "navigate" || shouldFetchFresh(event.request)) {
     event.respondWith(
       fetchFresh(event.request).catch(() => caches.match("/offline"))
     );
@@ -2709,6 +2721,7 @@ def fast_navigation_script() -> str:
         if (cached) pageCache.delete(key);
         const response = await fetch(key, {
           credentials: "same-origin",
+          cache: "no-store",
           headers: { "X-IKids-Navigation": "1" },
         });
         const contentType = response.headers.get("content-type") || "";
