@@ -44,6 +44,8 @@ CREATE TABLE reservations (
   mascot_enabled BOOLEAN NOT NULL DEFAULT false,
   attraction_at TIMESTAMPTZ,
   notes TEXT NOT NULL DEFAULT '',
+  assigned_waiter TEXT,
+  assigned_animator TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'cancelled')),
   cancellation_reason TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

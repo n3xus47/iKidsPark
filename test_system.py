@@ -446,8 +446,47 @@ def test_edit_and_cancel() -> None:
             fail(f"Anulowanie id={cancel_id}", f"status={status}")
 
 
+def test_staff_assignment() -> None:
+    section("8. Przypisywanie obsługi")
+
+    if not created_ids:
+        fail("Przypisywanie obsługi — brak rezerwacji")
+        return
+
+    rid = created_ids[0]
+    waiter = main.WAITERS[0]
+    status, _, _ = http_post("/assign-waiter", {"id": str(rid), "waiter": waiter}, "role=manager")
+    assigned = main.get_reservation(rid)
+    if status in (200, 303) and assigned and assigned["assigned_waiter"] == waiter:
+        ok("Przypisanie kelnera", waiter)
+    else:
+        fail("Przypisanie kelnera", f"status={status}")
+
+    animator = main.ANIMATORS[0]
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": animator}, "role=manager")
+    assigned = main.get_reservation(rid)
+    if status in (200, 303) and assigned and assigned["assigned_animator"] == animator:
+        ok("Przypisanie animatora", animator)
+    else:
+        fail("Przypisanie animatora", f"status={status}")
+
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": "Nie ma takiej osoby"}, "role=manager")
+    still_assigned = main.get_reservation(rid)
+    if status in (200, 303) and still_assigned and still_assigned["assigned_animator"] == animator:
+        ok("Nieprawidłowy animator odrzucony")
+    else:
+        fail("Nieprawidłowy animator", f"status={status}")
+
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": ""}, "role=manager")
+    removed = main.get_reservation(rid)
+    if status in (200, 303) and removed and not removed["assigned_animator"]:
+        ok("Usunięcie przypisania animatora")
+    else:
+        fail("Usunięcie przypisania animatora", f"status={status}")
+
+
 def test_history_page() -> None:
-    section("8. Strona historii zmian")
+    section("9. Strona historii zmian")
 
     if not created_ids:
         fail("Historia — brak rezerwacji")
@@ -466,7 +505,7 @@ def test_history_page() -> None:
 
 
 def test_role_views_with_data() -> None:
-    section("9. Widoki ról z danymi testowymi")
+    section("10. Widoki ról z danymi testowymi")
 
     for role, day, label in [
         ("manager", "2026-07-17", "Kierownik — 17 lipca"),
@@ -487,7 +526,7 @@ def test_role_views_with_data() -> None:
 
 
 def test_multiple_birthday_children() -> None:
-    section("10. Wielu solenizantów")
+    section("11. Wielu solenizantów")
 
     # Osobny dzień (20.07) — sala nie może być zajęta 2x w tym samym dniu
     data = base_reservation("2026-07-20", "6. Football", "Pozostałe stoliki - Stolik 17", "10:00", "", "Rodzic Multi")
@@ -508,7 +547,7 @@ def test_multiple_birthday_children() -> None:
 
 
 def test_delete_reservation() -> None:
-    section("11. Usuwanie rezerwacji")
+    section("12. Usuwanie rezerwacji")
 
     if not created_ids:
         fail("Usuwanie — brak rezerwacji")
@@ -533,7 +572,7 @@ def test_delete_reservation() -> None:
 
 
 def test_csv_export() -> None:
-    section("12. Eksport CSV")
+    section("13. Eksport CSV")
 
     try:
         status, body, headers = http_get("/export")
@@ -588,6 +627,7 @@ def main_test() -> int:
     test_availability_after_create()
     test_conflict_detection()
     test_edit_and_cancel()
+    test_staff_assignment()
     test_history_page()
     test_role_views_with_data()
     test_multiple_birthday_children()

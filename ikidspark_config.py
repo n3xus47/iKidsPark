@@ -314,6 +314,23 @@ WAITERS = (
     "Jan Ostrykiewicz",
 )
 
+ANIMATORS = (
+    "Weronika Gołębowska",
+    "Sandra Rutkowska",
+    "Karol Pańczyk",
+    "Damian Jaźwiec",
+    "Alicja Fitzner",
+    "Anastazja Adaszak",
+    "Jan Pietrzuszyński",
+    "Ania Pilarczyk",
+    "Vladyslav Lapshchun",
+    "Kornelia Kowalska",
+    "Kinga Piotrowska",
+    "Natalia Marcińczak",
+    "Mateusz Kańduła",
+    "Julia Juszczak",
+)
+
 SERVICE_OVERLAP_MESSAGE = "Godziny dodatków w tej rezerwacji nie mogą się nakładać."
 
 STATUS_LABELS = {
@@ -331,4 +348,3 @@ SERVICE_DURATIONS = {
     "pinata_at": 20,
     "mascot_at": 20,
 }
-

@@ -32,6 +32,7 @@ from ikidspark_config import (
     ALL_LOCATIONS,
     ANIMATION_GROUPS,
     ANIMATION_TYPES,
+    ANIMATORS,
     CAKE_CANDLE_LABELS,
     CAKE_CANDLE_TYPES,
     DAY_FILTERS,
@@ -226,6 +227,7 @@ def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
             attraction_at TEXT,
             notes TEXT NOT NULL DEFAULT '',
             assigned_waiter TEXT,
+            assigned_animator TEXT,
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
             cancellation_reason TEXT,
             created_at TEXT NOT NULL,
@@ -278,6 +280,8 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
         "guest_total": "INTEGER",
         "reservation_type": "TEXT NOT NULL DEFAULT 'banquet'",
         "parent_phone": "TEXT",
+        "assigned_waiter": "TEXT",
+        "assigned_animator": "TEXT",
     }
     for column, definition in schema_columns.items():
         if column in columns:
@@ -358,6 +362,10 @@ def can_modify_reservations(role: str) -> bool:
 
 
 def can_assign_waiter(role: str) -> bool:
+    return normalize_role(role) == "manager"
+
+
+def can_assign_animator(role: str) -> bool:
     return normalize_role(role) == "manager"
 
 
@@ -619,10 +627,13 @@ def reservation_plan_tip(row: DbRow | dict[str, object]) -> str:
             child_part = str(row.get("birthday_child_name") or "Solenizant").strip()
     if isinstance(row, dict):
         waiter = str(row.get("assigned_waiter") or "").strip()
+        animator = str(row.get("assigned_animator") or "").strip()
     else:
         waiter = str(row["assigned_waiter"] or "").strip() if "assigned_waiter" in row.keys() else ""
+        animator = str(row["assigned_animator"] or "").strip() if "assigned_animator" in row.keys() else ""
     waiter_part = waiter if waiter else "brak kelnera"
-    return f"{child_part} · {waiter_part}"
+    animator_part = animator if animator else "brak animatora"
+    return f"{child_part} · {waiter_part} · {animator_part}"
 
 
 def banquet_info_title(row: DbRow | dict[str, object]) -> str:
@@ -1413,6 +1424,28 @@ def assign_waiter(reservation_id: int, waiter: str | None, role: str) -> bool:
     return True
 
 
+def assign_animator(reservation_id: int, animator: str | None, role: str) -> bool:
+    row = get_reservation(reservation_id)
+    if row is None:
+        return False
+
+    animator_value = animator.strip() if animator and animator.strip() else None
+    if animator_value is not None and animator_value not in ANIMATORS:
+        return False
+
+    execute(
+        "UPDATE reservations SET assigned_animator = ?, updated_at = ? WHERE id = ?",
+        (animator_value, now_iso(), reservation_id),
+    )
+    updated = get_reservation(reservation_id)
+    if updated is None:
+        return False
+
+    action = "animator_assigned" if animator_value else "animator_removed"
+    record_history(reservation_id, action, role, updated)
+    return True
+
+
 def delete_reservation(reservation_id: int) -> bool:
     existing = get_reservation(reservation_id)
     if existing is None:
@@ -1492,7 +1525,7 @@ def availability_for(
     rows = db_rows(
         f"""
         SELECT id, start_at, end_at, parent_name, birthday_child_name, birthday_child_age,
-               birthday_children_json, assigned_waiter, child_location, adult_location, status
+               birthday_children_json, assigned_waiter, assigned_animator, child_location, adult_location, status
         FROM reservations
         WHERE status = 'active'
           AND start_at < ?
@@ -7160,6 +7193,52 @@ def render_waiter_assignment(row: DbRow, role: str, day: str) -> str:
     """
 
 
+def render_animator_assignment(row: DbRow, role: str, day: str) -> str:
+    if not can_assign_animator(role):
+        return ""
+
+    reservation_id = int(row["id"])
+    assigned = str(row["assigned_animator"] or "").strip()
+    action = f"/assign-animator?role={escape(role)}&day={escape(day)}"
+    available_animators = [name for name in ANIMATORS if name != assigned]
+    options = "".join(
+        f"""
+        <form method="post" action="{action}" class="waiter-option-form">
+          <input type="hidden" name="id" value="{reservation_id}">
+          <input type="hidden" name="animator" value="{escape(name)}">
+          <button type="submit" class="button secondary waiter-option">{escape(name)}</button>
+        </form>
+        """
+        for name in available_animators
+    )
+    empty_options = '<span class="muted">Brak innych animatorów</span>' if assigned else '<span class="muted">Brak animatorów</span>'
+
+    if assigned:
+        return f"""
+      <div class="waiter-assignment is-assigned">
+        <span class="waiter-assignment-label">Animator: <strong>{escape(assigned)}</strong></span>
+        <details class="waiter-picker">
+          <summary class="button secondary">Zmień</summary>
+          <div class="waiter-options">{options or empty_options}</div>
+        </details>
+        <form method="post" action="{action}" class="inline-form">
+          <input type="hidden" name="id" value="{reservation_id}">
+          <input type="hidden" name="animator" value="">
+          <button type="submit" class="button secondary waiter-remove-btn">Usuń</button>
+        </form>
+      </div>
+    """
+
+    return f"""
+      <div class="waiter-assignment">
+        <details class="waiter-picker">
+          <summary class="button secondary">Przypisz animatora</summary>
+          <div class="waiter-options">{options or empty_options}</div>
+        </details>
+      </div>
+    """
+
+
 def render_profile_identity(row: DbRow | dict[str, object]) -> str:
     if is_table_reservation(row):
         name_markup = f"Rezerwacja: {escape(str(row.get('parent_name') or 'gość'))}"
@@ -7295,6 +7374,7 @@ def render_reservation_details(
 
     footer = f'<footer class="timeline-footer">{footer_markup}</footer>' if footer_markup else ""
     waiter_markup = render_waiter_assignment(row, role, day) if assign_waiter else ""
+    animator_markup = render_animator_assignment(row, role, day) if assign_waiter else ""
     color_attr = f' style="--reservation-color: {escape(color)}"' if color else ""
     color_class = " has-color" if color else ""
 
@@ -7304,6 +7384,7 @@ def render_reservation_details(
           <time class="timeline-start" datetime="{escape(str(row['start_at']))}">{start_label}</time>
           {render_profile_identity(row)}
           {waiter_markup}
+          {animator_markup}
           {render_profile_guardian(row)}
           {status_markup}
         </header>
@@ -9445,6 +9526,26 @@ class ReservationHandler(BaseHTTPRequestHandler):
                 self.redirect(link_for(work_role, day, message=message))
             else:
                 self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować kelnera."))
+            return
+
+        if parsed.path == "/assign-animator":
+            if not can_assign_animator(work_role):
+                self.redirect(link_for(page_role, day, message="Brak uprawnień do przypisania animatora."))
+                return
+            raw_id = data.get("id", "")
+            if not raw_id.isdigit():
+                self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji."))
+                return
+            animator = data.get("animator", "")
+            if assign_animator(int(raw_id), animator or None, work_role):
+                message = (
+                    "Animator został przypisany."
+                    if animator.strip()
+                    else "Przypisanie animatora zostało usunięte."
+                )
+                self.redirect(link_for(work_role, day, message=message))
+            else:
+                self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować animatora."))
             return
 
         payload = json.dumps({"error": "Unsupported route"}, ensure_ascii=False).encode("utf-8")
