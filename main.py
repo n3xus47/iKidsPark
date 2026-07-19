@@ -161,6 +161,8 @@ ANIMATION_GROUPS = {
 
 ANIMATION_TYPES = [name for names in ANIMATION_GROUPS.values() for name in names]
 WORKSHOP_TYPES = ["Pizza", "Burger", "Piernik", "Shake"]
+CAKE_CANDLE_TYPES = ["cyfra", "zwykla", "wlasna"]
+CAKE_CANDLE_LABELS = {"cyfra": "cyfra", "zwykla": "zwyk\u0142a", "wlasna": "w\u0142asna"}
 MASCOT_TYPES = ["Lew", "Pan Królik", "Pani Królik", "Miś"]
 
 # Interactive hotspots for the floor plan (asset canvas 1440 x 810; display crops empty margins).
@@ -492,6 +494,7 @@ def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
             cake_filling TEXT,
             cake_cream TEXT,
             cake_image_data TEXT,
+            cake_candle TEXT,
             cake_at TEXT,
             fruit_enabled INTEGER NOT NULL DEFAULT 0,
             fruit_plates INTEGER,
@@ -561,6 +564,7 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
         "cake_filling": "TEXT",
         "cake_cream": "TEXT",
         "cake_image_data": "TEXT",
+        "cake_candle": "TEXT",
         "guest_total": "INTEGER",
         "reservation_type": "TEXT NOT NULL DEFAULT 'banquet'",
         "parent_phone": "TEXT",
@@ -868,10 +872,13 @@ def cake_detail_parts(row: DbRow | dict[str, object]) -> list[str]:
         ("Biszkopt", "cake_sponge"),
         ("Nadzienie", "cake_filling"),
         ("Krem", "cake_cream"),
+        ("\u015awieczka", "cake_candle"),
     )
     parts: list[str] = []
     for label, field in labels:
         value_text = str(row.get(field) or "").strip()
+        if field == "cake_candle":
+            value_text = CAKE_CANDLE_LABELS.get(value_text, value_text)
         if value_text:
             parts.append(f"{label}: {value_text}")
     return parts
@@ -1337,8 +1344,11 @@ def validate_reservation(
     cake_filling = data.get("cake_filling", "").strip()
     cake_cream = data.get("cake_cream", "").strip()
     cake_image_data = data.get("cake_image_data", "").strip()
+    cake_candle = data.get("cake_candle", "").strip()
     if cake_enabled and not cake_theme:
         cake_theme = "(brak)"
+    if cake_enabled and cake_candle and cake_candle not in CAKE_CANDLE_TYPES:
+        errors["cake_candle"] = "Wybierz rodzaj \u015bwieczki."
     if cake_enabled and cake_image_data:
         if not cake_image_data.startswith(("data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,")):
             errors["cake_image_data"] = "Wybierz poprawne zdjęcie tortu."
@@ -1351,6 +1361,7 @@ def validate_reservation(
         cake_filling = ""
         cake_cream = ""
         cake_image_data = ""
+        cake_candle = ""
 
     workshops_type = data.get("culinary_workshops_type", "").strip()
     if culinary_workshops_enabled and workshops_type not in WORKSHOP_TYPES:
@@ -1489,6 +1500,7 @@ def validate_reservation(
         "cake_filling": cake_filling or None,
         "cake_cream": cake_cream or None,
         "cake_image_data": cake_image_data or None,
+        "cake_candle": cake_candle or None,
         "cake_at": combine_day_time(reservation_day, cake_time) if cake_enabled else None,
         "fruit_enabled": fruit_enabled,
         "fruit_plates": fruit_plates if fruit_enabled else None,
@@ -1586,6 +1598,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["cake_filling"],
         values["cake_cream"],
         values["cake_image_data"],
+        values["cake_candle"],
         values["cake_at"],
         values["fruit_enabled"],
         values["fruit_plates"],
@@ -1622,7 +1635,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
                 child_location = ?, adult_location = ?, animation_enabled = ?, animation_type = ?,
                 animation_at = ?, animations_json = ?,
                 cake_enabled = ?, cake_theme = ?, cake_weight = ?, cake_sponge = ?,
-                cake_filling = ?, cake_cream = ?, cake_image_data = ?, cake_at = ?,
+                cake_filling = ?, cake_cream = ?, cake_image_data = ?, cake_candle = ?, cake_at = ?,
                 fruit_enabled = ?, fruit_plates = ?, fruit_at = ?,
                 drinks_enabled = ?, drinks_at = ?, culinary_workshops_enabled = ?,
                 culinary_workshops_type = ?, culinary_workshops_at = ?,
@@ -1648,7 +1661,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             start_at, end_at, children_count, adults_count, guest_total, reservation_type, parent_name,
             parent_phone, birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
             animation_enabled, animation_type, animation_at, animations_json, cake_enabled, cake_theme,
-            cake_weight, cake_sponge, cake_filling, cake_cream, cake_image_data, cake_at,
+            cake_weight, cake_sponge, cake_filling, cake_cream, cake_image_data, cake_candle, cake_at,
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
             culinary_workshops_enabled, culinary_workshops_type, culinary_workshops_at,
             pinata_enabled, pinata_theme, pinata_at,
@@ -1658,7 +1671,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             notes, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -2378,6 +2391,43 @@ def date_navigation_script() -> str:
       strip.dataset.dateNavReady = "true";
 
       const weeks = () => [...strip.querySelectorAll(".date-week")];
+      const finePointer = window.matchMedia?.("(pointer: fine)")?.matches === true;
+      const toolbar = strip.closest(".date-toolbar");
+
+      function buildWeekButton(direction) {
+        const button = document.createElement("button");
+        button.className = `date-week-jump date-week-jump-${direction}`;
+        button.type = "button";
+        button.setAttribute(`data-date-week-${direction}`, "");
+        button.setAttribute("aria-label", direction === "prev" ? "Poprzedni tydzień" : "Następny tydzień");
+        button.innerHTML = direction === "prev"
+          ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>'
+          : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+        return button;
+      }
+
+      function ensureWeekButtons() {
+        if (!toolbar) return { prev: null, next: null };
+        let prev = toolbar.querySelector("[data-date-week-prev]");
+        let next = toolbar.querySelector("[data-date-week-next]");
+        if (!prev) {
+          prev = buildWeekButton("prev");
+          toolbar.insertBefore(prev, strip);
+        }
+        if (!next) {
+          next = buildWeekButton("next");
+          toolbar.appendChild(next);
+        }
+        prev.hidden = false;
+        next.hidden = false;
+        prev.disabled = false;
+        next.disabled = false;
+        return { prev, next };
+      }
+
+      const weekButtons = ensureWeekButtons();
+      const prevWeekButton = weekButtons.prev;
+      const nextWeekButton = weekButtons.next;
 
       function scrollToWeek(week, behavior = "auto") {
         if (!week) return;
@@ -2395,6 +2445,38 @@ def date_navigation_script() -> str:
         scrollToWeek(nearest);
       }
 
+      function nearestWeek() {
+        const pages = weeks();
+        if (!pages.length) return null;
+        const targetLeft = strip.scrollLeft;
+        return pages.reduce((best, week) => {
+          const distance = Math.abs(week.offsetLeft - targetLeft);
+          return distance < best.distance ? { week, distance } : best;
+        }, { week: pages[0], distance: Number.POSITIVE_INFINITY }).week;
+      }
+
+      function updateWeekButtons() {
+        if (prevWeekButton) prevWeekButton.disabled = false;
+        if (nextWeekButton) nextWeekButton.disabled = false;
+      }
+
+      function shiftWeek(direction) {
+        const pages = weeks();
+        const current = nearestWeek();
+        const currentIndex = current ? pages.indexOf(current) : -1;
+        if (currentIndex < 0) return;
+        const nextIndex = Math.max(0, Math.min(pages.length - 1, currentIndex + direction));
+        const next = pages[nextIndex];
+        if (!next || next === current) return;
+        showMonthLabel();
+        scrollToWeek(next, "smooth");
+        window.setTimeout(() => {
+          updateMonthLabel();
+          updateWeekButtons();
+          hideMonthLabel();
+        }, 260);
+      }
+
       let initialScroll = true;
       let stripUserActive = false;
       let scrollIdleTimer = 0;
@@ -2406,6 +2488,7 @@ def date_navigation_script() -> str:
         window.setTimeout(() => {
           initialScroll = false;
           hideMonthLabel();
+          updateWeekButtons();
         }, 150);
       }
 
@@ -2434,6 +2517,7 @@ def date_navigation_script() -> str:
       });
 
       strip.addEventListener("mousedown", (event) => {
+        if (finePointer) return;
         if (event.button !== 0) return;
         dragActive = true;
         dragMoved = false;
@@ -2443,6 +2527,7 @@ def date_navigation_script() -> str:
       });
 
       window.addEventListener("mousemove", (event) => {
+        if (finePointer) return;
         if (!dragActive) return;
         const delta = event.pageX - startX;
         if (!dragMoved && Math.abs(delta) > 5) {
@@ -2512,16 +2597,6 @@ def date_navigation_script() -> str:
 
       const monthLabel = document.querySelector("[data-date-month-label]");
 
-      function nearestWeek() {
-        const pages = weeks();
-        if (!pages.length) return null;
-        const targetLeft = strip.scrollLeft;
-        return pages.reduce((best, week) => {
-          const distance = Math.abs(week.offsetLeft - targetLeft);
-          return distance < best.distance ? { week, distance } : best;
-        }, { week: pages[0], distance: Number.POSITIVE_INFINITY }).week;
-      }
-
       function updateMonthLabel() {
         if (!monthLabel) return;
         const week = nearestWeek();
@@ -2561,6 +2636,7 @@ def date_navigation_script() -> str:
       strip.addEventListener("scroll", () => {
         if (!stripUserActive) return;
         updateMonthLabel();
+        updateWeekButtons();
         if (!("onscrollend" in strip)) {
           window.clearTimeout(scrollIdleTimer);
           scrollIdleTimer = window.setTimeout(() => {
@@ -2569,6 +2645,10 @@ def date_navigation_script() -> str:
           }, 120);
         }
       }, { passive: true });
+
+      prevWeekButton?.addEventListener("click", () => shiftWeek(-1));
+      nextWeekButton?.addEventListener("click", () => shiftWeek(1));
+      updateWeekButtons();
       }
 
       window.IKIDSInitDateNavigation = initDateNavigation;
@@ -2673,7 +2753,7 @@ def fast_navigation_script() -> str:
         currentMain.replaceWith(document.importNode(nextMain, true));
         updateContext(url);
         executeInsertedScripts(document.querySelector("main"));
-        window.IKIDSInitDateNavigation?.();
+        window.requestAnimationFrame(() => window.IKIDSInitDateNavigation?.());
 
         if (options.history !== "none") {
           window.history.pushState({}, "", url.href);
@@ -3215,6 +3295,59 @@ def page_template(
 
     .date-toolbar {{
       min-width: 0;
+      position: relative;
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      padding: 0 52px;
+      box-sizing: border-box;
+    }}
+
+    .date-week-jump {{
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 5;
+      width: 40px;
+      height: 40px;
+      border: 1px solid #000000;
+      border-radius: 50%;
+      background: #000000;
+      color: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+      transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+    }}
+
+    .date-week-jump-prev {{
+      left: 0;
+    }}
+
+    .date-week-jump-next {{
+      right: 0;
+    }}
+
+    .date-week-jump:hover {{
+      background: #000000;
+      color: #ffffff;
+    }}
+
+    .date-week-jump:disabled {{
+      opacity: 1;
+      cursor: default;
+    }}
+
+    .date-week-jump svg {{
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      stroke-width: 2.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
     }}
 
     .date-day {{
@@ -3246,6 +3379,8 @@ def page_template(
     .date-strip {{
       --date-gap: 6px;
       position: relative;
+      width: 100%;
+      max-width: 100%;
       min-width: 0;
       gap: 0;
       overflow-x: auto;
@@ -3257,11 +3392,11 @@ def page_template(
       padding: 2px 0;
       -webkit-overflow-scrolling: touch;
       display: flex;
-      cursor: grab;
     }}
 
     .date-week {{
       flex: 0 0 100%;
+      width: 100%;
       min-width: 100%;
       display: flex;
       gap: var(--date-gap);
@@ -3312,6 +3447,7 @@ def page_template(
 
     .date-day.is-active .date-day-surface {{
       background: #000000;
+      box-shadow: none;
     }}
 
     .date-day.is-active {{
@@ -4331,7 +4467,10 @@ def page_template(
     }}
 
     .profile-phone {{
-      color: var(--muted);
+      color: #ffffff;
+      background: #000000;
+      border-radius: 999px;
+      padding: 2px 8px;
       font-size: 0.84rem;
       font-weight: 800;
     }}
@@ -4649,8 +4788,8 @@ def page_template(
     }}
 
     .tab[aria-current="page"] {{
-      background: var(--brand);
-      border-color: var(--brand);
+      background: #000000;
+      border-color: #000000;
       color: white;
     }}
 
@@ -4664,8 +4803,8 @@ def page_template(
     }}
 
     .tab-home[aria-current="page"] {{
-      background: var(--brand);
-      border-color: var(--brand);
+      background: #000000;
+      border-color: #000000;
     }}
 
     .tab-home-logo {{
@@ -6076,6 +6215,12 @@ def page_template(
         position: relative;
         z-index: 45;
         isolation: isolate;
+        display: block;
+        padding: 0;
+      }}
+
+      .date-week-jump {{
+        display: none;
       }}
 
       .date-strip {{
@@ -6785,7 +6930,13 @@ def render_nav(page_role: str, day: str) -> str:
     return f"""
 <div class="toolbar">
   <div class="date-toolbar">
+    <button class="date-week-jump date-week-jump-prev" type="button" data-date-week-prev aria-label="Poprzedni tydzień">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
     <div class="date-strip" data-date-strip>{"".join(week_blocks)}</div>
+    <button class="date-week-jump date-week-jump-next" type="button" data-date-week-next aria-label="Następny tydzień">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+    </button>
   </div>
   <div class="tabs">{''.join(role_links)}</div>
 </div>
@@ -6821,6 +6972,7 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "cake_filling": "",
         "cake_cream": "",
         "cake_image_data": "",
+        "cake_candle": "",
         "cake_at": "",
         "fruit_enabled": 0,
         "fruit_plates": "",
@@ -6870,6 +7022,13 @@ def row_to_form_values(row: DbRow) -> dict[str, object]:
 def render_options(options: list[str], current: object) -> str:
     return "\n".join(
         f'<option value="{escape(option)}"{selected(current, option)}>{escape(option)}</option>' for option in options
+    )
+
+
+def render_labeled_options(labels: dict[str, str], current: object) -> str:
+    return "\n".join(
+        f'<option value="{escape(value)}"{selected(current, value)}>{escape(label)}</option>'
+        for value, label in labels.items()
     )
 
 
@@ -7654,6 +7813,14 @@ def render_cake_theme_input(values: dict[str, object], errors: dict[str, str]) -
           Krem
           <input name="cake_cream" value="{escape(values.get("cake_cream", ""))}" placeholder="np. śmietankowy">
         </label>
+        <label class="service-extra">
+          &#346;wieczka
+          <select name="cake_candle">
+            <option value="">Brak / nie wiadomo</option>
+            {render_labeled_options(CAKE_CANDLE_LABELS, values.get("cake_candle"))}
+          </select>
+          {error_for(errors, "cake_candle")}
+        </label>
 """
 
 
@@ -8385,7 +8552,7 @@ def render_schema_summary() -> str:
         "child_location / adult_location",
         "animation_enabled / animation_type / animation_at / animations_json",
         "cake_enabled / cake_theme / cake_at",
-        "cake_weight / cake_sponge / cake_filling / cake_cream / cake_image_data",
+        "cake_weight / cake_sponge / cake_filling / cake_cream / cake_image_data / cake_candle",
         "fruit_enabled / fruit_plates / fruit_at",
         "culinary_workshops_enabled / culinary_workshops_type / culinary_workshops_at",
         "pinata_enabled / pinata_theme / pinata_at",
@@ -9243,6 +9410,7 @@ CREATE TABLE reservations (
   cake_filling TEXT,
   cake_cream TEXT,
   cake_image_data TEXT,
+  cake_candle TEXT,
   cake_at TIMESTAMPTZ,
   fruit_enabled BOOLEAN NOT NULL DEFAULT false,
   fruit_plates INT,
@@ -9386,6 +9554,7 @@ def csv_response() -> bytes:
             "Smak biszkoptu",
             "Nadzienie tortu",
             "Krem tortu",
+            "\u015awieczka",
             "Tort czas",
             "Owoce",
             "Liczba talerzy owoców",
@@ -9435,6 +9604,7 @@ def csv_response() -> bytes:
                 row["cake_sponge"] or "",
                 row["cake_filling"] or "",
                 row["cake_cream"] or "",
+                CAKE_CANDLE_LABELS.get(str(row.get("cake_candle") or ""), row.get("cake_candle") or ""),
                 format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]),
                 "Tak" if is_enabled(row, "fruit_enabled") else "Nie",
                 row["fruit_plates"] or "",

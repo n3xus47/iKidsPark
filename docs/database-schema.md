@@ -32,6 +32,7 @@ CREATE TABLE reservations (
   cake_filling TEXT,
   cake_cream TEXT,
   cake_image_data TEXT,
+  cake_candle TEXT,
   cake_at TIMESTAMPTZ,
   fruit_enabled BOOLEAN NOT NULL DEFAULT false,
   fruit_at TIMESTAMPTZ,
