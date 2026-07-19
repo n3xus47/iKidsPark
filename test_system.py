@@ -484,6 +484,14 @@ def test_staff_assignment() -> None:
     else:
         fail("Usunięcie przypisania animatora", f"status={status}")
 
+    animator_rid = created_ids[1] if len(created_ids) > 1 else rid
+    status, _, _ = http_post("/assign-animator", {"id": str(animator_rid), "animator": animator}, "role=animators")
+    assigned_by_animator = main.get_reservation(animator_rid)
+    if status in (200, 303) and assigned_by_animator and assigned_by_animator["assigned_animator"] == animator:
+        ok("Przypisanie animatora z zakładki Animatorzy", animator)
+    else:
+        fail("Przypisanie animatora z zakładki Animatorzy", f"status={status}")
+
 
 def test_history_page() -> None:
     section("9. Strona historii zmian")
@@ -519,6 +527,10 @@ def test_role_views_with_data() -> None:
             has_test = "Testow" in html or "Testowy" in html
             if status == 200:
                 ok(label, f"testowe dane widoczne: {has_test}, {len(html)} bajtów")
+                if role == "animators" and "Przypisz animatora" in html:
+                    ok("Opcja przypisania animatora widoczna w zakładce Animatorzy")
+                elif role == "animators":
+                    fail("Opcja przypisania animatora w zakładce Animatorzy", "brak przycisku")
             else:
                 fail(label, f"status={status}")
         except Exception as exc:

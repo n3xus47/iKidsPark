@@ -366,7 +366,7 @@ def can_assign_waiter(role: str) -> bool:
 
 
 def can_assign_animator(role: str) -> bool:
-    return normalize_role(role) == "manager"
+    return normalize_role(role) in {"manager", "animators"}
 
 
 def normalize_day(day: str | None) -> str:
@@ -8002,7 +8002,7 @@ def render_manager_view(rows: list[DbRow], role: str, day: str) -> str:
 """
 
 
-def render_animator_view(rows: list[DbRow]) -> str:
+def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
     banquets = []
     for row in rows:
         if row["status"] != "active":
@@ -8039,6 +8039,7 @@ def render_animator_view(rows: list[DbRow]) -> str:
 
     banquet_cards = []
     for _, row, task_items, notes in banquets:
+        animator_assignment = render_animator_assignment(row, role, day)
         task_markup = "".join(
             f"""
               <div class="banquet-task">
@@ -8054,6 +8055,7 @@ def render_animator_view(rows: list[DbRow]) -> str:
             f"""
             <div class="banquet-card role-card animator-card">
               {render_role_card_identity(row, show_guest_summary=False, show_children_tag=True)}
+              {animator_assignment}
               <div class="banquet-tasks">{task_markup}</div>
               {render_role_extra_info(row, notes)}
             </div>
@@ -8218,7 +8220,7 @@ def render_organizer_view(rows: list[DbRow], role: str, day: str) -> str:
 
 def render_role_view(role: str, rows: list[DbRow], day: str) -> str:
     if role == "animators":
-        return render_animator_view(rows)
+        return render_animator_view(rows, role, day)
     if role == "kitchen":
         return render_kitchen_view(rows)
     if role == "organizer":
