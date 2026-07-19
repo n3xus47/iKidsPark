@@ -463,26 +463,33 @@ def test_staff_assignment() -> None:
         fail("Przypisanie kelnera", f"status={status}")
 
     animator = main.ANIMATORS[0]
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": animator}, "role=manager")
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": animator}, "role=animators")
     assigned = main.get_reservation(rid)
     if status in (200, 303) and assigned and assigned["assigned_animator"] == animator:
         ok("Przypisanie animatora", animator)
     else:
         fail("Przypisanie animatora", f"status={status}")
 
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": "Nie ma takiej osoby"}, "role=manager")
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": "Nie ma takiej osoby"}, "role=animators")
     still_assigned = main.get_reservation(rid)
     if status in (200, 303) and still_assigned and still_assigned["assigned_animator"] == animator:
         ok("Nieprawidłowy animator odrzucony")
     else:
         fail("Nieprawidłowy animator", f"status={status}")
 
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": ""}, "role=manager")
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": ""}, "role=animators")
     removed = main.get_reservation(rid)
     if status in (200, 303) and removed and not removed["assigned_animator"]:
         ok("Usunięcie przypisania animatora")
     else:
         fail("Usunięcie przypisania animatora", f"status={status}")
+
+    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": animator}, "role=manager")
+    blocked = main.get_reservation(rid)
+    if status in (200, 303) and blocked and not blocked["assigned_animator"]:
+        ok("Kierownik nie przypisuje animatora")
+    else:
+        fail("Kierownik nie powinien przypisywać animatora", f"status={status}")
 
     animator_rid = created_ids[1] if len(created_ids) > 1 else rid
     status, _, _ = http_post("/assign-animator", {"id": str(animator_rid), "animator": animator}, "role=animators")
@@ -527,6 +534,10 @@ def test_role_views_with_data() -> None:
             has_test = "Testow" in html or "Testowy" in html
             if status == 200:
                 ok(label, f"testowe dane widoczne: {has_test}, {len(html)} bajtów")
+                if role == "manager" and "Przypisz animatora" not in html:
+                    ok("Opcja przypisania animatora ukryta w zakładce Kierownik")
+                elif role == "manager":
+                    fail("Opcja przypisania animatora w zakładce Kierownik", "przycisk nadal widoczny")
                 if role == "animators" and "Przypisz animatora" in html:
                     ok("Opcja przypisania animatora widoczna w zakładce Animatorzy")
                 elif role == "animators":

@@ -366,7 +366,7 @@ def can_assign_waiter(role: str) -> bool:
 
 
 def can_assign_animator(role: str) -> bool:
-    return normalize_role(role) in {"manager", "animators"}
+    return normalize_role(role) == "animators"
 
 
 def normalize_day(day: str | None) -> str:
@@ -7310,6 +7310,7 @@ def render_reservation_details(
     role: str = "",
     day: str = "today",
     assign_waiter: bool = False,
+    assign_animator: bool = False,
     color: str = "",
 ) -> str:
     start_label = escape(format_time(row["start_at"]))
@@ -7374,7 +7375,7 @@ def render_reservation_details(
 
     footer = f'<footer class="timeline-footer">{footer_markup}</footer>' if footer_markup else ""
     waiter_markup = render_waiter_assignment(row, role, day) if assign_waiter else ""
-    animator_markup = render_animator_assignment(row, role, day) if assign_waiter else ""
+    animator_markup = render_animator_assignment(row, role, day) if assign_animator else ""
     color_attr = f' style="--reservation-color: {escape(color)}"' if color else ""
     color_class = " has-color" if color else ""
 
