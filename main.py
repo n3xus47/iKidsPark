@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import csv
 import errno
 import html
 import ipaddress
-import io
 import json
 import os
 import shutil
 import socket
 import sqlite3
 import ssl
-import struct
 import subprocess
 import sys
 import tempfile
 import threading
-import zlib
 from datetime import date, datetime, time, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +24,49 @@ from zoneinfo import ZoneInfo
 import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
+
+from ikidspark_pwa import app_icon_png as build_app_icon_png
+from ikidspark_config import (
+    ADULT_LOCATION_GROUPS,
+    ADULT_LOCATIONS,
+    ALL_LOCATIONS,
+    ANIMATION_GROUPS,
+    ANIMATION_TYPES,
+    CAKE_CANDLE_LABELS,
+    CAKE_CANDLE_TYPES,
+    DAY_FILTERS,
+    EMPTY_LOCATION,
+    LEGACY_ADULT_LOCATION_RENAMES,
+    LEGACY_CHILD_LOCATION_RENAMES,
+    LOCATION_GROUPS,
+    LOCATION_SEPARATOR,
+    MASCOT_TYPES,
+    MONTH_FULL_LABELS,
+    MONTH_STANDALONE_LABELS,
+    PARTY_ROOMS,
+    PLAN_HOTSPOTS,
+    PLAN_VIEWBOX,
+    PLAN_WALLS,
+    RESERVATION_COLORS,
+    ROLE_DEFS,
+    ROLE_NAV_ICONS,
+    ROOM_CAPACITY,
+    SERVICE_DURATIONS,
+    SERVICE_OVERLAP_MESSAGE,
+    STAGE_BLOCK_END,
+    STAGE_BLOCK_MESSAGE,
+    STAGE_BLOCK_START,
+    STATUS_LABELS,
+    TABLE_GROUP_NUMBERS,
+    TABLE_NUMBERS,
+    TABLE_ZONE_BY_NUMBER,
+    WAITERS,
+    WEEKDAY_FULL_LABELS,
+    WEEKDAY_LABELS,
+    WORKSHOP_TYPES,
+    format_table_range,
+)
+from ikidspark_export import build_csv_response
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -58,20 +97,6 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8000"))
 DEFAULT_LOCAL_DOMAINS = ("ikids.pl",)
 
-RESERVATION_COLORS = [
-    "#e63946",
-    "#f77f00",
-    "#2a9d8f",
-    "#457b9d",
-    "#6a4c93",
-    "#c9184a",
-    "#3a86ff",
-    "#2b9348",
-    "#fb5607",
-    "#0077b6",
-]
-
-
 def logo_asset_url() -> str:
     if LOGO_PATH.exists():
         return f"/logo.png?v={int(LOGO_PATH.stat().st_mtime)}"
@@ -82,283 +107,6 @@ def menu_logo_asset_url() -> str:
     if MENU_LOGO_PATH.exists():
         return f"/menu-logo.png?v={int(MENU_LOGO_PATH.stat().st_mtime)}"
     return logo_asset_url()
-
-PARTY_ROOMS = [
-    "1. Biały Dom",
-    "2. Magiczny Las",
-    "3. Wróżki",
-    "4. Kosmos",
-    "5. Zima",
-    "6. Football",
-]
-
-ROOM_CAPACITY = {
-    "6. Football": 24,
-}
-
-TABLE_NUMBERS = tuple(range(7, 78))
-TABLE_GROUP_NUMBERS = {
-    "Bar": [7, 8, 9, 10, 11, 12, 13, 14],
-    "Scena": [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40],
-    "Trójkąt": [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
-    "Labirynt": [58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 71, 72, 73, 74],
-    "Pozostałe stoliki": [15, 16, 17, 70, 75, 76, 77],
-}
-TABLE_ZONE_BY_NUMBER = {
-    number: area
-    for area, numbers in TABLE_GROUP_NUMBERS.items()
-    for number in numbers
-}
-ADULT_LOCATION_GROUPS = {
-    area: [f"{area} - Stolik {number}" for number in numbers]
-    for area, numbers in TABLE_GROUP_NUMBERS.items()
-}
-ADULT_LOCATIONS = [location for locations in ADULT_LOCATION_GROUPS.values() for location in locations]
-LOCATION_GROUPS = {"Loże tematyczne": PARTY_ROOMS, **ADULT_LOCATION_GROUPS}
-
-
-def format_table_range(numbers: list[int]) -> str:
-    if not numbers:
-        return ""
-    sorted_numbers = sorted(numbers)
-    ranges: list[str] = []
-    range_start = sorted_numbers[0]
-    range_end = sorted_numbers[0]
-    for number in sorted_numbers[1:]:
-        if number == range_end + 1:
-            range_end = number
-            continue
-        ranges.append(f"{range_start}–{range_end}" if range_start != range_end else str(range_start))
-        range_start = range_end = number
-    ranges.append(f"{range_start}–{range_end}" if range_start != range_end else str(range_start))
-    return ", ".join(ranges)
-
-ALL_LOCATIONS = PARTY_ROOMS + ADULT_LOCATIONS
-LOCATION_SEPARATOR = " | "
-EMPTY_LOCATION = "Brak"
-
-ANIMATION_GROUPS = {
-    "Animacje tematyczne": [
-        "Impreza Hawajska",
-        "Ekipa Małych Ratowników",
-        "Wirtualny Świat Gier",
-        "Piłka Nożna",
-        "Królestwo Zimowego Czaru",
-        "Laboratorium Naukowe",
-        "Bańkowe Widowisko",
-        "Zabawy na Trampolinach",
-        "Dyskoteka",
-        "Dla Najmłodszych",
-    ],
-    "Misje specjalne (samodzielne przejście z podpowiedziami)": [
-        "Tajemnice Szkoły Magii",
-        "Piracka Przygoda",
-        "Zagadki Pradawnego Lasu",
-        "Wyzwanie Detektywistyczne",
-        "Superbohaterowie - Era Najodważniejszych",
-    ],
-}
-
-ANIMATION_TYPES = [name for names in ANIMATION_GROUPS.values() for name in names]
-WORKSHOP_TYPES = ["Pizza", "Burger", "Piernik", "Shake"]
-CAKE_CANDLE_TYPES = ["cyfra", "zwykla", "wlasna"]
-CAKE_CANDLE_LABELS = {"cyfra": "cyfra", "zwykla": "zwyk\u0142a", "wlasna": "w\u0142asna"}
-MASCOT_TYPES = ["Lew", "Pan Królik", "Pani Królik", "Miś"]
-
-# Interactive hotspots for the floor plan (asset canvas 1440 x 810; display crops empty margins).
-# Tuple: (number, center_x, center_y, width, height). Numbers 1-6 are party rooms.
-PLAN_HOTSPOTS = [
-    (1, 370.0, 533.8, 64.7, 63.3),
-    (2, 450.6, 533.8, 63.3, 63.3),
-    (3, 539.0, 517.5, 63.3, 64.7),
-    (4, 634.8, 517.5, 63.3, 64.7),
-    (5, 730.6, 517.5, 63.3, 64.7),
-    (6, 818.9, 506.4, 63.3, 64.7),
-    (7, 254.7, 420.6, 28.0, 36.0),
-    (8, 207.6, 420.6, 28.0, 36.0),
-    (9, 124.6, 439.1, 36.0, 28.0),
-    (10, 59.2, 445.5, 24.0, 24.0),
-    (11, 59.2, 414.3, 24.0, 24.0),
-    (12, 59.2, 383.1, 24.0, 24.0),
-    (13, 59.2, 345.1, 36.0, 28.0),
-    (14, 124.6, 345.1, 36.0, 28.0),
-    (15, 124.6, 402.0, 36.0, 28.0),
-    (18, 593.2, 389.1, 34.0, 34.0),
-    (19, 667.4, 389.1, 34.0, 34.0),
-    (20, 741.7, 389.1, 34.0, 34.0),
-    (21, 704.8, 348.2, 24.0, 24.0),
-    (22, 627.8, 348.2, 24.0, 24.0),
-    (23, 584.3, 307.6, 28.0, 36.0),
-    (24, 639.8, 307.6, 28.0, 36.0),
-    (25, 695.2, 307.6, 28.0, 36.0),
-    (26, 750.6, 307.6, 28.0, 36.0),
-    (30, 593.2, 226.3, 34.0, 34.0),
-    (31, 667.4, 226.3, 34.0, 34.0),
-    (32, 741.7, 226.3, 34.0, 34.0),
-    (33, 824.2, 335.6, 36.0, 28.0),
-    (34, 877.1, 335.6, 36.0, 28.0),
-    (35, 930.1, 335.6, 36.0, 28.0),
-    (36, 908.6, 373.3, 34.0, 34.0),
-    (37, 845.6, 373.3, 34.0, 34.0),
-    (38, 808.2, 420.6, 24.0, 24.0),
-    (39, 864.3, 420.6, 24.0, 24.0),
-    (40, 920.6, 420.6, 24.0, 24.0),
-    (41, 1106.9, 408.3, 28.0, 36.0),
-    (42, 1051.4, 408.3, 28.0, 36.0),
-    (43, 995.9, 408.3, 28.0, 36.0),
-    (44, 1117.0, 364.1, 24.0, 24.0),
-    (45, 1060.8, 364.1, 24.0, 24.0),
-    (46, 1004.6, 364.1, 24.0, 24.0),
-    (47, 1060.8, 303.4, 36.0, 36.0),
-    (48, 1017.5, 257.6, 36.0, 36.0),
-    (49, 1002.9, 150.9, 26.0, 26.0),
-    (50, 1043.4, 189.7, 26.0, 26.0),
-    (51, 1084.0, 228.7, 26.0, 26.0),
-    (52, 1121.9, 259.9, 36.0, 36.0),
-    (53, 1144.7, 281.6, 36.0, 36.0),
-    (54, 1178.1, 314.1, 36.0, 36.0),
-    (55, 1200.9, 335.8, 36.0, 36.0),
-    (56, 1217.1, 424.1, 28.0, 36.0),
-    (57, 1178.0, 423.4, 28.0, 36.0),
-    (58, 1149.1, 633.5, 24.0, 24.0),
-    (59, 1149.1, 587.2, 24.0, 24.0),
-    (60, 1149.1, 540.9, 24.0, 24.0),
-    (61, 1149.1, 492.8, 24.0, 24.0),
-    (62, 1205.3, 517.5, 24.0, 24.0),
-    (63, 1261.5, 517.5, 24.0, 24.0),
-    (64, 1317.7, 517.5, 24.0, 24.0),
-    (65, 1373.8, 517.5, 24.0, 24.0),
-    (66, 1373.8, 480.2, 24.0, 24.0),
-    (67, 1317.7, 480.2, 24.0, 24.0),
-    (68, 1261.5, 480.2, 24.0, 24.0),
-    (69, 1205.3, 480.2, 24.0, 24.0),
-    (70, 1255.4, 402.0, 28.0, 36.0),
-    (71, 1255.4, 360.8, 28.0, 36.0),
-    (72, 1382.2, 360.8, 28.0, 36.0),
-    (73, 1382.2, 402.0, 28.0, 36.0),
-]
-
-# Wall / edge segments extracted from 14.svg (absolute canvas coords).
-# Tuple: (x1, y1, x2, y2).
-PLAN_WALLS = [
-    (149.6, 382.8, 490.6, 382.8),
-    (149.6, 382.8, 149.6, 328.8),
-    (149.6, 328.8, 33.9, 328.8),
-    (33.9, 328.8, 33.9, 474.1),
-    (33.9, 474.1, 490.6, 474.1),
-    (490.6, 186.2, 490.6, 474.1),
-    (490.6, 455.1, 1231.5, 455.1),
-    (490.6, 186.2, 952.7, 186.2),
-    (952.7, 131.9, 952.7, 455.1),
-    (952.7, 131.9, 1015.0, 131.9),
-    (1231.5, 340.1, 1231.5, 455.1),
-    (1015.0, 131.9, 1231.5, 340.1),
-    (1231.5, 340.1, 1406.8, 340.1),
-    (1406.8, 340.1, 1406.8, 679.2),
-    (1114.2, 679.2, 1406.8, 679.2),
-    (1114.2, 455.1, 1114.2, 679.2),
-    (490.6, 474.1, 490.6, 609.8),
-    (328.8, 609.8, 490.6, 609.8),
-    (328.8, 474.1, 328.8, 609.8),
-    (409.4, 474.1, 409.4, 609.8),
-    (490.6, 595.1, 776.8, 595.1),
-    (586.8, 455.1, 586.8, 595.1),
-    (681.8, 455.1, 681.8, 595.1),
-    (776.8, 455.1, 776.8, 595.1),
-    (860.5, 455.1, 860.5, 574.4),
-    (776.8, 574.4, 860.5, 574.4),
-]
-
-PLAN_VIEWBOX = (30.9, 128.0, 1378.1, 554.1)
-
-
-LEGACY_CHILD_LOCATION_RENAMES = {
-    "Salka Piłka Nożna": "6. Football",
-    "Salka Dżungla": "2. Magiczny Las",
-    "Salka Kosmos": "4. Kosmos",
-    "Salka Księżniczki": "3. Wróżki",
-    "Salka Piraci": "1. Biały Dom",
-    "Salka Kreatywna": "5. Zima",
-    "Sala 1 - Biały Dom": "1. Biały Dom",
-    "Sala 2 - Magiczny Las": "2. Magiczny Las",
-    "Sala 3 - Wróżki": "3. Wróżki",
-    "Sala 4 - Kosmos": "4. Kosmos",
-    "Sala 5 - Zima": "5. Zima",
-    "Sala 6 - Piłka nożna": "6. Football",
-    "Loża 1 - Biały Dom": "1. Biały Dom",
-    "Loża 2 - Magiczny Las": "2. Magiczny Las",
-    "Loża 3 - Wróżki": "3. Wróżki",
-    "Loża 4 - Kosmos": "4. Kosmos",
-    "Loża 5 - Zima": "5. Zima",
-    "Loża 6 - Football": "6. Football",
-}
-
-LEGACY_ADULT_LOCATION_RENAMES = {
-    "Antresola - Stolik A": "Bar - Stolik 7",
-    "Antresola - Stolik B": "Bar - Stolik 8",
-    **{
-        f"Sala główna - Stolik {number}": f"{TABLE_ZONE_BY_NUMBER[number]} - Stolik {number}"
-        for number in TABLE_NUMBERS
-    },
-}
-
-ROLE_DEFS = {
-    "manager": {
-        "label": "Kierownik i recepcja",
-        "hint": "Podgląd rezerwacji, statusów i dostępności sal.",
-    },
-    "animators": {
-        "label": "Animatorzy",
-        "hint": "Animacje, piniaty, maskotki.",
-    },
-    "kitchen": {
-        "label": "Kuchnia",
-        "hint": "Owoce, torty i warsztaty.",
-    },
-    "organizer": {
-        "label": "Organizator urodzin",
-        "hint": "Pełny panel: nowe rezerwacje, edycja i usuwanie.",
-    },
-}
-
-DAY_FILTERS = {
-    "today": ("Dziś", 0),
-    "tomorrow": ("Jutro", 1),
-    "after_tomorrow": ("Pojutrze", 2),
-}
-
-WEEKDAY_LABELS = ("Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Ndz")
-WEEKDAY_FULL_LABELS = ("poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela")
-MONTH_FULL_LABELS = (
-    "stycznia",
-    "lutego",
-    "marca",
-    "kwietnia",
-    "maja",
-    "czerwca",
-    "lipca",
-    "sierpnia",
-    "września",
-    "października",
-    "listopada",
-    "grudnia",
-)
-
-MONTH_STANDALONE_LABELS = (
-    "styczeń",
-    "luty",
-    "marzec",
-    "kwiecień",
-    "maj",
-    "czerwiec",
-    "lipiec",
-    "sierpień",
-    "wrzesień",
-    "październik",
-    "listopad",
-    "grudzień",
-)
-
 
 def week_month_label(week_days: list[date]) -> str:
     month_counts: dict[int, int] = {}
@@ -373,44 +121,6 @@ def week_year_label(week_days: list[date]) -> int:
     for week_day in week_days:
         year_counts[week_day.year] = year_counts.get(week_day.year, 0) + 1
     return max(year_counts, key=year_counts.get)
-
-
-ROLE_NAV_ICONS = {
-    "manager": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16M7 4h10a2 2 0 0 1 2 2v13H5V6a2 2 0 0 1 2-2Z"/><path d="M8 10h3M8 14h3M14 10h2M14 14h2"/></svg>""",
-    "animators": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.2 4.5 5 .7-3.6 3.5.9 5-4.5-2.4-4.5 2.4.9-5-3.6-3.5 5-.7L12 3Z"/><path d="M5 20h14"/></svg>""",
-    "kitchen": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v8M11 3v8M7 7h4M9 11v10"/><path d="M16 3v18M16 3c2 1.5 3 3.3 3 5.5S18 12 16 12"/></svg>""",
-    "organizer": """<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10a2 2 0 0 1 2 2v14H5V6a2 2 0 0 1 2-2Z"/><path d="M9 4V2M15 4V2M8 9h8M8 13h5M8 17h7"/></svg>""",
-}
-
-WAITERS = (
-    "Ilya Tumilovich",
-    "Hanna Hodmash",
-    "Adrian Rybińczuk",
-    "Nicole Piotrowiak",
-    "Patrycja Zewar",
-    "Julia Wojciechowka",
-    "Paweł Osiałkowski",
-    "Kain Niżnik",
-    "Jan Ostrykiewicz",
-)
-
-SERVICE_OVERLAP_MESSAGE = "Godziny dodatków w tej rezerwacji nie mogą się nakładać."
-
-STATUS_LABELS = {
-    "active": "Aktywna",
-    "cancelled": "Anulowana",
-}
-
-STAGE_BLOCK_MESSAGE = "Ta atrakcja nachodzi na Koło Marzeń 17:45-18:15 - wybierz inną godzinę startu."
-STAGE_BLOCK_START = time(17, 45)
-STAGE_BLOCK_END = time(18, 15)
-SERVICE_DURATIONS = {
-    "animation_at": 60,
-    "cake_at": 20,
-    "culinary_workshops_at": 60,
-    "pinata_at": 20,
-    "mascot_at": 20,
-}
 
 
 def require_database_url() -> str:
@@ -1883,8 +1593,6 @@ def date_title(target_day: date) -> str:
     )
 
 
-_APP_ICON_CACHE: dict[tuple[int, bool], bytes] = {}
-_APP_ICON_LOCK = threading.Lock()
 _BOOT_READY = threading.Event()
 _BOOT_ERROR: str | None = None
 
@@ -1954,177 +1662,9 @@ def pwa_icon_version() -> str:
     return f"{PWA_CACHE_NAME}-splash2"
 
 
-def _png_chunk(tag: bytes, data: bytes) -> bytes:
-    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-
-def _encode_png_rgba(width: int, height: int, pixels: list[tuple[int, int, int, int]]) -> bytes:
-    rows = bytearray()
-    for y in range(height):
-        rows.append(0)
-        start = y * width
-        for r, g, b, a in pixels[start : start + width]:
-            rows.extend((r, g, b, a))
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-        + _png_chunk(b"IDAT", zlib.compress(bytes(rows), level=6))
-        + _png_chunk(b"IEND", b"")
-    )
-
-
-def _decode_png_rgba(data: bytes) -> tuple[int, int, list[tuple[int, int, int, int]]] | None:
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return None
-    pos = 8
-    width = height = bit_depth = color_type = interlace = None
-    compressed = bytearray()
-    while pos + 8 <= len(data):
-        length = struct.unpack(">I", data[pos : pos + 4])[0]
-        kind = data[pos + 4 : pos + 8]
-        body = data[pos + 8 : pos + 8 + length]
-        pos += 12 + length
-        if kind == b"IHDR":
-            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", body)
-        elif kind == b"IDAT":
-            compressed.extend(body)
-        elif kind == b"IEND":
-            break
-    if bit_depth != 8 or interlace != 0 or width is None or height is None or color_type not in {2, 6}:
-        return None
-    channels = 4 if color_type == 6 else 3
-    stride = width * channels
-    raw = zlib.decompress(bytes(compressed))
-    rows: list[bytearray] = []
-    offset = 0
-
-    def paeth(a: int, b: int, c: int) -> int:
-        p = a + b - c
-        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-        if pa <= pb and pa <= pc:
-            return a
-        if pb <= pc:
-            return b
-        return c
-
-    for y in range(height):
-        filter_type = raw[offset]
-        offset += 1
-        row = bytearray(raw[offset : offset + stride])
-        offset += stride
-        prev = rows[y - 1] if y else bytearray(stride)
-        for x in range(stride):
-            left = row[x - channels] if x >= channels else 0
-            up = prev[x]
-            up_left = prev[x - channels] if x >= channels else 0
-            if filter_type == 1:
-                row[x] = (row[x] + left) & 0xFF
-            elif filter_type == 2:
-                row[x] = (row[x] + up) & 0xFF
-            elif filter_type == 3:
-                row[x] = (row[x] + ((left + up) // 2)) & 0xFF
-            elif filter_type == 4:
-                row[x] = (row[x] + paeth(left, up, up_left)) & 0xFF
-        rows.append(row)
-
-    pixels: list[tuple[int, int, int, int]] = []
-    for row in rows:
-        for x in range(0, stride, channels):
-            if channels == 4:
-                pixels.append((row[x], row[x + 1], row[x + 2], row[x + 3]))
-            else:
-                pixels.append((row[x], row[x + 1], row[x + 2], 255))
-    return width, height, pixels
-
-
-def _resize_rgba(
-    src_w: int,
-    src_h: int,
-    src: list[tuple[int, int, int, int]],
-    size: int,
-) -> list[tuple[int, int, int, int]]:
-    if src_w == size and src_h == size:
-        return src
-    out: list[tuple[int, int, int, int]] = []
-    for y in range(size):
-        sy = min(src_h - 1, (y * src_h) // size)
-        for x in range(size):
-            sx = min(src_w - 1, (x * src_w) // size)
-            out.append(src[sy * src_w + sx])
-    return out
-
-
-def _whiten_near_white(pixels: list[tuple[int, int, int, int]], threshold: int = 248) -> list[tuple[int, int, int, int]]:
-    """Force near-white pixels to pure #fff so splash tiles don't show gray fringes."""
-    out: list[tuple[int, int, int, int]] = []
-    for r, g, b, a in pixels:
-        if r >= threshold and g >= threshold and b >= threshold:
-            out.append((255, 255, 255, 255))
-        else:
-            out.append((r, g, b, a))
-    return out
-
-
-def _knockout_white_to_transparent(
-    pixels: list[tuple[int, int, int, int]],
-    threshold: int = 248,
-) -> list[tuple[int, int, int, int]]:
-    """Make white background transparent so splash shows only the gray logo on white bg."""
-    out: list[tuple[int, int, int, int]] = []
-    for r, g, b, a in pixels:
-        if r >= threshold and g >= threshold and b >= threshold:
-            out.append((255, 255, 255, 0))
-        else:
-            # Soften residual light fringe against transparent bg
-            luma = (r + g + b) / 3
-            if luma > 200:
-                alpha = max(0, min(255, int(255 * (1 - (luma - 200) / 55))))
-                out.append((r, g, b, alpha))
-            else:
-                out.append((r, g, b, a))
-    return out
-
-
 def app_icon_png(size: int = 512, *, solid: bool = False) -> bytes:
-    """PWA icon from pwalogo.png.
-
-    solid=False (default): transparent background — splash/launcher „any” shows only gray logo.
-    solid=True: pure white background — maskable / apple-touch / favicon.
-    """
-    target = 512 if size >= 512 else 192
-    cache_key = (target, solid)
-    with _APP_ICON_LOCK:
-        cached = _APP_ICON_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-        source_bytes: bytes | None = None
-        if PWA_LOGO_PATH.exists():
-            source_bytes = PWA_LOGO_PATH.read_bytes()
-        elif LOGO_PATH.exists():
-            source_bytes = LOGO_PATH.read_bytes()
-        if source_bytes is None:
-            if solid:
-                payload = _encode_png_rgba(target, target, [(255, 255, 255, 255)] * (target * target))
-            else:
-                payload = _encode_png_rgba(target, target, [(255, 255, 255, 0)] * (target * target))
-            _APP_ICON_CACHE[cache_key] = payload
-            return payload
-        decoded = _decode_png_rgba(source_bytes)
-        if decoded is None:
-            payload = source_bytes
-            _APP_ICON_CACHE[cache_key] = payload
-            return payload
-        src_w, src_h, src = decoded
-        pixels = _resize_rgba(src_w, src_h, src, target)
-        if solid:
-            pixels = _whiten_near_white(pixels)
-        else:
-            pixels = _knockout_white_to_transparent(pixels)
-        payload = _encode_png_rgba(target, target, pixels)
-        _APP_ICON_CACHE[cache_key] = payload
-        return payload
-
-
+    """PWA icon from pwalogo.png."""
+    return build_app_icon_png(PWA_LOGO_PATH, LOGO_PATH, size, solid=solid)
 def manifest_response() -> bytes:
     icon_v = pwa_icon_version()
     icons: list[dict[str, str]] = []
@@ -2766,7 +2306,10 @@ def fast_navigation_script() -> str:
         currentMain.replaceWith(document.importNode(nextMain, true));
         updateContext(url);
         executeInsertedScripts(document.querySelector("main"));
-        window.requestAnimationFrame(() => window.IKIDSInitDateNavigation?.());
+        window.requestAnimationFrame(() => {
+          window.IKIDSInitDateNavigation?.();
+          window.IKIDSInitPlanTip?.();
+        });
 
         if (options.history !== "none") {
           window.history.pushState({}, "", url.href);
@@ -5884,6 +5427,12 @@ def page_template(
       background: #ffffff;
     }}
 
+    @media (min-width: 641px) {{
+      .plan-block-title[data-open-plan-fs] {{
+        display: none;
+      }}
+    }}
+
     .room-plan {{
       width: 100%;
       height: auto;
@@ -5903,12 +5452,14 @@ def page_template(
 
     .plan-node {{
       cursor: pointer;
+      pointer-events: all;
     }}
 
     .plan-field {{
       fill: transparent;
       stroke: transparent;
       stroke-width: 2.4;
+      pointer-events: all;
       transition: fill 0.15s ease, stroke 0.15s ease, stroke-width 0.15s ease;
     }}
 
@@ -6628,9 +6179,6 @@ def plan_tip_script() -> str:
     return """
 <script>
 (() => {
-  const svg = document.querySelector(".room-plan");
-  if (!svg) return;
-
   let tipTimer = null;
   let activeNode = null;
   const planTip = document.createElement("div");
@@ -6712,17 +6260,37 @@ def plan_tip_script() -> str:
   window.addEventListener("scroll", () => placePlanTip(activeNode), true);
   window.addEventListener("resize", () => placePlanTip(activeNode));
 
+  function handleBusyPlanNode(event) {
+    const node = findPlanNode(event);
+    if (!node || !node.classList.contains("is-busy")) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    showPlanTip(node);
+    return true;
+  }
+
+  function initPlanTip() {
+    document.querySelectorAll(".room-plan").forEach((svg) => {
+      if (svg.dataset.planTipReady === "true") return;
+      svg.dataset.planTipReady = "true";
+      svg.addEventListener("pointerdown", handleBusyPlanNode, true);
+      svg.addEventListener("click", handleBusyPlanNode, true);
+      svg.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        handleBusyPlanNode(event);
+      }, true);
+    });
+  }
+
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("[data-open-plan-fs], .plan-fs-close")) return;
     const node = findPlanNode(event);
-    if (node && node.classList.contains("is-busy")) {
-      event.preventDefault();
-      event.stopPropagation();
-      showPlanTip(node);
-      return;
-    }
+    if (handleBusyPlanNode(event)) return;
     if (!node && !event.target.closest?.(".plan-tip")) hidePlanTip();
   }, true);
+
+  window.IKIDSInitPlanTip = initPlanTip;
+  initPlanTip();
 })();
 </script>
 """
@@ -9564,105 +9132,19 @@ def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
 
 
 def csv_response() -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output, delimiter=";")
-    writer.writerow(
-        [
-            "ID",
-            "Typ",
-            "Data",
-            "Start imprezy",
-            "Goście razem",
-            "Dzieci",
-            "Dorośli",
-            "Rodzic",
-            "Telefon",
-            "Solenizant",
-            "Wiek",
-            "Sala dzieci",
-            "Lokalizacja dorosłych",
-            "Animacja",
-            "Rodzaj animacji",
-            "Animacja czas",
-            "Tort",
-            "Motyw tortu",
-            "Waga tortu",
-            "Smak biszkoptu",
-            "Nadzienie tortu",
-            "Krem tortu",
-            "\u015awieczka",
-            "Tort czas",
-            "Owoce",
-            "Liczba talerzy owoców",
-            "Godzina owoców",
-            "Warsztaty",
-            "Rodzaj warsztatów",
-            "Warsztaty czas",
-            "Piniata",
-            "Motyw piniaty",
-            "Piniata czas",
-            "Maskotka",
-            "Rodzaj maskotki",
-            "Maskotka czas",
-            "Balony",
-            "Opis balonów",
-            "Godzina balonów",
-            "Status",
-            "Powód anulowania",
-            "Notatki",
-        ]
+    return build_csv_response(
+        get_all_reservations(),
+        is_table_reservation=is_table_reservation,
+        format_date=format_date,
+        format_time=format_time,
+        display_locations=display_locations,
+        animations_from_row=animations_from_row,
+        format_service_window=format_service_window,
+        is_enabled=is_enabled,
+        service_durations=SERVICE_DURATIONS,
+        cake_candle_labels=CAKE_CANDLE_LABELS,
+        status_labels=STATUS_LABELS,
     )
-    for row in get_all_reservations():
-        writer.writerow(
-            [
-                row["id"],
-                "Rezerwacja stolika" if is_table_reservation(row) else "Bankiet",
-                format_date(row["start_at"]),
-                format_time(row["start_at"]),
-                row.get("guest_total") or int(row["children_count"] or 0) + int(row["adults_count"] or 0),
-                row["children_count"],
-                row["adults_count"],
-                row["parent_name"],
-                row.get("parent_phone") or "",
-                row["birthday_child_name"],
-                row["birthday_child_age"],
-                row["child_location"],
-                display_locations(row["adult_location"]),
-                "Tak" if animations_from_row(row) else "Nie",
-                "; ".join(str(item.get("type") or "") for item in animations_from_row(row)),
-                "; ".join(
-                    format_service_window(item.get("at"), SERVICE_DURATIONS["animation_at"])
-                    for item in animations_from_row(row)
-                ),
-                "Tak" if is_enabled(row, "cake_enabled") else "Nie",
-                row["cake_theme"] or "",
-                row["cake_weight"] or "",
-                row["cake_sponge"] or "",
-                row["cake_filling"] or "",
-                row["cake_cream"] or "",
-                CAKE_CANDLE_LABELS.get(str(row.get("cake_candle") or ""), row.get("cake_candle") or ""),
-                format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"]),
-                "Tak" if is_enabled(row, "fruit_enabled") else "Nie",
-                row["fruit_plates"] or "",
-                format_time(row["fruit_at"]),
-                "Tak" if is_enabled(row, "culinary_workshops_enabled") else "Nie",
-                row["culinary_workshops_type"] or "",
-                format_service_window(row["culinary_workshops_at"], SERVICE_DURATIONS["culinary_workshops_at"]),
-                "Tak" if is_enabled(row, "pinata_enabled") else "Nie",
-                row["pinata_theme"] or "",
-                format_service_window(row["pinata_at"], SERVICE_DURATIONS["pinata_at"]),
-                "Tak" if is_enabled(row, "mascot_enabled") else "Nie",
-                row["mascot_type"] or "",
-                format_service_window(row["mascot_at"], SERVICE_DURATIONS["mascot_at"]),
-                "Tak" if is_enabled(row, "balloons_enabled") else "Nie",
-                row["balloons_description"] or "",
-                format_time(row["balloons_at"]),
-                STATUS_LABELS[row["status"]],
-                row["cancellation_reason"],
-                row["notes"],
-            ]
-        )
-    return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
 def icon_spec_for_path(path: str) -> tuple[int, bool] | None:
