@@ -5340,6 +5340,24 @@ def page_template(
       box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
     }}
 
+    a.metric {{
+      color: inherit;
+      text-decoration: none;
+      cursor: pointer;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+    }}
+
+    a.metric:hover {{
+      border-color: #000000;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+      transform: translateY(-1px);
+    }}
+
+    a.metric:focus-visible {{
+      outline: 3px solid #000000;
+      outline-offset: 3px;
+    }}
+
     .metric-icon {{
       display: inline-flex;
       align-items: center;
@@ -7336,14 +7354,16 @@ METRIC_ICONS = {
 }
 
 
-def render_metric(value: int, label: str, icon_key: str) -> str:
+def render_metric(value: int, label: str, icon_key: str, href: str = "") -> str:
     icon_class = f" metric-icon-{icon_key}" if icon_key in {"animacje", "warsztaty", "torty", "piniaty"} else ""
+    tag = "a" if href else "div"
+    href_attr = f' href="{escape(href)}"' if href else ""
     return (
-        f'<div class="metric">'
+        f'<{tag} class="metric"{href_attr}>'
         f'<span class="metric-icon{icon_class}" aria-hidden="true">{METRIC_ICONS[icon_key]}</span>'
         f"<strong>{value}</strong>"
         f'<span class="muted">{escape(label)}</span>'
-        f"</div>"
+        f"</{tag}>"
     )
 
 
@@ -8283,21 +8303,24 @@ def service_pills(row: DbRow) -> str:
     )
 
 
-def render_metrics(rows: list[DbRow]) -> str:
+def render_metrics(rows: list[DbRow], day: str) -> str:
     active = [row for row in rows if row["status"] == "active"]
     animation_count = sum(len(animations_from_row(row)) for row in active)
     workshops = sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled"))
     cakes = sum(1 for row in active if is_enabled(row, "cake_enabled"))
     pinatas = sum(1 for row in active if is_enabled(row, "pinata_enabled"))
     guests = sum(int(row["children_count"]) + int(row["adults_count"]) for row in active)
+    current_day_query = day_query(selected_day(day))
+    animators_link = link_for("animators", current_day_query)
+    kitchen_link = link_for("kitchen", current_day_query)
     return f"""
 <div class="metrics">
   {render_metric(len(active), "bankiety", "bankiety")}
   {render_metric(guests, "liczba gości", "guests")}
-  {render_metric(animation_count, "animacje", "animacje")}
-  {render_metric(pinatas, "piniaty", "piniaty")}
-  {render_metric(cakes, "torty", "torty")}
-  {render_metric(workshops, "warsztaty", "warsztaty")}
+  {render_metric(animation_count, "animacje", "animacje", animators_link)}
+  {render_metric(pinatas, "piniaty", "piniaty", animators_link)}
+  {render_metric(cakes, "torty", "torty", kitchen_link)}
+  {render_metric(workshops, "warsztaty", "warsztaty", kitchen_link)}
 </div>
 """
 
@@ -8609,7 +8632,7 @@ def render_home(
     rows = get_reservations_for_day(target_day)
 
     if page_role == "home":
-        content = render_nav(page_role, day) + f'<div class="home-summary">{render_metrics(rows)}</div>'
+        content = render_nav(page_role, day) + f'<div class="home-summary">{render_metrics(rows, day)}</div>'
         return page_template(content, message=message, errors=errors, role=page_role, day=day)
 
     if role != "organizer":
