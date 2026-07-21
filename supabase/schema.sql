@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     notes TEXT NOT NULL DEFAULT '',
     assigned_waiter TEXT,
     assigned_animator TEXT,
+    cooperation_enabled INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
     cancellation_reason TEXT,
     created_at TEXT NOT NULL,

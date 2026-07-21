@@ -229,16 +229,24 @@ def test_unit_validation() -> None:
     else:
         fail("Anulowanie bez powodu odrzucone")
 
-    # Blokada Koło Marzeń (17:45-18:15)
+    # Blokada Koło Marzeń (17:45-18:15) — bez potwierdzenia
     data = base_reservation("2026-07-17", "5. Zima", "Bar - Stolik 10", "10:00", "Test", "Rodzic")
     data["animation_enabled"] = "1"
     data["animation_type"] = "Dyskoteka"
     data["animation_at"] = "17:50"
     _, errors = main.validate_reservation(data)
     if "animation_at" in errors and "Koło Marzeń" in errors["animation_at"]:
-        ok("Blokada Koło Marzeń 17:45-18:15")
+        ok("Ostrzeżenie Koło Marzeń bez potwierdzenia")
     else:
-        fail("Blokada Koło Marzeń", str(errors.get("animation_at", errors)))
+        fail("Ostrzeżenie Koło Marzeń bez potwierdzenia", str(errors.get("animation_at", errors)))
+
+    # Po potwierdzeniu organizatora — dozwolone
+    data["stage_block_acknowledged"] = "1"
+    _, errors = main.validate_reservation(data)
+    if "animation_at" not in errors:
+        ok("Koło Marzeń po zatwierdzeniu organizatora")
+    else:
+        fail("Koło Marzeń po zatwierdzeniu", str(errors.get("animation_at", errors)))
 
     # Nakładanie się dodatków
     data = base_reservation("2026-07-17", "5. Zima", "Bar - Stolik 11", "10:00", "Test", "Rodzic")
@@ -457,44 +465,153 @@ def test_staff_assignment() -> None:
     waiter = main.WAITERS[0]
     status, _, _ = http_post("/assign-waiter", {"id": str(rid), "waiter": waiter}, "role=manager")
     assigned = main.get_reservation(rid)
-    if status in (200, 303) and assigned and assigned["assigned_waiter"] == waiter:
+    if status in (200, 303) and assigned and main.assigned_waiters_from_row(assigned) == [waiter]:
         ok("Przypisanie kelnera", waiter)
     else:
         fail("Przypisanie kelnera", f"status={status}")
 
+    if len(main.WAITERS) > 1:
+        second_waiter = main.WAITERS[1]
+        status, _, _ = http_post(
+            "/assign-waiter",
+            {"id": str(rid), "waiter": second_waiter},
+            "role=manager",
+        )
+        multi_waiter = main.get_reservation(rid)
+        if (
+            status in (200, 303)
+            and multi_waiter
+            and main.assigned_waiters_from_row(multi_waiter) == [waiter, second_waiter]
+        ):
+            ok("Przypisanie drugiego kelnera", second_waiter)
+        else:
+            fail("Przypisanie drugiego kelnera", f"status={status}")
+
+        status, _, _ = http_post(
+            "/assign-waiter",
+            {"id": str(rid), "remove_waiter": waiter},
+            "role=manager",
+        )
+        after_waiter_remove = main.get_reservation(rid)
+        if (
+            status in (200, 303)
+            and after_waiter_remove
+            and main.assigned_waiters_from_row(after_waiter_remove) == [second_waiter]
+        ):
+            ok("Usunięcie jednego z kelnerów", waiter)
+        else:
+            fail("Usunięcie jednego z kelnerów", f"status={status}")
+
     animator = main.ANIMATORS[0]
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": animator}, "role=animators")
+    status, _, _ = http_post(
+        "/assign-animator",
+        {"id": str(rid), "animator": animator, "slot": "anim:0"},
+        "role=animators",
+    )
     assigned = main.get_reservation(rid)
-    if status in (200, 303) and assigned and assigned["assigned_animator"] == animator:
+    if status in (200, 303) and assigned and main.assigned_animators_for_slot(assigned, "anim:0") == [animator]:
         ok("Przypisanie animatora", animator)
     else:
         fail("Przypisanie animatora", f"status={status}")
 
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": "Nie ma takiej osoby"}, "role=animators")
+    status, _, _ = http_post(
+        "/assign-animator",
+        {"id": str(rid), "animator": "Nie ma takiej osoby", "slot": "anim:0"},
+        "role=animators",
+    )
     still_assigned = main.get_reservation(rid)
-    if status in (200, 303) and still_assigned and still_assigned["assigned_animator"] == animator:
+    if (
+        status in (200, 303)
+        and still_assigned
+        and main.assigned_animators_for_slot(still_assigned, "anim:0") == [animator]
+    ):
         ok("Nieprawidłowy animator odrzucony")
     else:
         fail("Nieprawidłowy animator", f"status={status}")
 
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": ""}, "role=animators")
+    if len(main.ANIMATORS) > 1:
+        second = main.ANIMATORS[1]
+        status, _, _ = http_post(
+            "/assign-animator",
+            {"id": str(rid), "animator": second, "slot": "anim:0"},
+            "role=animators",
+        )
+        multi = main.get_reservation(rid)
+        if (
+            status in (200, 303)
+            and multi
+            and main.assigned_animators_for_slot(multi, "anim:0") == [animator, second]
+        ):
+            ok("Przypisanie drugiego animatora", second)
+        else:
+            fail("Przypisanie drugiego animatora", f"status={status}")
+
+        status, _, _ = http_post(
+            "/assign-animator",
+            {"id": str(rid), "animator": second, "slot": "anim:1"},
+            "role=animators",
+        )
+        per_animation = main.get_reservation(rid)
+        if (
+            status in (200, 303)
+            and per_animation
+            and main.assigned_animators_for_slot(per_animation, "anim:0") == [animator, second]
+            and main.assigned_animators_for_slot(per_animation, "anim:1") == [second]
+        ):
+            ok("Przypisanie animatora do drugiej animacji", second)
+        else:
+            fail("Przypisanie animatora do drugiej animacji", f"status={status}")
+
+        status, _, _ = http_post(
+            "/assign-animator",
+            {"id": str(rid), "remove_animator": animator, "slot": "anim:0"},
+            "role=animators",
+        )
+        after_remove = main.get_reservation(rid)
+        if (
+            status in (200, 303)
+            and after_remove
+            and main.assigned_animators_for_slot(after_remove, "anim:0") == [second]
+            and main.assigned_animators_for_slot(after_remove, "anim:1") == [second]
+        ):
+            ok("Usunięcie jednego z animatorów", animator)
+        else:
+            fail("Usunięcie jednego z animatorów", f"status={status}")
+
+    status, _, _ = http_post(
+        "/assign-animator",
+        {"id": str(rid), "animator": "", "slot": "anim:0"},
+        "role=animators",
+    )
     removed = main.get_reservation(rid)
-    if status in (200, 303) and removed and not removed["assigned_animator"]:
+    if status in (200, 303) and removed and not main.assigned_animators_for_slot(removed, "anim:0"):
         ok("Usunięcie przypisania animatora")
     else:
         fail("Usunięcie przypisania animatora", f"status={status}")
 
-    status, _, _ = http_post("/assign-animator", {"id": str(rid), "animator": animator}, "role=manager")
+    status, _, _ = http_post(
+        "/assign-animator",
+        {"id": str(rid), "animator": animator, "slot": "anim:0"},
+        "role=manager",
+    )
     blocked = main.get_reservation(rid)
-    if status in (200, 303) and blocked and not blocked["assigned_animator"]:
+    if status in (200, 303) and blocked and not main.assigned_animators_for_slot(blocked, "anim:0"):
         ok("Kierownik nie przypisuje animatora")
     else:
         fail("Kierownik nie powinien przypisywać animatora", f"status={status}")
 
     animator_rid = created_ids[1] if len(created_ids) > 1 else rid
-    status, _, _ = http_post("/assign-animator", {"id": str(animator_rid), "animator": animator}, "role=animators")
+    status, _, _ = http_post(
+        "/assign-animator",
+        {"id": str(animator_rid), "animator": animator, "slot": "anim:0"},
+        "role=animators",
+    )
     assigned_by_animator = main.get_reservation(animator_rid)
-    if status in (200, 303) and assigned_by_animator and assigned_by_animator["assigned_animator"] == animator:
+    if (
+        status in (200, 303)
+        and assigned_by_animator
+        and main.assigned_animators_for_slot(assigned_by_animator, "anim:0") == [animator]
+    ):
         ok("Przypisanie animatora z zakładki Animatorzy", animator)
     else:
         fail("Przypisanie animatora z zakładki Animatorzy", f"status={status}")

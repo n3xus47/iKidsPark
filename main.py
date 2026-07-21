@@ -59,6 +59,7 @@ from ikidspark_config import (
     SERVICE_OVERLAP_MESSAGE,
     STAGE_BLOCK_END,
     STAGE_BLOCK_MESSAGE,
+    STAGE_BLOCK_CONFIRM_PROMPT,
     STAGE_BLOCK_START,
     STATUS_LABELS,
     TABLE_GROUP_NUMBERS,
@@ -236,6 +237,7 @@ def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
             notes TEXT NOT NULL DEFAULT '',
             assigned_waiter TEXT,
             assigned_animator TEXT,
+            cooperation_enabled INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
             cancellation_reason TEXT,
             created_at TEXT NOT NULL,
@@ -290,6 +292,7 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
         "parent_phone": "TEXT",
         "assigned_waiter": "TEXT",
         "assigned_animator": "TEXT",
+        "cooperation_enabled": "INTEGER NOT NULL DEFAULT 0",
     }
     for column, definition in schema_columns.items():
         if column in columns:
@@ -633,14 +636,10 @@ def reservation_plan_tip(row: DbRow | dict[str, object]) -> str:
             child_part = f"{name}, {age} lat" if age not in (None, "") else name
         else:
             child_part = str(row.get("birthday_child_name") or "Solenizant").strip()
-    if isinstance(row, dict):
-        waiter = str(row.get("assigned_waiter") or "").strip()
-        animator = str(row.get("assigned_animator") or "").strip()
-    else:
-        waiter = str(row["assigned_waiter"] or "").strip() if "assigned_waiter" in row.keys() else ""
-        animator = str(row["assigned_animator"] or "").strip() if "assigned_animator" in row.keys() else ""
-    waiter_part = waiter if waiter else "brak kelnera"
-    animator_part = animator if animator else "brak animatora"
+    waiters = assigned_waiters_from_row(row)
+    animators = assigned_animators_from_row(row)
+    waiter_part = ", ".join(waiters) if waiters else "brak kelnera"
+    animator_part = ", ".join(animators) if animators else "brak animatora"
     return f"{child_part} · {waiter_part} · {animator_part}"
 
 
@@ -1036,9 +1035,11 @@ def validate_reservation(
     pinata_enabled = 0 if is_table else checked_bool(data, "pinata_enabled")
     mascot_enabled = 0 if is_table else checked_bool(data, "mascot_enabled")
     balloons_enabled = 0 if is_table else checked_bool(data, "balloons_enabled")
+    cooperation_enabled = checked_bool(data, "cooperation_enabled")
 
     parsed_animations = parse_animations(data) if animation_enabled else []
     animations: list[dict[str, object]] = []
+    stage_block_fields: list[str] = []
     for index, item in enumerate(parsed_animations):
         anim_type = str(item.get("type") or "").strip()
         anim_at_raw = str(item.get("at") or "").strip()
@@ -1049,7 +1050,7 @@ def validate_reservation(
             errors["animation_at"] = "Podaj godzinę startu każdej animacji (HH:MM)."
         else:
             if overlaps_stage_block(anim_time, SERVICE_DURATIONS["animation_at"]):
-                errors["animation_at"] = STAGE_BLOCK_MESSAGE
+                stage_block_fields.append("animation_at")
             animations.append(
                 {
                     "type": anim_type,
@@ -1137,6 +1138,10 @@ def validate_reservation(
         ("mascot_at", mascot_time, SERVICE_DURATIONS["mascot_at"]),
     ):
         if overlaps_stage_block(value, duration):
+            stage_block_fields.append(field)
+
+    if stage_block_fields and not checked_bool(data, "stage_block_acknowledged"):
+        for field in dict.fromkeys(stage_block_fields):
             errors[field] = STAGE_BLOCK_MESSAGE
 
     parent_name = parse_text_field(data, errors, "parent_name", "Rodzic / osoba rezerwująca")
@@ -1252,6 +1257,7 @@ def validate_reservation(
         "balloons_at": combine_day_time(reservation_day, balloons_time) if balloons_enabled else None,
         "attraction_at": None,
         "notes": data.get("notes", "").strip(),
+        "cooperation_enabled": 1 if cooperation_enabled else 0,
         "status": status,
         "cancellation_reason": cancellation_reason,
     }
@@ -1348,6 +1354,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["balloons_at"],
         values["attraction_at"],
         values["notes"],
+        values.get("cooperation_enabled") or 0,
         values["status"],
         values["cancellation_reason"],
     )
@@ -1372,7 +1379,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
                 mascot_enabled = ?, mascot_type = ?, mascot_at = ?,
                 balloons_enabled = ?, balloons_description = ?, balloons_at = ?,
                 attraction_at = ?,
-                notes = ?, status = ?, cancellation_reason = ?,
+                notes = ?, cooperation_enabled = ?, status = ?, cancellation_reason = ?,
                 updated_at = ?
             WHERE id = ?
             """,
@@ -1397,10 +1404,10 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             mascot_enabled, mascot_type, mascot_at,
             balloons_enabled, balloons_description, balloons_at,
             attraction_at,
-            notes, status, cancellation_reason,
+            notes, cooperation_enabled, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -1410,46 +1417,240 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
     return new_id
 
 
-def assign_waiter(reservation_id: int, waiter: str | None, role: str) -> bool:
+def assign_waiter(
+    reservation_id: int,
+    waiter: str | None,
+    role: str,
+    *,
+    remove_waiter: str | None = None,
+) -> bool:
     row = get_reservation(reservation_id)
     if row is None:
         return False
 
+    current = assigned_waiters_from_row(row)
+    remove_value = remove_waiter.strip() if remove_waiter and remove_waiter.strip() else None
     waiter_value = waiter.strip() if waiter and waiter.strip() else None
-    if waiter_value is not None and waiter_value not in WAITERS:
-        return False
 
+    if remove_value:
+        next_names = [name for name in current if name != remove_value]
+        action = "waiter_removed"
+    elif waiter_value:
+        if waiter_value not in WAITERS:
+            return False
+        next_names = list(current)
+        if waiter_value not in next_names:
+            next_names.append(waiter_value)
+        action = "waiter_assigned"
+    else:
+        next_names = []
+        action = "waiter_removed"
+
+    stored = format_assigned_waiters(next_names)
     execute(
         "UPDATE reservations SET assigned_waiter = ?, updated_at = ? WHERE id = ?",
-        (waiter_value, now_iso(), reservation_id),
+        (stored, now_iso(), reservation_id),
     )
     updated = get_reservation(reservation_id)
     if updated is None:
         return False
 
-    action = "waiter_assigned" if waiter_value else "waiter_removed"
     record_history(reservation_id, action, role, updated)
     return True
 
 
-def assign_animator(reservation_id: int, animator: str | None, role: str) -> bool:
+def parse_assigned_waiters(raw: object) -> list[str]:
+    value = str(raw or "").strip()
+    if not value:
+        return []
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            names = [str(name).strip() for name in parsed if str(name).strip()]
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for name in names:
+                if name in seen:
+                    continue
+                seen.add(name)
+                ordered.append(name)
+            return ordered
+    return parse_assigned_animators(value)
+
+
+def format_assigned_waiters(names: list[str]) -> str | None:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        cleaned_name = str(name or "").strip()
+        if not cleaned_name or cleaned_name in seen:
+            continue
+        seen.add(cleaned_name)
+        cleaned.append(cleaned_name)
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return " | ".join(cleaned)
+
+
+def assigned_waiters_from_row(row: DbRow | dict[str, object]) -> list[str]:
+    if isinstance(row, dict):
+        raw = row.get("assigned_waiter")
+    else:
+        raw = row["assigned_waiter"] if "assigned_waiter" in row.keys() else ""
+    return parse_assigned_waiters(raw)
+
+
+def parse_assigned_animators(raw: object) -> list[str]:
+    value = str(raw or "").strip()
+    if not value:
+        return []
+    if " | " in value:
+        parts = [part.strip() for part in value.split(" | ") if part.strip()]
+    else:
+        parts = [value]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in parts:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def normalize_animator_slot(slot: str | None) -> str | None:
+    value = str(slot or "").strip()
+    if value in {"pinata", "mascot"}:
+        return value
+    if value.startswith("anim:") and value[5:].isdigit():
+        return value
+    return None
+
+
+def parse_assigned_animators_map(raw: object) -> dict[str, list[str]]:
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    if value.startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            mapping: dict[str, list[str]] = {}
+            for key, names_raw in parsed.items():
+                slot = normalize_animator_slot(str(key))
+                if not slot:
+                    continue
+                if isinstance(names_raw, list):
+                    names = [str(name).strip() for name in names_raw if str(name).strip()]
+                else:
+                    names = parse_assigned_animators(names_raw)
+                if names:
+                    mapping[slot] = names
+            return mapping
+    legacy = parse_assigned_animators(value)
+    return {"anim:0": legacy} if legacy else {}
+
+
+def format_assigned_animators_map(mapping: dict[str, list[str]]) -> str | None:
+    cleaned: dict[str, list[str]] = {}
+    for key, names in mapping.items():
+        slot = normalize_animator_slot(key)
+        if not slot:
+            continue
+        unique: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            cleaned_name = str(name or "").strip()
+            if not cleaned_name or cleaned_name in seen:
+                continue
+            seen.add(cleaned_name)
+            unique.append(cleaned_name)
+        if unique:
+            cleaned[slot] = unique
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+
+
+def assigned_animators_map_from_row(row: DbRow | dict[str, object]) -> dict[str, list[str]]:
+    if isinstance(row, dict):
+        raw = row.get("assigned_animator")
+    else:
+        raw = row["assigned_animator"] if "assigned_animator" in row.keys() else ""
+    return parse_assigned_animators_map(raw)
+
+
+def assigned_animators_for_slot(row: DbRow | dict[str, object], slot: str) -> list[str]:
+    normalized = normalize_animator_slot(slot) or "anim:0"
+    return list(assigned_animators_map_from_row(row).get(normalized, []))
+
+
+def assigned_animators_from_row(row: DbRow | dict[str, object]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for names in assigned_animators_map_from_row(row).values():
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def assign_animator(
+    reservation_id: int,
+    animator: str | None,
+    role: str,
+    *,
+    remove_animator: str | None = None,
+    slot: str | None = "anim:0",
+) -> bool:
     row = get_reservation(reservation_id)
     if row is None:
         return False
 
-    animator_value = animator.strip() if animator and animator.strip() else None
-    if animator_value is not None and animator_value not in ANIMATORS:
+    normalized_slot = normalize_animator_slot(slot)
+    if normalized_slot is None:
         return False
 
+    mapping = assigned_animators_map_from_row(row)
+    current = list(mapping.get(normalized_slot, []))
+    remove_value = remove_animator.strip() if remove_animator and remove_animator.strip() else None
+    animator_value = animator.strip() if animator and animator.strip() else None
+
+    if remove_value:
+        next_names = [name for name in current if name != remove_value]
+        action = "animator_removed"
+    elif animator_value:
+        if animator_value not in ANIMATORS:
+            return False
+        next_names = list(current)
+        if animator_value not in next_names:
+            next_names.append(animator_value)
+        action = "animator_assigned"
+    else:
+        next_names = []
+        action = "animator_removed"
+
+    if next_names:
+        mapping[normalized_slot] = next_names
+    else:
+        mapping.pop(normalized_slot, None)
+
+    stored = format_assigned_animators_map(mapping)
     execute(
         "UPDATE reservations SET assigned_animator = ?, updated_at = ? WHERE id = ?",
-        (animator_value, now_iso(), reservation_id),
+        (stored, now_iso(), reservation_id),
     )
     updated = get_reservation(reservation_id)
     if updated is None:
         return False
 
-    action = "animator_assigned" if animator_value else "animator_removed"
     record_history(reservation_id, action, role, updated)
     return True
 
@@ -1512,6 +1713,44 @@ def get_reservations_for_days(iso_dates: list[str]) -> dict[str, list[DbRow]]:
             if start_at < day_end and end_at > day_start:
                 result[iso].append(row)
     return result
+
+
+def get_reservations_created_between(range_start: str, range_end: str) -> list[DbRow]:
+    """Rezerwacje wpisane do systemu w oknie czasu (created_at)."""
+    return db_rows(
+        """
+        SELECT *
+        FROM reservations
+        WHERE created_at >= ? AND created_at < ?
+        ORDER BY created_at ASC, id ASC
+        """,
+        (range_start, range_end),
+    )
+
+
+def get_reservations_created_on_day(target_day: date) -> list[DbRow]:
+    start, end = day_bounds(target_day)
+    return get_reservations_created_between(start, end)
+
+
+def get_reservations_for_month(year: int, month: int) -> list[DbRow]:
+    """Rezerwacje wpisane w danym miesiącu kalendarzowym (po created_at)."""
+    first = date(year, month, 1)
+    nxt = next_calendar_month(first)
+    return get_reservations_created_between(
+        datetime.combine(first, time.min).isoformat(timespec="minutes"),
+        datetime.combine(nxt, time.min).isoformat(timespec="minutes"),
+    )
+
+
+def reservation_party_date(row: DbRow | dict[str, object]) -> date | None:
+    raw = str(row.get("start_at") or "")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).date()
+    except ValueError:
+        return None
 
 
 def get_all_reservations() -> list[DbRow]:
@@ -2068,7 +2307,14 @@ def field_time(values: dict[str, object], field: str) -> str:
 
 
 def is_enabled(row: DbRow | dict[str, object], field: str) -> bool:
-    return int(row[field] or 0) == 1
+    try:
+        value = row.get(field) if isinstance(row, dict) else row[field]
+    except (KeyError, IndexError, TypeError):
+        return False
+    try:
+        return int(value or 0) == 1
+    except (TypeError, ValueError):
+        return False
 
 
 def selected(current: object, value: str) -> str:
@@ -3081,20 +3327,22 @@ def page_template(
     .topbar-section {{
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       z-index: 2;
       min-width: 0;
+      width: 100%;
     }}
 
     .topbar-section-left {{
       grid-column: 1;
       grid-row: 1;
-      justify-self: start;
+      justify-self: stretch;
     }}
 
     .topbar-section-right {{
       grid-column: 3;
       grid-row: 1;
-      justify-self: end;
+      justify-self: stretch;
     }}
 
     .topbar-link {{
@@ -3108,13 +3356,13 @@ def page_template(
       display: inline-flex;
       align-items: center;
       white-space: nowrap;
-      border: 1px solid #a6a6a6;
+      border: 1px solid #000000;
       border-radius: 7px;
       gap: 7px;
       cursor: pointer;
       text-decoration: none;
-      background: #fff;
-      color: #000;
+      background: #ffffff;
+      color: #000000;
     }}
 
     .topbar-link:hover {{
@@ -3122,14 +3370,14 @@ def page_template(
     }}
 
     .topbar-link.is-active {{
-      background: var(--brand);
-      border-color: var(--brand);
-      color: #fff;
+      background: #000000;
+      border-color: #000000;
+      color: #ffffff;
     }}
 
     .topbar-link.is-active:hover {{
-      background: var(--brand-dark);
-      border-color: var(--brand-dark);
+      background: #1a1a1a;
+      border-color: #000000;
     }}
 
     .install-button {{
@@ -3382,6 +3630,80 @@ def page_template(
       gap: 10px;
       flex-wrap: wrap;
       margin: 0;
+      align-items: center;
+    }}
+
+    .organizer-report-panel {{
+      margin: 0;
+      display: inline-flex;
+      align-items: center;
+    }}
+
+    .shift-report-copy {{
+      appearance: none;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font: inherit;
+      font-weight: 800;
+      font-size: 0.82rem;
+      min-height: 36px;
+      padding: 0 10px 0 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      text-decoration: none;
+    }}
+
+    .shift-report-copy:hover {{
+      background: #eeeeee;
+    }}
+
+    .shift-report-copy:focus-visible {{
+      outline: 2px solid var(--brand);
+      outline-offset: 2px;
+    }}
+
+    .shift-report-copy.is-copied {{
+      background: color-mix(in srgb, var(--ok) 14%, white);
+      border-color: var(--ok);
+    }}
+
+    .shift-report-copy__icon {{
+      width: 16px;
+      height: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+    }}
+
+    .shift-report-copy__icon svg {{
+      width: 100%;
+      height: 100%;
+      display: block;
+    }}
+
+    .cooperation-toggle {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      margin: 0;
+    }}
+
+    .cooperation-toggle input {{
+      width: 18px;
+      height: 18px;
+      min-height: 18px;
+      accent-color: var(--brand);
+    }}
+
+    .profile-tag-cooperation {{
+      background: color-mix(in srgb, var(--orange) 18%, white);
+      border-color: color-mix(in srgb, var(--orange) 45%, white);
+      color: #9a4d00;
     }}
 
     .organizer-layout {{
@@ -4384,6 +4706,26 @@ def page_template(
       margin: 0;
     }}
 
+    .timeline-header .animator-assign--waiter {{
+      margin-left: auto;
+      flex: 0 1 auto;
+      max-width: min(100%, 28rem);
+    }}
+
+    .timeline-header.has-color .animator-assign__icon-btn {{
+      background: #ffffff;
+      border-color: rgba(0, 0, 0, 0.18);
+      color: #111111;
+    }}
+
+    .timeline-header.has-color .animator-assign__chip {{
+      background: rgba(255, 255, 255, 0.92);
+    }}
+
+    .timeline-card {{
+      overflow: visible;
+    }}
+
     .timeline-header.has-color {{
       background: var(--reservation-color);
       border-radius: 12px;
@@ -4521,6 +4863,267 @@ def page_template(
 
     .waiter-remove-btn {{
       color: var(--danger);
+    }}
+
+    .visually-hidden {{
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }}
+
+    .task-label-row {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }}
+
+    .task-label-row .task-label {{
+      flex: 1 1 auto;
+      min-width: 0;
+    }}
+
+    .animator-assign {{
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 4px;
+      flex: 0 0 auto;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }}
+
+    .animator-assign__chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      flex: 0 0 auto;
+      width: max-content;
+      height: 32px;
+      max-width: min(100%, 14rem);
+      padding: 0 1px 0 2px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--ok) 14%, white);
+      color: #3f6212;
+      font-size: 0.74rem;
+      font-weight: 800;
+      line-height: 1;
+    }}
+
+    .animator-assign__chip-initials {{
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      display: inline-grid;
+      place-items: center;
+      flex: 0 0 auto;
+      background: color-mix(in srgb, var(--ok) 22%, white);
+      font-size: 0.62rem;
+      letter-spacing: 0.02em;
+      line-height: 1;
+    }}
+
+    .animator-assign__chip-name {{
+      min-width: 0;
+      flex: 0 1 auto;
+      padding: 0 2px 0 1px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      line-height: 1;
+    }}
+
+    .animator-assign__chip-remove-form {{
+      margin: 0;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      flex: 0 0 auto;
+      width: auto;
+    }}
+
+    button.animator-assign__chip-remove {{
+      appearance: none;
+      box-sizing: border-box;
+      width: 18px;
+      height: 18px;
+      min-height: 0;
+      min-width: 0;
+      padding: 0;
+      margin: 0;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: #3f6212;
+      font-family: inherit;
+      font-size: 0.85rem;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: 0;
+      display: inline-grid;
+      place-items: center;
+      cursor: pointer;
+    }}
+
+    button.animator-assign__chip-remove:hover {{
+      background: color-mix(in srgb, var(--danger) 14%, white);
+      color: var(--danger);
+    }}
+
+    .animator-assign__avatar {{
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      display: inline-grid;
+      place-items: center;
+      flex: 0 0 auto;
+      background: color-mix(in srgb, var(--brand) 16%, white);
+      color: var(--brand-dark);
+      font-size: 0.68rem;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }}
+
+    .animator-assign__picker {{
+      position: relative;
+      flex: 0 0 auto;
+      z-index: 1;
+    }}
+
+    .animator-assign__picker[open] {{
+      z-index: 14000;
+    }}
+
+    .animator-assign__icon-btn {{
+      list-style: none;
+      cursor: pointer;
+      display: inline-grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      padding: 0;
+      border: 1px solid color-mix(in srgb, var(--brand) 28%, var(--line));
+      border-radius: 999px;
+      background: #ffffff;
+      color: var(--brand-dark);
+      box-shadow: none;
+    }}
+
+    .animator-assign__icon-btn::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .animator-assign__icon-btn:hover,
+    .animator-assign__picker[open] > .animator-assign__icon-btn {{
+      background: color-mix(in srgb, var(--brand) 10%, white);
+      border-color: color-mix(in srgb, var(--brand) 45%, var(--line));
+    }}
+
+    .animator-assign.is-assigned .animator-assign__icon-btn {{
+      border-color: var(--line);
+      color: var(--ink);
+    }}
+
+    .animator-assign__icon-btn svg {{
+      width: 16px;
+      height: 16px;
+      display: block;
+    }}
+
+    .animator-assign__sheet {{
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      left: auto;
+      z-index: 14000;
+      width: min(300px, 86vw);
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #ffffff;
+      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.2);
+    }}
+
+    .animator-assign__sheet.is-ported {{
+      position: fixed;
+      margin: 0;
+    }}
+
+    .animator-assign__search input {{
+      width: 100%;
+      min-height: 40px;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f8f8f8;
+      padding: 0 12px;
+      font: inherit;
+      font-size: 0.9rem;
+    }}
+
+    .animator-assign__search input:focus {{
+      outline: 2px solid var(--brand);
+      outline-offset: 1px;
+      background: #ffffff;
+    }}
+
+    .animator-assign__list {{
+      display: grid;
+      gap: 4px;
+      max-height: 240px;
+      overflow-y: auto;
+      padding-right: 2px;
+    }}
+
+    .animator-assign__option-form {{
+      margin: 0;
+      padding: 0;
+    }}
+
+    .animator-assign__option {{
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 40px;
+      padding: 6px 8px;
+      border: 0;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+    }}
+
+    .animator-assign__option:hover {{
+      background: color-mix(in srgb, var(--brand) 10%, white);
+    }}
+
+    .animator-assign__option-name {{
+      min-width: 0;
+      line-height: 1.25;
+    }}
+
+    .animator-assign__empty {{
+      margin: 0;
+      padding: 12px 8px;
+      color: var(--muted);
+      font-size: 0.86rem;
+      text-align: center;
     }}
 
     .timeline-start {{
@@ -5603,6 +6206,21 @@ def page_template(
       overflow: hidden;
     }}
 
+    .animator-board {{
+      overflow: visible;
+    }}
+
+    .animator-board .banquet-grid {{
+      overflow: visible;
+    }}
+
+    .animator-card .banquet-tasks,
+    .animator-card .banquet-task,
+    .animator-card .task-detail,
+    .animator-card .task-label-row {{
+      overflow: visible;
+    }}
+
     .role-board .section-head {{
       border: 1px solid var(--line);
       border-bottom: 0;
@@ -5684,6 +6302,16 @@ def page_template(
       background: #ffffff;
       box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
       overflow: hidden;
+    }}
+
+    .role-card.animator-card {{
+      position: relative;
+      overflow: visible;
+      z-index: 1;
+    }}
+
+    .role-card.animator-card:has(.animator-assign__picker[open]) {{
+      z-index: 14000;
     }}
 
     .role-card-head {{
@@ -6718,21 +7346,17 @@ def page_template(
         flex: 1 1 auto;
       }}
 
-      .timeline-header .waiter-assignment,
+      .timeline-header .animator-assign--waiter,
       .timeline-header .timeline-status {{
         order: 3;
       }}
 
-      .timeline-header .waiter-assignment {{
+      .timeline-header .animator-assign--waiter {{
         width: 100%;
         flex-basis: 100%;
         flex-wrap: wrap;
         justify-content: flex-start;
         margin-left: 0;
-      }}
-
-      .waiter-picker {{
-        flex: 1 1 150px;
       }}
 
       .waiter-picker > summary, .waiter-remove-btn {{
@@ -7105,6 +7729,9 @@ def plan_fullscreen_script() -> str:
 
 
 def render_organizer_tools(role: str, day: str) -> str:
+    target_day = selected_day(normalize_day(day))
+    report_text = format_organizer_report_text(target_day)
+    report_json = json.dumps(report_text, ensure_ascii=False)
     return f"""
 <section class="role-board organizer-tools-board">
   <div class="section-head">
@@ -7113,11 +7740,56 @@ def render_organizer_tools(role: str, day: str) -> str:
       <p class="subtitle">Nowa rezerwacja, edycja oraz narzędzia dnia.</p>
     </div>
     <div class="organizer-tools">
+      <div class="shift-report-panel organizer-report-panel">
+        <button type="button" id="organizer-report-copy" class="shift-report-copy" aria-label="Kopiuj raport organizatora">
+          <span class="shift-report-copy__label">Raport</span>
+          <span class="shift-report-copy__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2"/>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+          </span>
+        </button>
+      </div>
       <a class="button secondary" href="/schema?role={escape(role)}&day={escape(day)}">Struktura bazy</a>
       <a class="button secondary" href="/export">Eksport CSV</a>
     </div>
   </div>
 </section>
+<script>
+(() => {{
+  const button = document.getElementById("organizer-report-copy");
+  if (!button) return;
+  const reportText = {report_json};
+  let feedbackTimer = 0;
+  function showCopied() {{
+    button.classList.add("is-copied");
+    window.clearTimeout(feedbackTimer);
+    feedbackTimer = window.setTimeout(() => button.classList.remove("is-copied"), 1600);
+  }}
+  button.addEventListener("click", async () => {{
+    try {{
+      await navigator.clipboard.writeText(reportText);
+      showCopied();
+      return;
+    }} catch (_err) {{
+      const helper = document.createElement("textarea");
+      helper.value = reportText;
+      helper.setAttribute("readonly", "");
+      helper.style.position = "fixed";
+      helper.style.left = "-9999px";
+      document.body.appendChild(helper);
+      helper.select();
+      try {{
+        document.execCommand("copy");
+        showCopied();
+      }} finally {{
+        helper.remove();
+      }}
+    }}
+  }});
+}})();
+</script>
 """
 
 
@@ -7371,6 +8043,7 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "balloons_at": "",
         "attraction_at": "",
         "notes": "",
+        "cooperation_enabled": 0,
         "status": "active",
         "cancellation_reason": "",
     }
@@ -7740,6 +8413,8 @@ def render_role_card_identity(
     if show_total_guests_tag:
         total_guests = int_row_value(row, "guest_total") or int_row_value(row, "children_count") + int_row_value(row, "adults_count")
         age_tags += f'<span class="profile-tag profile-tag-guests">{escape(total_guests)} osób</span>'
+    if is_enabled(row, "cooperation_enabled"):
+        age_tags += '<span class="profile-tag profile-tag-cooperation">Współpraca</span>'
     tags_block = f'<div class="profile-tags">{age_tags}</div>' if age_tags else ""
     guests = escape(guest_count_label(row))
     guest_summary = f'<div class="role-guest-summary">Goście: <strong>{guests}</strong></div>' if show_guest_summary else ""
@@ -7898,91 +8573,312 @@ def render_waiter_assignment(row: DbRow, role: str, day: str) -> str:
         return ""
 
     reservation_id = int(row["id"])
-    assigned = str(row["assigned_waiter"] or "").strip()
+    assigned = assigned_waiters_from_row(row)
     action = f"/assign-waiter?role={escape(role)}&day={escape(day)}"
-    available_waiters = [name for name in WAITERS if name != assigned]
-    options = "".join(
-        f"""
-        <form method="post" action="{action}" class="waiter-option-form">
+    available_waiters = [name for name in WAITERS if name not in assigned]
+    assigned_class = " is-assigned" if assigned else ""
+    aria_label = "Dodaj kelnera"
+
+    def option_button(name: str) -> str:
+        return f"""
+        <form method="post" action="{action}" class="animator-assign__option-form">
           <input type="hidden" name="id" value="{reservation_id}">
           <input type="hidden" name="waiter" value="{escape(name)}">
-          <button type="submit" class="button secondary waiter-option">{escape(name)}</button>
+          <button type="submit" class="animator-assign__option" data-staff-option>
+            <span class="animator-assign__avatar" aria-hidden="true">{escape(staff_initials(name))}</span>
+            <span class="animator-assign__option-name">{escape(name)}</span>
+          </button>
         </form>
         """
-        for name in available_waiters
-    )
-    empty_options = '<span class="muted">Brak innych kelnerów</span>' if assigned else '<span class="muted">Brak kelnerów</span>'
 
-    if assigned:
+    def assigned_chip(name: str) -> str:
         return f"""
-      <div class="waiter-assignment is-assigned">
-        <span class="waiter-assignment-label">Kelner: <strong>{escape(assigned)}</strong></span>
-        <details class="waiter-picker">
-          <summary class="button secondary">Zmień</summary>
-          <div class="waiter-options">{options or empty_options}</div>
+        <span class="animator-assign__chip" title="{escape(name)}">
+          <span class="animator-assign__chip-initials" aria-hidden="true">{escape(staff_initials(name))}</span>
+          <span class="animator-assign__chip-name">{escape(name)}</span>
+          <form method="post" action="{action}" class="animator-assign__chip-remove-form">
+            <input type="hidden" name="id" value="{reservation_id}">
+            <input type="hidden" name="remove_waiter" value="{escape(name)}">
+            <button type="submit" class="animator-assign__chip-remove" aria-label="Usuń {escape(name)}" title="Usuń">×</button>
+          </form>
+        </span>
+        """
+
+    options = "".join(option_button(name) for name in available_waiters)
+    chips = "".join(assigned_chip(name) for name in assigned)
+    empty_options = (
+        '<p class="animator-assign__empty">Wszyscy kelnerzy już przypisani</p>'
+        if assigned
+        else '<p class="animator-assign__empty">Brak kelnerów na liście</p>'
+    )
+    add_picker = (
+        f"""
+        <details class="animator-assign__picker" data-staff-picker>
+          <summary class="animator-assign__icon-btn" aria-label="{escape(aria_label)}" title="{escape(aria_label)}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M19 8v6M22 11h-6"/>
+            </svg>
+          </summary>
+          <div class="animator-assign__sheet">
+            <label class="animator-assign__search">
+              <span class="visually-hidden">Szukaj kelnera</span>
+              <input type="search" placeholder="Szukaj po imieniu…" autocomplete="off" data-staff-filter>
+            </label>
+            <div class="animator-assign__list" data-staff-list>
+              {options or empty_options}
+            </div>
+          </div>
         </details>
-        <form method="post" action="{action}" class="inline-form">
-          <input type="hidden" name="id" value="{reservation_id}">
-          <input type="hidden" name="waiter" value="">
-          <button type="submit" class="button secondary waiter-remove-btn">Usuń</button>
-        </form>
-      </div>
-    """
+        """
+        if available_waiters or not assigned
+        else ""
+    )
 
     return f"""
-      <div class="waiter-assignment">
-        <details class="waiter-picker">
-          <summary class="button secondary">Przypisz kelnera</summary>
-          <div class="waiter-options">{options or empty_options}</div>
-        </details>
+      <div class="animator-assign animator-assign--waiter{assigned_class}" data-staff-assign>
+        {chips}
+        {add_picker}
       </div>
     """
 
 
-def render_animator_assignment(row: DbRow, role: str, day: str) -> str:
+def render_animator_assignment(row: DbRow, role: str, day: str, slot: str = "anim:0") -> str:
     if not can_assign_animator(role):
         return ""
 
+    normalized_slot = normalize_animator_slot(slot)
+    if normalized_slot is None:
+        return ""
+
     reservation_id = int(row["id"])
-    assigned = str(row["assigned_animator"] or "").strip()
+    assigned = assigned_animators_for_slot(row, normalized_slot)
     action = f"/assign-animator?role={escape(role)}&day={escape(day)}"
-    available_animators = [name for name in ANIMATORS if name != assigned]
-    options = "".join(
-        f"""
-        <form method="post" action="{action}" class="waiter-option-form">
+    available_animators = [name for name in ANIMATORS if name not in assigned]
+    assigned_class = " is-assigned" if assigned else ""
+    aria_label = "Dodaj animatora"
+    slot_field = f'<input type="hidden" name="slot" value="{escape(normalized_slot)}">'
+
+    def option_button(name: str) -> str:
+        return f"""
+        <form method="post" action="{action}" class="animator-assign__option-form">
           <input type="hidden" name="id" value="{reservation_id}">
+          {slot_field}
           <input type="hidden" name="animator" value="{escape(name)}">
-          <button type="submit" class="button secondary waiter-option">{escape(name)}</button>
+          <button type="submit" class="animator-assign__option" data-staff-option>
+            <span class="animator-assign__avatar" aria-hidden="true">{escape(staff_initials(name))}</span>
+            <span class="animator-assign__option-name">{escape(name)}</span>
+          </button>
         </form>
         """
-        for name in available_animators
-    )
-    empty_options = '<span class="muted">Brak innych animatorów</span>' if assigned else '<span class="muted">Brak animatorów</span>'
 
-    if assigned:
+    def assigned_chip(name: str) -> str:
         return f"""
-      <div class="waiter-assignment is-assigned">
-        <span class="waiter-assignment-label">Animator: <strong>{escape(assigned)}</strong></span>
-        <details class="waiter-picker">
-          <summary class="button secondary">Zmień</summary>
-          <div class="waiter-options">{options or empty_options}</div>
+        <span class="animator-assign__chip" title="{escape(name)}">
+          <span class="animator-assign__chip-initials" aria-hidden="true">{escape(staff_initials(name))}</span>
+          <span class="animator-assign__chip-name">{escape(name)}</span>
+          <form method="post" action="{action}" class="animator-assign__chip-remove-form">
+            <input type="hidden" name="id" value="{reservation_id}">
+            {slot_field}
+            <input type="hidden" name="remove_animator" value="{escape(name)}">
+            <button type="submit" class="animator-assign__chip-remove" aria-label="Usuń {escape(name)}" title="Usuń">×</button>
+          </form>
+        </span>
+        """
+
+    options = "".join(option_button(name) for name in available_animators)
+    chips = "".join(assigned_chip(name) for name in assigned)
+    empty_options = (
+        '<p class="animator-assign__empty">Wszyscy animatorzy już przypisani</p>'
+        if assigned
+        else '<p class="animator-assign__empty">Brak animatorów na liście</p>'
+    )
+    add_picker = (
+        f"""
+        <details class="animator-assign__picker" data-staff-picker>
+          <summary class="animator-assign__icon-btn" aria-label="{escape(aria_label)}" title="{escape(aria_label)}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M19 8v6M22 11h-6"/>
+            </svg>
+          </summary>
+          <div class="animator-assign__sheet">
+            <label class="animator-assign__search">
+              <span class="visually-hidden">Szukaj animatora</span>
+              <input type="search" placeholder="Szukaj po imieniu…" autocomplete="off" data-staff-filter>
+            </label>
+            <div class="animator-assign__list" data-staff-list>
+              {options or empty_options}
+            </div>
+          </div>
         </details>
-        <form method="post" action="{action}" class="inline-form">
-          <input type="hidden" name="id" value="{reservation_id}">
-          <input type="hidden" name="animator" value="">
-          <button type="submit" class="button secondary waiter-remove-btn">Usuń</button>
-        </form>
-      </div>
-    """
+        """
+        if available_animators or not assigned
+        else ""
+    )
 
     return f"""
-      <div class="waiter-assignment">
-        <details class="waiter-picker">
-          <summary class="button secondary">Przypisz animatora</summary>
-          <div class="waiter-options">{options or empty_options}</div>
-        </details>
+      <div class="animator-assign{assigned_class}" data-staff-assign>
+        {chips}
+        {add_picker}
       </div>
     """
+
+
+def staff_initials(name: str) -> str:
+    parts = [part for part in str(name or "").split() if part]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
+
+def staff_assignment_script() -> str:
+    return """
+<script>
+(() => {
+  const assigns = Array.from(document.querySelectorAll("[data-staff-assign]"));
+  if (!assigns.length) return;
+
+  function normalize(value) {
+    return String(value || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\\u0300-\\u036f]/g, "");
+  }
+
+  function placeSheet(picker) {
+    const sheet = picker.querySelector(".animator-assign__sheet") || picker._portedSheet;
+    const trigger = picker.querySelector(".animator-assign__icon-btn");
+    if (!sheet || !trigger) return;
+    picker._portedSheet = sheet;
+    if (sheet.parentElement !== document.body) {
+      document.body.appendChild(sheet);
+    }
+    sheet.classList.add("is-ported");
+    const rect = trigger.getBoundingClientRect();
+    const width = Math.min(300, window.innerWidth - 16);
+    const maxHeight = Math.min(340, window.innerHeight - 16);
+    let left = rect.right - width;
+    if (left < 8) left = 8;
+    if (left + width > window.innerWidth - 8) {
+      left = Math.max(8, window.innerWidth - width - 8);
+    }
+    let top = rect.bottom + 6;
+    if (top + Math.min(maxHeight, 220) > window.innerHeight - 8) {
+      top = Math.max(8, rect.top - Math.min(maxHeight, 280) - 6);
+    }
+    sheet.style.top = top + "px";
+    sheet.style.left = left + "px";
+    sheet.style.right = "auto";
+    sheet.style.width = width + "px";
+    sheet.style.maxHeight = maxHeight + "px";
+  }
+
+  function restoreSheet(picker) {
+    const sheet = picker._portedSheet || picker.querySelector(".animator-assign__sheet");
+    if (!sheet) return;
+    sheet.classList.remove("is-ported");
+    sheet.style.top = "";
+    sheet.style.left = "";
+    sheet.style.right = "";
+    sheet.style.width = "";
+    sheet.style.maxHeight = "";
+    if (sheet.parentElement !== picker) {
+      picker.appendChild(sheet);
+    }
+  }
+
+  function closeOtherPickers(active) {
+    assigns.forEach((other) => {
+      if (other === active) return;
+      other.querySelectorAll("[data-staff-picker][open]").forEach((node) => {
+        node.open = false;
+      });
+    });
+  }
+
+  assigns.forEach((root) => {
+    const picker = root.querySelector("[data-staff-picker]");
+    if (!picker) return;
+    const filter = () =>
+      (picker._portedSheet || picker).querySelector("[data-staff-filter]");
+    const listRoot = () =>
+      (picker._portedSheet || picker).querySelector("[data-staff-list]");
+    const options = () =>
+      Array.from((picker._portedSheet || picker).querySelectorAll("[data-staff-option]"));
+
+    picker.addEventListener("toggle", () => {
+      if (!picker.open) {
+        const input = filter();
+        if (input) input.value = "";
+        options().forEach((btn) => {
+          const form = btn.closest(".animator-assign__option-form");
+          if (form) form.hidden = false;
+        });
+        listRoot()?.querySelector("[data-staff-empty-filter]")?.remove();
+        restoreSheet(picker);
+        return;
+      }
+      closeOtherPickers(root);
+      placeSheet(picker);
+      const sheet = picker._portedSheet;
+      if (sheet && !sheet.dataset.filterBound) {
+        sheet.dataset.filterBound = "1";
+        sheet.addEventListener("input", (event) => {
+          const target = event.target;
+          if (!(target instanceof Element) || !target.matches("[data-staff-filter]")) return;
+          const query = normalize(target.value.trim());
+          let visible = 0;
+          options().forEach((btn) => {
+            const form = btn.closest(".animator-assign__option-form");
+            const name = normalize(btn.textContent);
+            const show = !query || name.includes(query);
+            if (form) form.hidden = !show;
+            if (show) visible += 1;
+          });
+          const list = listRoot();
+          let empty = list?.querySelector("[data-staff-empty-filter]");
+          if (visible === 0) {
+            if (!empty && list) {
+              empty = document.createElement("p");
+              empty.className = "animator-assign__empty";
+              empty.setAttribute("data-staff-empty-filter", "");
+              empty.textContent = "Brak wyników";
+              list.appendChild(empty);
+            }
+          } else {
+            empty?.remove();
+          }
+        });
+      }
+      window.requestAnimationFrame(() => filter()?.focus());
+    });
+  });
+
+  function repositionOpenSheets() {
+    document.querySelectorAll("[data-staff-picker][open]").forEach((picker) => {
+      placeSheet(picker);
+    });
+  }
+
+  window.addEventListener("resize", repositionOpenSheets);
+  window.addEventListener("scroll", repositionOpenSheets, true);
+
+  document.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest("[data-staff-assign]") || target.closest(".animator-assign__sheet")) return;
+    document.querySelectorAll("[data-staff-picker][open]").forEach((node) => {
+      node.open = false;
+    });
+  });
+})();
+</script>
+"""
 
 
 def render_profile_identity(row: DbRow | dict[str, object]) -> str:
@@ -8001,7 +8897,12 @@ def render_profile_identity(row: DbRow | dict[str, object]) -> str:
         )
     child_location = row["child_location"] if not isinstance(row, dict) else row.get("child_location", "")
     room_tag = render_profile_room_tag(child_location)
-    tags_markup = age_tags + room_tag
+    coop_tag = (
+        '<span class="profile-tag profile-tag-cooperation">Współpraca</span>'
+        if is_enabled(row, "cooperation_enabled")
+        else ""
+    )
+    tags_markup = age_tags + room_tag + coop_tag
     tags_block = f'<div class="profile-tags">{tags_markup}</div>' if tags_markup else ""
     guests_markup = f'<span class="profile-tag profile-tag-guests">{escape(guest_count_label(row))}</span>'
     if tags_block:
@@ -8528,6 +9429,7 @@ def render_form(
   </div>
   <form method="post" action="/reservations?role={escape(role)}&day={escape(day)}" id="reservation-form" class="{form_type_class}">
     <input type="hidden" name="id" id="reservation_id" value="{escape(reservation_id)}">
+    <input type="hidden" name="stage_block_acknowledged" id="stage_block_acknowledged" value="">
     <div class="form-board">
       <div class="form-category">
         <h3 class="category-title">Termin</h3>
@@ -8543,6 +9445,10 @@ def render_form(
               Rezerwacja stolika
             </label>
           </fieldset>
+          <label class="cooperation-toggle full">
+            <input type="checkbox" name="cooperation_enabled" value="1"{checked(values.get("cooperation_enabled"))}>
+            Etykieta: Współpraca
+          </label>
           <label>
             Data
             <input type="date" name="reservation_date" id="reservation_date" value="{escape(values.get("reservation_date", ""))}" required>
@@ -8625,6 +9531,14 @@ def render_form(
         <h3 class="category-title">Atrakcje i dodatki</h3>
         <p class="subtitle location-hint">Przy każdej opcji kliknij zielony plus, wybierz godzinę i rodzaj. Czerwony minus usuwa dodatek.</p>
         <div id="service-overlap-notice" class="overlap-notice is-hidden">Godziny się pokrywają</div>
+        <div
+          id="stage-block-notice"
+          class="overlap-notice stage-block-notice is-hidden"
+          data-start-minutes="{STAGE_BLOCK_START.hour * 60 + STAGE_BLOCK_START.minute}"
+          data-end-minutes="{STAGE_BLOCK_END.hour * 60 + STAGE_BLOCK_END.minute}"
+          data-message="{escape(STAGE_BLOCK_MESSAGE)}"
+          data-confirm="{escape(STAGE_BLOCK_CONFIRM_PROMPT)}"
+        >{escape(STAGE_BLOCK_MESSAGE)} Możesz zatwierdzić przy zapisie.</div>
         <div class="category-fields services service-catalog">
           {render_service_option(values, errors, "animation_enabled", "animation_at", "Animacja", SERVICE_DURATIONS["animation_at"], render_animation_type_select(values, errors), show_time=False)}
           {render_service_option(values, errors, "cake_enabled", "cake_at", "Tort", SERVICE_DURATIONS["cake_at"], render_cake_theme_input(values, errors))}
@@ -8746,6 +9660,7 @@ def render_manager_view(rows: list[DbRow], role: str, day: str) -> str:
     return f"""
   <div class="day-heading">{escape(day_label)}</div>
   {body}
+{staff_assignment_script()}
 """
 
 
@@ -8756,15 +9671,15 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
             continue
 
         tasks = []
-        for item in animations_from_row(row):
-            tasks.append((item.get("at"), item.get("type") or "Animacja"))
+        for index, item in enumerate(animations_from_row(row)):
+            tasks.append((item.get("at"), item.get("type") or "Animacja", f"anim:{index}"))
         if is_enabled(row, "pinata_enabled"):
-            tasks.append((row["pinata_at"], f"Piniata: {row['pinata_theme'] or '(brak)'}"))
+            tasks.append((row["pinata_at"], f"Piniata: {row['pinata_theme'] or '(brak)'}", "pinata"))
         if is_enabled(row, "mascot_enabled"):
-            tasks.append((row["mascot_at"], f"Maskotka: {row['mascot_type'] or '(brak)'}"))
+            tasks.append((row["mascot_at"], f"Maskotka: {row['mascot_type'] or '(brak)'}", "mascot"))
 
         task_items = []
-        for task_time, task_name in tasks:
+        for task_time, task_name, slot in tasks:
             time_label = format_time(task_time)
             if not time_label:
                 continue
@@ -8774,7 +9689,7 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
                 hour = 0
             if hour < 10 or hour > 21:
                 continue
-            task_items.append((time_label, task_name))
+            task_items.append((time_label, task_name, slot))
 
         if task_items:
             task_items.sort(key=lambda item: (item[0], item[1]))
@@ -8786,24 +9701,27 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
 
     banquet_cards = []
     for _, row, task_items, notes in banquets:
-        animator_assignment = render_animator_assignment(row, role, day)
-        task_markup = "".join(
-            f"""
+        task_blocks = []
+        for time_label, task_name, slot in task_items:
+            assign_slot = render_animator_assignment(row, role, day, slot=slot)
+            task_blocks.append(
+                f"""
               <div class="banquet-task">
                 <div class="task-time">{escape(time_label)}</div>
                 <div class="task-detail">
-                  <div class="task-label">{escape(task_name)}</div>
+                  <div class="task-label-row">
+                    <div class="task-label">{escape(task_name)}</div>
+                    {assign_slot}
+                  </div>
                 </div>
               </div>
             """
-            for time_label, task_name in task_items
-        )
+            )
         banquet_cards.append(
             f"""
             <div class="banquet-card role-card animator-card">
               {render_role_card_identity(row, show_guest_summary=False, show_children_tag=True)}
-              {animator_assignment}
-              <div class="banquet-tasks">{task_markup}</div>
+              <div class="banquet-tasks">{''.join(task_blocks)}</div>
               {render_role_extra_info(row, notes)}
             </div>
             """
@@ -8823,6 +9741,7 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
     {''.join(banquet_cards)}
   </div>
 </section>
+{staff_assignment_script()}
 """
 
 
@@ -9360,6 +10279,77 @@ def reservation_metrics_for_day(
         "pinatas": sum(1 for row in active if is_enabled(row, "pinata_enabled")),
         "workshops": sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled")),
     }
+
+
+def organizer_metrics_from_rows(rows: list[DbRow]) -> dict[str, int]:
+    active = [row for row in rows if str(row.get("status") or "") == "active"]
+    return {
+        "banquets": sum(1 for row in active if not is_table_reservation(row)),
+        "tables": sum(1 for row in active if is_table_reservation(row)),
+        "cakes": sum(1 for row in active if is_enabled(row, "cake_enabled")),
+        "animations": sum(len(animations_from_row(row)) for row in active),
+        "pinatas": sum(1 for row in active if is_enabled(row, "pinata_enabled")),
+        "cooperation": sum(1 for row in active if is_enabled(row, "cooperation_enabled")),
+    }
+
+
+def next_calendar_month(target_day: date) -> date:
+    if target_day.month == 12:
+        return date(target_day.year + 1, 1, 1)
+    return date(target_day.year, target_day.month + 1, 1)
+
+
+def format_organizer_report_text(report_day: date) -> str:
+    """Raport z pracy organizatora: liczy wpisy po created_at w danym dniu/miesiącu."""
+    tomorrow = report_day + timedelta(days=1)
+    created_today = get_reservations_created_on_day(report_day)
+    today_metrics = organizer_metrics_from_rows(created_today)
+    # Z dzisiejszej pracy: wpisy z datą imprezy na jutro.
+    created_for_tomorrow = [
+        row for row in created_today if reservation_party_date(row) == tomorrow
+    ]
+    tomorrow_metrics = organizer_metrics_from_rows(created_for_tomorrow)
+    month_a = date(report_day.year, report_day.month, 1)
+    month_b = next_calendar_month(report_day)
+    month_a_metrics = organizer_metrics_from_rows(
+        get_reservations_for_month(month_a.year, month_a.month)
+    )
+    month_b_metrics = organizer_metrics_from_rows(
+        get_reservations_for_month(month_b.year, month_b.month)
+    )
+
+    def month_block(month_day: date, metrics: dict[str, int]) -> list[str]:
+        label = f"{MONTH_STANDALONE_LABELS[month_day.month - 1]} {month_day.year}"
+        return [
+            label.capitalize() + ":",
+            f"Bankiety: {metrics['banquets']}",
+            f"Rezerwacje: {metrics['tables']}",
+            f"Współpraca: {metrics['cooperation']}",
+            f"Torty: {metrics['cakes']}",
+            f"Animacje: {metrics['animations']}",
+            f"Piniata: {metrics['pinatas']}",
+        ]
+
+    lines = [
+        f"Raport: {report_day.strftime('%d.%m.%Y')}",
+        "Liczba odpowiedzi i wysłanych ofert (mail): ",
+        f"Rezerwacje: {today_metrics['tables']}",
+        f"Wstępne zamówienia bankietów: {today_metrics['banquets']}",
+        "Potwierdzone bankiety: ",
+        f"Torty: {today_metrics['cakes']}",
+        f"Animacje: {today_metrics['animations']}",
+        f"Piniata: {today_metrics['pinatas']}",
+        "",
+        "Jutro:",
+        f"Bankiety: {tomorrow_metrics['banquets']}",
+        f"Rezerwacje: {tomorrow_metrics['tables']}",
+        f"Współpraca: {tomorrow_metrics['cooperation']}",
+        "",
+        *month_block(month_a, month_a_metrics),
+        "",
+        *month_block(month_b, month_b_metrics),
+    ]
+    return "\n".join(lines)
 
 
 def build_shift_report(
@@ -11086,6 +12076,7 @@ def render_schema_summary() -> str:
         "parent_name / parent_phone",
         "birthday_child_name / birthday_child_age",
         "child_location / adult_location",
+        "cooperation_enabled",
         "animation_enabled / animation_type / animation_at / animations_json",
         "cake_enabled / cake_theme / cake_at",
         "cake_weight / cake_sponge / cake_filling / cake_cream / cake_image_data / cake_candle",
@@ -11585,7 +12576,39 @@ def room_plan_script() -> str:
         input.closest(".service-catalog-body")?.querySelector(".overlap-hint")?.classList.remove("is-hidden");
       });
     }
+    validateStageBlockConflicts();
     return !hasOverlap;
+  }
+
+  const stageBlockNotice = document.getElementById("stage-block-notice");
+  const stageBlockAck = document.getElementById("stage_block_acknowledged");
+  const stageBlockStart = Number(stageBlockNotice?.dataset.startMinutes || (17 * 60 + 45));
+  const stageBlockEnd = Number(stageBlockNotice?.dataset.endMinutes || (18 * 60 + 15));
+  const stageBlockMessage = stageBlockNotice?.dataset.message
+    || "Ta atrakcja nachodzi na powitanie solenizantów (Koło Marzeń) 17:45–18:15.";
+  const stageBlockConfirm = stageBlockNotice?.dataset.confirm
+    || (stageBlockMessage + " Zatwierdzić mimo to i pozwolić na nakładanie się godzin?");
+
+  function overlapsStageBlock(windowValue) {
+    if (!windowValue || !windowValue.duration) return false;
+    return windowValue.startMinutes < stageBlockEnd && windowValue.endMinutes > stageBlockStart;
+  }
+
+  function stageBlockConflictInputs() {
+    return allTimeInputs().filter((input) => overlapsStageBlock(serviceWindow(input)));
+  }
+
+  function validateStageBlockConflicts() {
+    const conflicts = stageBlockConflictInputs();
+    allTimeInputs().forEach((input) => input.classList.remove("stage-block-error"));
+    if (stageBlockNotice) stageBlockNotice.classList.add("is-hidden");
+    if (!conflicts.length) {
+      if (stageBlockAck) stageBlockAck.value = "";
+      return false;
+    }
+    if (stageBlockNotice) stageBlockNotice.classList.remove("is-hidden");
+    conflicts.forEach((input) => input.classList.add("stage-block-error"));
+    return true;
   }
 
   function updateTimeEndLabel(input) {
@@ -11924,9 +12947,17 @@ def room_plan_script() -> str:
   form.addEventListener("submit", (event) => {
     allTimeInputs().forEach(normalizeTimeInput);
     finalizeLocations();
+    if (stageBlockAck) stageBlockAck.value = "";
     if (!validateServiceOverlaps()) {
       event.preventDefault();
       return;
+    }
+    if (validateStageBlockConflicts()) {
+      if (!window.confirm(stageBlockConfirm)) {
+        event.preventDefault();
+        return;
+      }
+      if (stageBlockAck) stageBlockAck.value = "1";
     }
     const actionLabel = form.querySelector('button[type="submit"]')?.textContent?.trim() || "zapisać rezerwację";
     if (!window.confirm(`Czy na pewno chcesz ${actionLabel.toLowerCase()}?`)) {
@@ -11943,9 +12974,16 @@ def room_plan_script() -> str:
 })();
 </script>
 <style>
-  input.overlap-error {
+  input.overlap-error,
+  input.stage-block-error {
     border-color: var(--danger);
     outline-color: rgba(251, 113, 133, 0.35);
+  }
+
+  .stage-block-notice {
+    border-color: color-mix(in srgb, #d97706 35%, var(--line));
+    background: color-mix(in srgb, #f59e0b 12%, white);
+    color: #92400e;
   }
 </style>
 """
@@ -11996,6 +13034,7 @@ CREATE TABLE reservations (
   balloons_description TEXT,
   balloons_at TIMESTAMPTZ,
   notes TEXT NOT NULL DEFAULT '',
+  cooperation_enabled BOOLEAN NOT NULL DEFAULT false,
   status TEXT NOT NULL CHECK (status IN ('active', 'cancelled')),
   cancellation_reason TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -12431,12 +13470,19 @@ class ReservationHandler(BaseHTTPRequestHandler):
                 self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji."))
                 return
             waiter = data.get("waiter", "")
-            if assign_waiter(int(raw_id), waiter or None, work_role):
-                message = (
-                    "Kelner został przypisany."
-                    if waiter.strip()
-                    else "Przypisanie kelnera zostało usunięte."
-                )
+            remove_waiter = data.get("remove_waiter", "")
+            if assign_waiter(
+                int(raw_id),
+                waiter or None,
+                work_role,
+                remove_waiter=remove_waiter or None,
+            ):
+                if remove_waiter.strip():
+                    message = "Przypisanie kelnera zostało usunięte."
+                elif waiter.strip():
+                    message = "Kelner został przypisany."
+                else:
+                    message = "Przypisanie kelnerów zostało usunięte."
                 self.redirect(link_for(work_role, day, message=message))
             else:
                 self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować kelnera."))
@@ -12451,12 +13497,21 @@ class ReservationHandler(BaseHTTPRequestHandler):
                 self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji."))
                 return
             animator = data.get("animator", "")
-            if assign_animator(int(raw_id), animator or None, work_role):
-                message = (
-                    "Animator został przypisany."
-                    if animator.strip()
-                    else "Przypisanie animatora zostało usunięte."
-                )
+            remove_animator = data.get("remove_animator", "")
+            slot = data.get("slot", "anim:0")
+            if assign_animator(
+                int(raw_id),
+                animator or None,
+                work_role,
+                remove_animator=remove_animator or None,
+                slot=slot or "anim:0",
+            ):
+                if remove_animator.strip():
+                    message = "Przypisanie animatora zostało usunięte."
+                elif animator.strip():
+                    message = "Animator został przypisany."
+                else:
+                    message = "Przypisanie animatorów zostało usunięte."
                 self.redirect(link_for(work_role, day, message=message))
             else:
                 self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować animatora."))

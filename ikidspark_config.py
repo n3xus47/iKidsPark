@@ -338,9 +338,15 @@ STATUS_LABELS = {
     "cancelled": "Anulowana",
 }
 
-STAGE_BLOCK_MESSAGE = "Ta atrakcja nachodzi na Koło Marzeń 17:45-18:15 - wybierz inną godzinę startu."
+STAGE_BLOCK_MESSAGE = (
+    "Ta atrakcja nachodzi na powitanie solenizantów (Koło Marzeń) 17:45–18:15."
+)
 STAGE_BLOCK_START = time(17, 45)
 STAGE_BLOCK_END = time(18, 15)
+STAGE_BLOCK_CONFIRM_PROMPT = (
+    "Ta atrakcja nachodzi na powitanie solenizantów (Koło Marzeń) 17:45–18:15. "
+    "Zatwierdzić mimo to i pozwolić na nakładanie się godzin?"
+)
 SERVICE_DURATIONS = {
     "animation_at": 60,
     "cake_at": 20,
