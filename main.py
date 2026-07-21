@@ -5,6 +5,7 @@ import html
 import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -13,12 +14,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
+import urllib.request
 from datetime import date, datetime, time, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -83,6 +86,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DB_MODE = os.environ.get("IKIDS_DB_MODE", "").strip().lower()
 USE_LOCAL_SQLITE = DB_MODE == "sqlite" or (not DATABASE_URL and DB_MODE != "supabase")
 LOCAL_DB_PATH = Path(__file__).with_name(os.environ.get("IKIDS_LOCAL_DB_PATH", "reservations-local.db"))
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON_PATH = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "").strip()
+GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "A1:Z160").strip()
+GOOGLE_SHEETS_CACHE_SECONDS = int(os.environ.get("GOOGLE_SHEETS_CACHE_SECONDS", "90"))
 LOGO_PATH = Path(__file__).with_name("logo.png")
 MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
 PWA_LOGO_PATH = Path(__file__).with_name("pwalogo.png")
@@ -1589,6 +1597,307 @@ def format_datetime(value: object) -> str:
         return raw
 
 
+SCHEDULE_DEPARTMENTS = [
+    ("animatorzy", "Animatorzy i organizator urodzin"),
+    ("managerowie", "Managerowie"),
+    ("kuchnia", "Kuchnia"),
+    ("serwis", "Serwis"),
+]
+SCHEDULE_DEPARTMENT_MATCHERS = {
+    "animatorzy": ("animator", "organizator"),
+    "managerowie": ("manager", "menedzer", "menedzer", "kierownik"),
+    "kuchnia": ("kuchnia", "kucharz", "cukiernik", "pomoc kuchenna"),
+    "serwis": (
+        "barman",
+        "kelner",
+        "recepcja",
+        "sprzataj",
+        "sprzatajac",
+        "pracownia tworcza",
+        "serwis",
+    ),
+}
+_SCHEDULE_CACHE: dict[str, object] = {"loaded_at": 0.0, "result": None}
+
+
+def normalize_search_text(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    ascii_text = ascii_text.replace("ł", "l").replace("Ł", "L")
+    return ascii_text.lower().strip()
+
+
+def schedule_month_from_title(sheet_title: str) -> tuple[int, int] | None:
+    match = re.search(r"(?<!\d)(0?[1-9]|1[0-2])\.(20\d{2})(?!\d)", sheet_title)
+    if not match:
+        return None
+    return int(match.group(2)), int(match.group(1))
+
+
+def schedule_date_from_cell(value: object, sheet_title: str) -> date | None:
+    match = re.search(r"(?<!\d)(\d{1,2})\.(\d{1,2})(?!\d)", str(value or ""))
+    title_month = schedule_month_from_title(sheet_title)
+    if not match or title_month is None:
+        return None
+    year = title_month[0]
+    day_value = int(match.group(1))
+    month_value = int(match.group(2))
+    try:
+        return date(year, month_value, day_value)
+    except ValueError:
+        return None
+
+
+def schedule_month_key(value: date | None) -> str:
+    return value.strftime("%Y-%m") if value else ""
+
+
+def schedule_month_label(month_key: str) -> str:
+    try:
+        year_value, month_value = (int(part) for part in month_key.split("-", 1))
+    except ValueError:
+        return month_key
+    return f"{MONTH_STANDALONE_LABELS[month_value - 1]} {year_value}"
+
+
+def schedule_week_label(week_key: str) -> str:
+    try:
+        start_day = date.fromisoformat(week_key)
+    except ValueError:
+        return week_key
+    end_day = start_day + timedelta(days=6)
+    return f"{start_day.strftime('%d.%m')} - {end_day.strftime('%d.%m')}"
+
+
+def schedule_department_for(sheet_title: str, position: str) -> str:
+    haystack = f"{normalize_search_text(sheet_title)} {normalize_search_text(position)}"
+    for key, matchers in SCHEDULE_DEPARTMENT_MATCHERS.items():
+        if any(matcher in haystack for matcher in matchers):
+            return key
+    return "serwis"
+
+
+def load_google_service_account_info() -> dict[str, object]:
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        raw = GOOGLE_SERVICE_ACCOUNT_JSON
+        if raw.startswith("{"):
+            return json.loads(raw)
+        path = Path(raw)
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    if GOOGLE_SERVICE_ACCOUNT_JSON_PATH:
+        return json.loads(Path(GOOGLE_SERVICE_ACCOUNT_JSON_PATH).read_text(encoding="utf-8"))
+    raise RuntimeError("Brak GOOGLE_SERVICE_ACCOUNT_JSON albo GOOGLE_SERVICE_ACCOUNT_JSON_PATH w .env.")
+
+
+def google_sheets_access_token() -> str:
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.service_account import Credentials
+    except ImportError as exc:
+        raise RuntimeError("Brakuje pakietu google-auth. Uruchom: pip install -r requirements.txt") from exc
+
+    credentials = Credentials.from_service_account_info(
+        load_google_service_account_info(),
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    credentials.refresh(Request())
+    return str(credentials.token)
+
+
+def google_sheets_get(path: str, token: str | None = None) -> dict[str, object]:
+    token = token or google_sheets_access_token()
+    request = urllib.request.Request(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def spreadsheet_sheet_titles(token: str | None = None) -> list[str]:
+    payload = google_sheets_get("?fields=sheets.properties.title", token=token)
+    sheets = payload.get("sheets", [])
+    titles = []
+    for item in sheets if isinstance(sheets, list) else []:
+        properties = item.get("properties", {}) if isinstance(item, dict) else {}
+        title = str(properties.get("title", "")).strip()
+        if title:
+            titles.append(title)
+    return titles
+
+
+def google_sheet_values(sheet_title: str, token: str | None = None) -> list[list[str]]:
+    encoded_range = quote(f"'{sheet_title}'!{GOOGLE_SHEETS_RANGE}", safe="")
+    payload = google_sheets_get(f"/values/{encoded_range}?majorDimension=ROWS", token=token)
+    values = payload.get("values", [])
+    if not isinstance(values, list):
+        return []
+    return [[str(cell) for cell in row] for row in values if isinstance(row, list)]
+
+
+def row_cell(row: list[str], index: int) -> str:
+    return row[index].strip() if 0 <= index < len(row) else ""
+
+
+def find_schedule_header(rows: list[list[str]]) -> tuple[int, int, int, int] | None:
+    for index, row in enumerate(rows[:25]):
+        normalized = [normalize_search_text(cell) for cell in row]
+        name_index = next((i for i, cell in enumerate(normalized) if "imie" in cell and "nazwisko" in cell), -1)
+        position_index = next((i for i, cell in enumerate(normalized) if "stanowisko" in cell), -1)
+        total_index = next((i for i, cell in enumerate(normalized) if "ilosc godzin" in cell), -1)
+        if name_index >= 0 and position_index >= 0 and total_index >= 0:
+            return index, name_index, position_index, total_index
+    return None
+
+
+def find_schedule_headers(rows: list[list[str]]) -> list[tuple[int, int, int, int]]:
+    headers = []
+    for index, row in enumerate(rows):
+        normalized = [normalize_search_text(cell) for cell in row]
+        name_index = next((i for i, cell in enumerate(normalized) if "imie" in cell and "nazwisko" in cell), -1)
+        position_index = next((i for i, cell in enumerate(normalized) if "stanowisko" in cell), -1)
+        total_index = next((i for i, cell in enumerate(normalized) if "ilosc godzin" in cell), -1)
+        if name_index >= 0 and position_index >= 0 and total_index >= 0:
+            headers.append((index, name_index, position_index, total_index))
+    return headers
+
+
+def parse_schedule_block(
+    sheet_title: str,
+    rows: list[list[str]],
+    header_index: int,
+    next_header_index: int,
+    name_index: int,
+    position_index: int,
+    total_index: int,
+) -> list[dict[str, object]]:
+    header_row = rows[header_index]
+    date_row = rows[header_index - 1] if header_index > 0 else []
+    title_month = schedule_month_from_title(sheet_title)
+    day_columns: list[dict[str, object]] = []
+    day_names = {"poniedzialek", "wtorek", "sroda", "czwartek", "piatek", "sobota", "niedziela"}
+    for column_index, value in enumerate(header_row):
+        day_name = normalize_search_text(value)
+        if day_name in day_names:
+            day_date = schedule_date_from_cell(row_cell(date_row, column_index), sheet_title)
+            day_columns.append(
+                {
+                    "name": value.strip(),
+                    "date": day_date.isoformat() if day_date else "",
+                    "date_label": row_cell(date_row, column_index),
+                    "month": schedule_month_key(day_date),
+                    "shift_index": column_index,
+                    "hours_index": column_index + 1,
+                }
+            )
+
+    entries: list[dict[str, object]] = []
+    week_dates = [date.fromisoformat(str(day["date"])) for day in day_columns if day.get("date")]
+    week_start = min(week_dates).isoformat() if week_dates else f"{sheet_title}:{header_index}"
+    week_months = sorted({schedule_month_key(day) for day in week_dates if title_month is None or True})
+    primary_month = schedule_month_key(week_dates[-1]) if week_dates else ""
+
+    for row in rows[header_index + 1 : next_header_index]:
+        name = row_cell(row, name_index)
+        position = row_cell(row, position_index)
+        if not name and not position:
+            continue
+        normalized_name = normalize_search_text(name)
+        normalized_position = normalize_search_text(position)
+        if normalized_name in {"razem", "suma", "lp.", "lp"} or "imie" in normalized_name:
+            continue
+        if not name and not normalized_position:
+            continue
+        shifts = []
+        has_shift = False
+        for day in day_columns:
+            shift = row_cell(row, int(day["shift_index"]))
+            hours = row_cell(row, int(day["hours_index"]))
+            if shift or hours:
+                has_shift = True
+            shifts.append(
+                {
+                    "day": day["name"],
+                    "date": day["date"],
+                    "date_label": day["date_label"],
+                    "month": day["month"],
+                    "shift": shift,
+                    "hours": hours,
+                }
+            )
+        if not name and not has_shift:
+            continue
+        entries.append(
+            {
+                "sheet": sheet_title,
+                "department": schedule_department_for(sheet_title, position),
+                "week_start": week_start,
+                "week_months": week_months,
+                "primary_month": primary_month,
+                "name": name or "Bez nazwiska",
+                "position": position,
+                "total_hours": row_cell(row, total_index),
+                "shifts": shifts,
+            }
+        )
+    return entries
+
+
+def parse_schedule_sheet(sheet_title: str, rows: list[list[str]]) -> list[dict[str, object]]:
+    headers = find_schedule_headers(rows)
+    entries: list[dict[str, object]] = []
+    for index, (header_index, name_index, position_index, total_index) in enumerate(headers):
+        next_header_index = headers[index + 1][0] if index + 1 < len(headers) else len(rows)
+        entries.extend(
+            parse_schedule_block(
+                sheet_title,
+                rows,
+                header_index,
+                next_header_index,
+                name_index,
+                position_index,
+                total_index,
+            )
+        )
+    return entries
+
+
+def load_live_schedule(force: bool = False) -> dict[str, object]:
+    if not GOOGLE_SHEET_ID:
+        return {"ok": False, "error": "Brak GOOGLE_SHEET_ID w .env.", "entries": [], "loaded_at": None}
+
+    now = datetime.now().timestamp()
+    cached_result = _SCHEDULE_CACHE.get("result")
+    if not force and cached_result and now - float(_SCHEDULE_CACHE.get("loaded_at", 0.0)) < GOOGLE_SHEETS_CACHE_SECONDS:
+        return cached_result  # type: ignore[return-value]
+
+    try:
+        token = google_sheets_access_token()
+        titles = spreadsheet_sheet_titles(token=token)
+        entries: list[dict[str, object]] = []
+        for title in titles:
+            entries.extend(parse_schedule_sheet(title, google_sheet_values(title, token=token)))
+        result = {
+            "ok": True,
+            "error": "",
+            "entries": entries,
+            "sheet_titles": titles,
+            "loaded_at": datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
+        }
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "error": str(exc),
+            "entries": [],
+            "sheet_titles": [],
+            "loaded_at": datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
+        }
+    _SCHEDULE_CACHE["loaded_at"] = now
+    _SCHEDULE_CACHE["result"] = result
+    return result
+
+
 def field_time(values: dict[str, object], field: str) -> str:
     return format_time(values.get(field))
 
@@ -2438,6 +2747,7 @@ def page_template(
     errors: dict[str, str] | None = None,
     role: str = "manager",
     day: str = "today",
+    page_class: str = "",
 ) -> bytes:
     errors = errors or {}
     alert = ""
@@ -2450,7 +2760,12 @@ def page_template(
     role = normalize_role(role)
     day = normalize_day(day)
     logo_src = logo_asset_url()
-    body_class = ' class="page-home"' if page_role == "home" else ""
+    classes = []
+    if page_role == "home":
+        classes.append("page-home")
+    if page_class:
+        classes.append(page_class)
+    body_class = f' class="{" ".join(classes)}"' if classes else ""
 
     document = f"""<!doctype html>
 <html lang="pl">
@@ -4420,14 +4735,30 @@ def page_template(
       height: 100%;
     }}
 
+    html:has(body.page-schedules) {{
+      overflow-y: auto;
+      height: auto;
+    }}
+
     body.page-home {{
       overflow: hidden;
       height: 100dvh;
       overscroll-behavior: none;
     }}
 
+    body.page-schedules {{
+      overflow-y: auto;
+      height: auto;
+      min-height: 100vh;
+      overscroll-behavior: auto;
+    }}
+
     body.page-home main {{
       overflow: hidden;
+    }}
+
+    body.page-schedules main {{
+      overflow: visible;
     }}
 
     .layout {{
@@ -6952,6 +7283,14 @@ METRIC_ICONS = {
     "warsztaty": LOGISTICS_CHIP_ICONS["kitchen"].replace("logistics-chip-svg", "metric-svg"),
     "torty": LOGISTICS_CHIP_ICONS["cake"].replace("logistics-chip-svg", "metric-svg"),
     "piniaty": LOGISTICS_CHIP_ICONS["pinata"].replace("logistics-chip-svg", "metric-svg"),
+    "grafiki": (
+        '<svg class="metric-svg" viewBox="0 0 24 24" aria-hidden="true">'
+        '<rect x="3" y="4" width="18" height="18" rx="2"/>'
+        '<path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>'
+        '<path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/>'
+        '<path d="M8 18h.01"/><path d="M12 18h.01"/>'
+        "</svg>"
+    ),
 }
 
 
@@ -7971,6 +8310,11 @@ def render_metrics(rows: list[DbRow], day: str) -> str:
   {render_metric(pinatas, "piniaty", "piniaty", animators_link)}
   {render_metric(cakes, "torty", "torty", kitchen_link)}
   {render_metric(workshops, "warsztaty", "warsztaty", kitchen_link)}
+  <a class="metric" href="/grafiki?role=home&day={escape(current_day_query)}" target="_blank" rel="noopener">
+    <span class="metric-icon" aria-hidden="true">{METRIC_ICONS["grafiki"]}</span>
+    <strong>live</strong>
+    <span class="muted">grafiki</span>
+  </a>
 </div>
 """
 
@@ -8227,6 +8571,531 @@ def render_role_view(role: str, rows: list[DbRow], day: str) -> str:
     if role == "organizer":
         return render_organizer_view(rows, role, day)
     return render_manager_view(rows, role, day)
+
+
+def render_schedule_shift_cell(shift: dict[str, object]) -> str:
+    value = str(shift.get("shift") or "").strip()
+    hours = str(shift.get("hours") or "").strip()
+    empty = not value or normalize_search_text(value) in {"-", ".", "x"}
+    shift_class = " schedule-shift is-empty" if empty else " schedule-shift"
+    hours_markup = f'<span class="schedule-hours">{escape(hours)}</span>' if hours and not empty else ""
+    shift_markup = escape(value) if value else "<span>Wolne</span>"
+    return f'<td><div class="{shift_class}"><strong>{shift_markup}</strong>{hours_markup}</div></td>'
+
+
+def schedule_url(
+    *,
+    role: str,
+    day: str,
+    department: str,
+    month: str,
+    week: str,
+    view: str,
+) -> str:
+    return "/grafiki?" + urlencode(
+        {
+            "role": role,
+            "day": day,
+            "department": department,
+            "month": month,
+            "week": week,
+            "view": view,
+        }
+    )
+
+
+def schedule_entry_has_month(entry: dict[str, object], month: str) -> bool:
+    shifts = entry.get("shifts", [])
+    return any(isinstance(shift, dict) and shift.get("month") == month for shift in shifts)
+
+
+def schedule_entry_has_week(entry: dict[str, object], week: str) -> bool:
+    return str(entry.get("week_start") or "") == week
+
+
+def schedule_available_months(entries: list[dict[str, object]]) -> list[str]:
+    months = {
+        str(shift.get("month"))
+        for entry in entries
+        for shift in (entry.get("shifts", []) if isinstance(entry.get("shifts", []), list) else [])
+        if isinstance(shift, dict) and shift.get("month")
+    }
+    return sorted(months)
+
+
+def schedule_available_weeks(entries: list[dict[str, object]], month: str, department: str) -> list[str]:
+    weeks = {
+        str(entry.get("week_start") or "")
+        for entry in entries
+        if entry.get("week_start")
+        and (department == "all" or entry.get("department") == department)
+        and schedule_entry_has_month(entry, month)
+    }
+    return sorted(weeks)
+
+
+def schedule_default_week(weeks: list[str], selected_month: str) -> str:
+    today = current_app_date()
+    today_key = schedule_month_key(today)
+    if today_key == selected_month:
+        for week in weeks:
+            try:
+                week_start = date.fromisoformat(week)
+            except ValueError:
+                continue
+            if week_start <= today <= week_start + timedelta(days=6):
+                return week
+    return weeks[0] if weeks else ""
+
+
+def schedule_filtered_entries(
+    entries: list[dict[str, object]],
+    *,
+    department: str,
+    month: str,
+    week: str = "",
+) -> list[dict[str, object]]:
+    filtered = []
+    for entry in entries:
+        if department != "all" and entry.get("department") != department:
+            continue
+        if not schedule_entry_has_month(entry, month):
+            continue
+        if week and not schedule_entry_has_week(entry, week):
+            continue
+        filtered.append(entry)
+    return filtered
+
+
+def schedule_shift_is_work(value: object) -> bool:
+    normalized = normalize_search_text(value)
+    return bool(normalized) and normalized not in {"-", ".", "x", "w", "wolne"}
+
+
+def schedule_month_days(month: str) -> list[date]:
+    try:
+        year_value, month_value = (int(part) for part in month.split("-", 1))
+        first_day = date(year_value, month_value, 1)
+    except ValueError:
+        return []
+    days = []
+    current = first_day
+    while current.month == first_day.month:
+        days.append(current)
+        current += timedelta(days=1)
+    return days
+
+
+def compact_schedule_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for entry in entries:
+        key = (str(entry.get("name") or ""), str(entry.get("position") or ""))
+        current = merged.setdefault(
+            key,
+            {
+                "name": entry.get("name", ""),
+                "position": entry.get("position", ""),
+                "total": 0.0,
+                "days": {},
+            },
+        )
+        for shift in entry.get("shifts", []) if isinstance(entry.get("shifts", []), list) else []:
+            if not isinstance(shift, dict) or not shift.get("date"):
+                continue
+            current_days = current["days"]
+            if isinstance(current_days, dict):
+                current_days[str(shift["date"])] = {
+                    "shift": str(shift.get("shift") or "").strip(),
+                    "hours": str(shift.get("hours") or "").strip(),
+                }
+            try:
+                hours_value = str(shift.get("hours") or "").replace(",", ".")
+                if hours_value and schedule_shift_is_work(shift.get("shift")):
+                    current["total"] = float(current.get("total", 0.0)) + float(hours_value)
+            except ValueError:
+                pass
+    return list(merged.values())
+
+
+def format_schedule_total(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number.is_integer():
+        return str(int(number))
+    return str(number).replace(".", ",")
+
+
+def render_schedule_table(entries: list[dict[str, object]], title: str, subtitle: str = "") -> str:
+    if not entries:
+        return f"""
+        <section class="schedule-section">
+          <div class="section-head">
+            <div>
+              <h2>{escape(title)}</h2>
+              <p class="subtitle">{escape(subtitle)}</p>
+            </div>
+          </div>
+          <div class="empty">Brak odczytanych pozycji dla tego zakresu.</div>
+        </section>
+        """
+
+    first_shifts = entries[0].get("shifts", [])
+    day_headers = "".join(
+        f'<th>{escape(shift.get("day", ""))}<br><span>{escape(shift.get("date_label", "") or format_date(shift.get("date", "")))}</span></th>'
+        for shift in first_shifts
+        if isinstance(shift, dict)
+    )
+    rows = []
+    for entry in entries:
+        shifts = entry.get("shifts", [])
+        shift_cells = "".join(
+            render_schedule_shift_cell(shift)
+            for shift in shifts
+            if isinstance(shift, dict)
+        )
+        rows.append(
+            f"""
+            <tr>
+              <th class="schedule-person">
+                <strong>{escape(entry.get("name", ""))}</strong>
+                <span>{escape(entry.get("position", ""))}</span>
+              </th>
+              {shift_cells}
+              <td class="schedule-total">{escape(entry.get("total_hours", ""))}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <section class="schedule-section">
+      <div class="section-head">
+        <div>
+          <h2>{escape(title)}</h2>
+          <p class="subtitle">{escape(subtitle)} · {len(entries)} pozycji</p>
+        </div>
+      </div>
+        <div class="schedule-table-wrap" data-fit-schedule>
+          <table class="schedule-table">
+          <thead>
+            <tr>
+              <th>Osoba</th>
+              {day_headers}
+              <th>Razem</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def render_schedule_month_matrix(entries: list[dict[str, object]], month: str, title: str, subtitle: str = "") -> str:
+    days = schedule_month_days(month)
+    compact_entries = compact_schedule_entries(entries)
+    if not compact_entries or not days:
+        return f"""
+        <section class="schedule-section schedule-section-compact">
+          <div class="section-head">
+            <div>
+              <h2>{escape(title)}</h2>
+              <p class="subtitle">{escape(subtitle)}</p>
+            </div>
+          </div>
+          <div class="empty">Brak danych dla wybranego miesiąca.</div>
+        </section>
+        """
+    headers = "".join(
+        f'<th class="schedule-month-day"><strong>{day.day}</strong><span>{WEEKDAY_LABELS[day.weekday()][:2]}</span></th>'
+        for day in days
+    )
+    rows = []
+    for entry in compact_entries:
+        day_values = entry.get("days", {})
+        cells = []
+        for day in days:
+            item = day_values.get(day.isoformat(), {}) if isinstance(day_values, dict) else {}
+            shift = str(item.get("shift") or "").strip() if isinstance(item, dict) else ""
+            hours = str(item.get("hours") or "").strip() if isinstance(item, dict) else ""
+            is_work = schedule_shift_is_work(shift)
+            cell_class = "schedule-month-cell is-work" if is_work else "schedule-month-cell is-empty"
+            label = escape(shift) if shift else ""
+            hours_label = f'<span>{escape(hours)}</span>' if hours and is_work else ""
+            cells.append(f'<td><div class="{cell_class}">{label}{hours_label}</div></td>')
+        rows.append(
+            f"""
+            <tr>
+              <th class="schedule-person schedule-person-compact">
+                <strong>{escape(entry.get("name", ""))}</strong>
+                <span>{escape(entry.get("position", ""))}</span>
+              </th>
+              {''.join(cells)}
+              <td class="schedule-total">{escape(format_schedule_total(entry.get("total")))}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <section class="schedule-section schedule-section-compact">
+      <div class="section-head schedule-section-head-compact">
+        <div>
+          <h2>{escape(title)}</h2>
+          <p class="subtitle">{escape(subtitle)} · {len(compact_entries)} osób</p>
+        </div>
+      </div>
+      <div class="schedule-table-wrap schedule-month-wrap" data-fit-schedule>
+        <table class="schedule-table schedule-month-table">
+          <thead>
+            <tr>
+              <th>Osoba</th>
+              {headers}
+              <th>H</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def render_schedule_controls(
+    *,
+    role: str,
+    day: str,
+    selected_department: str,
+    selected_month: str,
+    selected_week: str,
+    selected_view: str,
+    months: list[str],
+    weeks: list[str],
+) -> str:
+    department_items = [
+        ("all", "Wszystkie"),
+        ("animatorzy", "Animatorzy"),
+        ("managerowie", "Managerowie"),
+        ("kuchnia", "Kuchnia"),
+        ("serwis", "Serwis"),
+    ]
+    department_links = "".join(
+        f'<a class="schedule-control{" is-active" if key == selected_department else ""}" href="{escape(schedule_url(role=role, day=day, department=key, month=selected_month, week=selected_week, view=selected_view))}">{escape(label)}</a>'
+        for key, label in department_items
+    )
+    month_links = "".join(
+        f'<a class="schedule-control{" is-active" if month == selected_month else ""}" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=month, week="", view=selected_view))}">{escape(schedule_month_label(month))}</a>'
+        for month in months
+    )
+    week_links = "".join(
+        f'<a class="schedule-control{" is-active" if week == selected_week else ""}" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=week, view="week"))}">{escape(schedule_week_label(week))}</a>'
+        for week in weeks
+    )
+    view_links = "".join(
+        f'<a class="schedule-control{" is-active" if view == selected_view else ""}" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=selected_week, view=view))}">{label}</a>'
+        for view, label in (("week", "Tydzień"), ("month", "Miesiąc"))
+    )
+    return f"""
+    <div class="schedule-controls">
+      <div class="schedule-control-group"><span>Dział</span><div>{department_links}</div></div>
+      <div class="schedule-control-group"><span>Miesiąc</span><div>{month_links}</div></div>
+      <div class="schedule-control-group"><span>Widok</span><div>{view_links}</div></div>
+      <div class="schedule-control-group"><span>Tydzień</span><div>{week_links or '<span class="muted">Brak tygodni</span>'}</div></div>
+    </div>
+    """
+
+
+def render_schedules_page(
+    role: str = "manager",
+    day: str = "today",
+    query: dict[str, list[str]] | None = None,
+) -> bytes:
+    query = query or {}
+    schedule = load_live_schedule()
+    entries = schedule.get("entries", [])
+    entries_list = entries if isinstance(entries, list) else []
+    months = schedule_available_months(entries_list)
+    requested_month = query.get("month", [""])[0]
+    current_month = schedule_month_key(current_app_date())
+    selected_month = requested_month if requested_month in months else (current_month if current_month in months else (months[0] if months else ""))
+    requested_department = query.get("department", ["animatorzy"])[0]
+    department_keys = {"all", *(key for key, _ in SCHEDULE_DEPARTMENTS)}
+    selected_department = requested_department if requested_department in department_keys else "animatorzy"
+    selected_view = query.get("view", ["week"])[0]
+    if selected_view not in {"week", "month"}:
+        selected_view = "week"
+    weeks = schedule_available_weeks(entries_list, selected_month, selected_department) if selected_month else []
+    requested_week = query.get("week", [""])[0]
+    selected_week = requested_week if requested_week in weeks else schedule_default_week(weeks, selected_month)
+
+    loaded_at = schedule.get("loaded_at") or "brak"
+    error = str(schedule.get("error") or "")
+    sheet_titles = schedule.get("sheet_titles", [])
+    sheet_label = ", ".join(str(title) for title in sheet_titles) if isinstance(sheet_titles, list) and sheet_titles else "nie odczytano zakładek"
+    status_markup = (
+        f'<div class="message success">Połączono z arkuszem. Ostatni odczyt: {escape(loaded_at)}. Zakładki: {escape(sheet_label)}.</div>'
+        if schedule.get("ok")
+        else f'<div class="message error">Nie udało się pobrać grafików: {escape(error)}</div>'
+    )
+    controls = render_schedule_controls(
+        role=role,
+        day=day,
+        selected_department=selected_department,
+        selected_month=selected_month,
+        selected_week=selected_week,
+        selected_view=selected_view,
+        months=months,
+        weeks=weeks,
+    )
+    selected_department_label = dict([("all", "Wszystkie działy"), *SCHEDULE_DEPARTMENTS]).get(selected_department, selected_department)
+    if selected_view == "month":
+        sections = render_schedule_month_matrix(
+            schedule_filtered_entries(
+                entries_list,
+                department=selected_department,
+                month=selected_month,
+            ),
+            selected_month,
+            schedule_month_label(selected_month),
+            selected_department_label,
+        )
+    else:
+        sections = render_schedule_table(
+            schedule_filtered_entries(
+                entries_list,
+                department=selected_department,
+                month=selected_month,
+                week=selected_week,
+            ),
+            schedule_week_label(selected_week) if selected_week else "Tydzień",
+            f"{selected_department_label} · {schedule_month_label(selected_month)}",
+        )
+    content = f"""
+<div class="stack schedules-layout">
+  <section class="schedule-hero">
+    <div class="section-head">
+      <div>
+        <h2>Grafiki pracowników</h2>
+        <p class="subtitle">Live z Google Sheets · szybki wybór działu, miesiąca i tygodnia.</p>
+      </div>
+      <div class="schedule-actions">
+        <a class="button secondary" href="/?role=home&day={escape(day)}">Ekran główny</a>
+        <a class="button secondary" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=selected_week, view=selected_view))}">Odśwież</a>
+      </div>
+    </div>
+    {status_markup}
+    {controls}
+  </section>
+  {sections}
+</div>
+<style>
+  .schedules-layout {{ gap: 18px; }}
+  body.page-schedules > header {{ display: none; }}
+  body.page-schedules main {{ padding-top: 8px; }}
+  .schedules-layout {{ gap: 8px; }}
+  .schedule-hero, .schedule-section {{ padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
+  .schedule-hero .section-head {{ margin-bottom: 6px; }}
+  .schedule-hero h2 {{ font-size: 1.05rem; }}
+  .schedule-hero .subtitle {{ font-size: 0.78rem; }}
+  .schedule-hero .message.success {{ display: none; }}
+  .schedule-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }}
+  .schedule-section-compact {{ padding: 10px; }}
+  .schedule-section-head-compact {{ margin-bottom: 8px; }}
+  .schedule-controls {{ display: grid; grid-template-columns: 1.15fr 0.75fr 0.65fr 1.45fr; gap: 6px; margin-top: 6px; }}
+  .schedule-control-group {{ display: grid; gap: 3px; min-width: 0; }}
+  .schedule-control-group > span {{ color: var(--muted); font-size: 0.62rem; font-weight: 800; text-transform: uppercase; }}
+  .schedule-control-group > div {{ display: flex; flex-wrap: wrap; gap: 3px; }}
+  .schedule-control {{ display: inline-flex; align-items: center; min-height: 23px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); text-decoration: none; background: #f8fafc; font-size: 0.72rem; font-weight: 700; }}
+  .schedule-control.is-active {{ background: #139bd7; border-color: #139bd7; color: #fff; }}
+  .schedule-table-wrap {{ overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }}
+  .schedule-table {{ width: 100%; border-collapse: collapse; min-width: 920px; background: #fff; table-layout: fixed; }}
+  .schedule-table th, .schedule-table td {{ border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); padding: 1px 3px; vertical-align: middle; }}
+  .schedule-table thead th {{ background: #256fd4; color: #fff; text-align: center; font-size: 0.62rem; line-height: 1; }}
+  .schedule-table thead th span {{ font-weight: 600; opacity: 0.9; }}
+  .schedule-person {{ width: 132px; text-align: left; background: #f8fafc; font-size: 0.64rem; line-height: 1; }}
+  .schedule-person span {{ display: block; color: var(--muted); font-size: 0.56rem; font-weight: 500; margin-top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .schedule-person strong {{ display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .schedule-shift {{ display: grid; gap: 0; min-height: 18px; align-content: center; text-align: center; color: #0f172a; font-size: 0.62rem; line-height: 1; }}
+  .schedule-shift.is-empty {{ color: #94a3b8; }}
+  .schedule-hours {{ font-size: 0.5rem; color: #2f6f26; font-weight: 700; }}
+  .schedule-total {{ width: 34px; background: #e8bfd3; text-align: center; font-size: 0.62rem; font-weight: 800; }}
+  .schedule-month-wrap {{ overflow-x: auto; }}
+  .schedule-month-table {{ min-width: 1220px; table-layout: fixed; }}
+  .schedule-month-table th, .schedule-month-table td {{ padding: 1px 2px; }}
+  .schedule-month-table .schedule-person {{ width: 112px; }}
+  .schedule-month-day {{ width: 25px; }}
+  .schedule-month-day strong, .schedule-month-day span {{ display: block; }}
+  .schedule-month-cell {{ min-height: 13px; display: grid; align-content: center; text-align: center; font-size: 0.46rem; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .schedule-month-cell.is-work {{ color: #0f172a; background: #dbeafe; border-radius: 3px; font-weight: 800; }}
+  .schedule-month-cell.is-empty {{ color: transparent; }}
+  .schedule-month-cell span {{ display: none; }}
+  .schedule-table-wrap[data-fit-schedule] {{
+    overflow: hidden;
+    position: relative;
+  }}
+  .schedule-table-wrap[data-fit-schedule] .schedule-table {{
+    transform-origin: top left;
+  }}
+  .schedule-fit-note {{
+    position: absolute;
+    right: 6px;
+    top: 6px;
+    z-index: 2;
+    padding: 2px 5px;
+    border-radius: 5px;
+    background: rgba(15, 23, 42, 0.72);
+    color: #fff;
+    font-size: 0.62rem;
+    pointer-events: none;
+  }}
+  .message.success {{ border-color: #bbf7d0; background: #f0fdf4; color: #166534; }}
+  .message.error {{ border-color: #fecaca; background: #fef2f2; color: #991b1b; }}
+  @media (min-width: 1350px) {{
+    .schedule-month-table {{ min-width: 100%; }}
+  }}
+  @media (max-width: 700px) {{
+    .schedule-hero, .schedule-section {{ padding: 12px; }}
+    .schedule-controls {{ grid-template-columns: 1fr; }}
+    .schedule-table {{ min-width: 860px; }}
+    .schedule-control {{ min-height: 34px; padding: 0 10px; font-size: 0.88rem; }}
+  }}
+</style>
+<script>
+(() => {{
+  function fitScheduleTables() {{
+    document.querySelectorAll("[data-fit-schedule]").forEach((wrap) => {{
+      const table = wrap.querySelector(".schedule-table");
+      if (!table) return;
+      table.style.transform = "";
+      table.style.width = "";
+      wrap.style.height = "";
+      wrap.style.overflow = "hidden";
+      wrap.querySelector(".schedule-fit-note")?.remove();
+
+      const rect = wrap.getBoundingClientRect();
+      const availableWidth = Math.max(320, wrap.clientWidth - 2);
+      const availableHeight = Math.max(220, window.innerHeight - rect.top - 6);
+      const tableWidth = table.scrollWidth || table.getBoundingClientRect().width;
+      const tableHeight = table.scrollHeight || table.getBoundingClientRect().height;
+      if (!tableWidth || !tableHeight) return;
+      const scale = Math.min(1, availableWidth / tableWidth, availableHeight / tableHeight);
+      if (scale >= 0.995) return;
+
+      table.style.transform = `scale(${{scale}})`;
+      table.style.width = `${{tableWidth}}px`;
+      wrap.style.height = `${{Math.ceil(tableHeight * scale) + 2}}px`;
+      const note = document.createElement("span");
+      note.className = "schedule-fit-note";
+      note.textContent = `${{Math.round(scale * 100)}}%`;
+      wrap.appendChild(note);
+    }});
+  }}
+  window.addEventListener("resize", fitScheduleTables);
+  window.addEventListener("orientationchange", fitScheduleTables);
+  requestAnimationFrame(fitScheduleTables);
+  setTimeout(fitScheduleTables, 250);
+}})();
+</script>
+"""
+    return page_template(content, role=normalize_page_role(role), day=normalize_day(day), page_class="page-schedules")
 
 
 def render_schema_summary() -> str:
@@ -9386,6 +10255,10 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.send_bytes(render_schema_page(role=role, day=day))
             return
 
+        if parsed.path == "/grafiki":
+            self.send_bytes(render_schedules_page(role=role, day=day, query=query))
+            return
+
         if parsed.path == "/history":
             reservation_value = query.get("id", [""])[0]
             if reservation_value.isdigit():
@@ -9457,7 +10330,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed.path in {"/", "/export", "/schema", "/api/availability", "/offline"}:
+        if parsed.path in {"/", "/export", "/schema", "/grafiki", "/api/availability", "/offline"}:
             self.send_response(HTTPStatus.OK)
             self.send_header(
                 "Content-Type",
