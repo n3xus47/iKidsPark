@@ -16,7 +16,7 @@ import tempfile
 import threading
 import unicodedata
 import urllib.request
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -89,8 +89,8 @@ LOCAL_DB_PATH = Path(__file__).with_name(os.environ.get("IKIDS_LOCAL_DB_PATH", "
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON_PATH = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "").strip()
-GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "A1:Z160").strip()
-GOOGLE_SHEETS_CACHE_SECONDS = int(os.environ.get("GOOGLE_SHEETS_CACHE_SECONDS", "90"))
+GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "A1:Z250").strip()
+GOOGLE_SHEETS_CACHE_SECONDS = int(os.environ.get("GOOGLE_SHEETS_CACHE_SECONDS", "600"))
 LOGO_PATH = Path(__file__).with_name("logo.png")
 MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
 PWA_LOGO_PATH = Path(__file__).with_name("pwalogo.png")
@@ -1480,6 +1480,40 @@ def get_reservations_for_day(target_day: date) -> list[DbRow]:
     )
 
 
+def get_reservations_for_days(iso_dates: list[str]) -> dict[str, list[DbRow]]:
+    """Jedno zapytanie DB dla całego zakresu dat zamiast N osobnych."""
+    result: dict[str, list[DbRow]] = {iso: [] for iso in iso_dates}
+    valid_days: list[date] = []
+    for iso in iso_dates:
+        try:
+            valid_days.append(date.fromisoformat(iso))
+        except ValueError:
+            continue
+    if not valid_days:
+        return result
+
+    first, last = min(valid_days), max(valid_days)
+    range_start, _ = day_bounds(first)
+    _, range_end = day_bounds(last)
+    rows = db_rows(
+        """
+        SELECT *
+        FROM reservations
+        WHERE start_at < ? AND end_at > ?
+        ORDER BY start_at ASC, child_location ASC
+        """,
+        (range_end, range_start),
+    )
+    bounds_by_iso = {day.isoformat(): day_bounds(day) for day in valid_days}
+    for row in rows:
+        start_at = str(row.get("start_at") or "")
+        end_at = str(row.get("end_at") or "")
+        for iso, (day_start, day_end) in bounds_by_iso.items():
+            if start_at < day_end and end_at > day_start:
+                result[iso].append(row)
+    return result
+
+
 def get_all_reservations() -> list[DbRow]:
     return db_rows(
         """
@@ -1618,6 +1652,7 @@ SCHEDULE_DEPARTMENT_MATCHERS = {
     ),
 }
 _SCHEDULE_CACHE: dict[str, object] = {"loaded_at": 0.0, "result": None}
+_GOOGLE_TOKEN_CACHE: dict[str, object] = {"token": "", "expires_at": 0.0}
 
 
 def normalize_search_text(value: object) -> str:
@@ -1650,6 +1685,28 @@ def schedule_date_from_cell(value: object, sheet_title: str) -> date | None:
 
 def schedule_month_key(value: date | None) -> str:
     return value.strftime("%Y-%m") if value else ""
+
+
+def schedule_dates_form_contiguous_week(week_dates: list[date]) -> bool:
+    """Daty tygodnia muszą tworzyć spójny zakres (max 7 dni bez dziur w kalendarzu)."""
+    if len(week_dates) <= 1:
+        return True
+    ordered = sorted(set(week_dates))
+    span_days = (ordered[-1] - ordered[0]).days
+    if span_days > 6:
+        return False
+    return len(ordered) == span_days + 1
+
+
+def dominant_schedule_month(week_dates: list[date]) -> str:
+    """Miesiąc bloku z pól dat (np. 20.07…26.07 → 2026-07), nie z nazwy zakładki."""
+    if not week_dates:
+        return ""
+    counts: dict[str, int] = {}
+    for day in week_dates:
+        key = schedule_month_key(day)
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts, key=lambda key: (counts[key], key))
 
 
 def schedule_month_label(month_key: str) -> str:
@@ -1691,6 +1748,13 @@ def load_google_service_account_info() -> dict[str, object]:
 
 
 def google_sheets_access_token() -> str:
+    now = datetime.now().timestamp()
+    cached_token = str(_GOOGLE_TOKEN_CACHE.get("token") or "")
+    expires_at = float(_GOOGLE_TOKEN_CACHE.get("expires_at") or 0.0)
+    # Odśwież ~60 s przed wygaśnięciem, żeby uniknąć race przy równoległych requestach.
+    if cached_token and now < expires_at - 60:
+        return cached_token
+
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.service_account import Credentials
@@ -1702,7 +1766,19 @@ def google_sheets_access_token() -> str:
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
     )
     credentials.refresh(Request())
-    return str(credentials.token)
+    token = str(credentials.token)
+    # google-auth trzyma expiry jako naive datetime w UTC — nie wolno brać .timestamp() lokalnie.
+    if credentials.expiry is not None:
+        expiry = credentials.expiry
+        if expiry.tzinfo is None:
+            expires_at = expiry.replace(tzinfo=timezone.utc).timestamp()
+        else:
+            expires_at = expiry.timestamp()
+    else:
+        expires_at = now + 3500
+    _GOOGLE_TOKEN_CACHE["token"] = token
+    _GOOGLE_TOKEN_CACHE["expires_at"] = expires_at
+    return token
 
 
 def google_sheets_get(path: str, token: str | None = None) -> dict[str, object]:
@@ -1727,13 +1803,40 @@ def spreadsheet_sheet_titles(token: str | None = None) -> list[str]:
     return titles
 
 
-def google_sheet_values(sheet_title: str, token: str | None = None) -> list[list[str]]:
-    encoded_range = quote(f"'{sheet_title}'!{GOOGLE_SHEETS_RANGE}", safe="")
-    payload = google_sheets_get(f"/values/{encoded_range}?majorDimension=ROWS", token=token)
-    values = payload.get("values", [])
+def _normalize_sheet_values(values: object) -> list[list[str]]:
     if not isinstance(values, list):
         return []
     return [[str(cell) for cell in row] for row in values if isinstance(row, list)]
+
+
+def google_sheet_values(sheet_title: str, token: str | None = None) -> list[list[str]]:
+    encoded_range = quote(f"'{sheet_title}'!{GOOGLE_SHEETS_RANGE}", safe="")
+    payload = google_sheets_get(f"/values/{encoded_range}?majorDimension=ROWS", token=token)
+    return _normalize_sheet_values(payload.get("values", []))
+
+
+def google_sheet_values_batch(
+    sheet_titles: list[str],
+    token: str | None = None,
+) -> dict[str, list[list[str]]]:
+    """Pobierz wartości wielu zakładek jednym requestem (values.batchGet)."""
+    if not sheet_titles:
+        return {}
+    query = ["majorDimension=ROWS"]
+    for title in sheet_titles:
+        encoded_range = quote(f"'{title}'!{GOOGLE_SHEETS_RANGE}", safe="")
+        query.append(f"ranges={encoded_range}")
+    payload = google_sheets_get(f"/values:batchGet?{'&'.join(query)}", token=token)
+    value_ranges = payload.get("valueRanges", [])
+    if not isinstance(value_ranges, list):
+        value_ranges = []
+    by_title: dict[str, list[list[str]]] = {}
+    for title, item in zip(sheet_titles, value_ranges):
+        values = item.get("values", []) if isinstance(item, dict) else []
+        by_title[title] = _normalize_sheet_values(values)
+    for title in sheet_titles:
+        by_title.setdefault(title, [])
+    return by_title
 
 
 def row_cell(row: list[str], index: int) -> str:
@@ -1774,7 +1877,6 @@ def parse_schedule_block(
 ) -> list[dict[str, object]]:
     header_row = rows[header_index]
     date_row = rows[header_index - 1] if header_index > 0 else []
-    title_month = schedule_month_from_title(sheet_title)
     day_columns: list[dict[str, object]] = []
     day_names = {"poniedzialek", "wtorek", "sroda", "czwartek", "piatek", "sobota", "niedziela"}
     for column_index, value in enumerate(header_row):
@@ -1794,9 +1896,15 @@ def parse_schedule_block(
 
     entries: list[dict[str, object]] = []
     week_dates = [date.fromisoformat(str(day["date"])) for day in day_columns if day.get("date")]
-    week_start = min(week_dates).isoformat() if week_dates else f"{sheet_title}:{header_index}"
-    week_months = sorted({schedule_month_key(day) for day in week_dates if title_month is None or True})
-    primary_month = schedule_month_key(week_dates[-1]) if week_dates else ""
+    if week_dates and not schedule_dates_form_contiguous_week(week_dates):
+        return []
+    if not week_dates:
+        return []
+    week_start = min(week_dates).isoformat()
+    week_months = sorted({schedule_month_key(day) for day in week_dates})
+    primary_month = schedule_month_key(week_dates[-1])
+    # Miesiąc bloku bierzemy z dat nad tabelką (20.07 → lipiec), nie z nazwy zakładki 08.2026.
+    block_month = dominant_schedule_month(week_dates) or primary_month
 
     for row in rows[header_index + 1 : next_header_index]:
         name = row_cell(row, name_index)
@@ -1831,6 +1939,7 @@ def parse_schedule_block(
         entries.append(
             {
                 "sheet": sheet_title,
+                "sheet_month": block_month,
                 "department": schedule_department_for(sheet_title, position),
                 "week_start": week_start,
                 "week_months": week_months,
@@ -1847,20 +1956,74 @@ def parse_schedule_block(
 def parse_schedule_sheet(sheet_title: str, rows: list[list[str]]) -> list[dict[str, object]]:
     headers = find_schedule_headers(rows)
     entries: list[dict[str, object]] = []
+    best_by_person_week: dict[tuple[str, str, str], tuple[int, dict[str, object]]] = {}
     for index, (header_index, name_index, position_index, total_index) in enumerate(headers):
         next_header_index = headers[index + 1][0] if index + 1 < len(headers) else len(rows)
-        entries.extend(
-            parse_schedule_block(
-                sheet_title,
-                rows,
-                header_index,
-                next_header_index,
-                name_index,
-                position_index,
-                total_index,
-            )
+        block_entries = parse_schedule_block(
+            sheet_title,
+            rows,
+            header_index,
+            next_header_index,
+            name_index,
+            position_index,
+            total_index,
         )
-    return entries
+        for entry in block_entries:
+            shifts = entry.get("shifts", [])
+            shift_score = 0
+            if isinstance(shifts, list):
+                for shift in shifts:
+                    if not isinstance(shift, dict):
+                        continue
+                    if str(shift.get("shift") or "").strip() not in {"", "-", "wolne"}:
+                        shift_score += 2
+                    if str(shift.get("hours") or "").strip():
+                        shift_score += 1
+            total_hours = str(entry.get("total_hours") or "").strip()
+            score = shift_score + (2 if total_hours else 0)
+            person_week_key = (
+                str(entry.get("week_start") or ""),
+                normalize_search_text(str(entry.get("name") or "")) + "|" + normalize_search_text(str(entry.get("position") or "")),
+            )
+            previous = best_by_person_week.get(person_week_key)
+            if not previous or score > previous[0]:
+                best_by_person_week[person_week_key] = (score, entry)
+    return [item[1] for item in best_by_person_week.values()]
+
+
+def schedule_entry_score(entry: dict[str, object]) -> int:
+    shifts = entry.get("shifts", [])
+    shift_score = 0
+    if isinstance(shifts, list):
+        for shift in shifts:
+            if not isinstance(shift, dict):
+                continue
+            if str(shift.get("shift") or "").strip() not in {"", "-", "wolne"}:
+                shift_score += 2
+            if str(shift.get("hours") or "").strip():
+                shift_score += 1
+    total_hours = str(entry.get("total_hours") or "").strip()
+    score = shift_score + (2 if total_hours else 0)
+    # Przy skopiowanej tabelce lipiec→sierpień preferuj zakładkę zgodną z datami bloku.
+    title_month = schedule_month_from_title(str(entry.get("sheet") or ""))
+    block_month = str(entry.get("sheet_month") or entry.get("primary_month") or "")
+    if title_month is not None and block_month == f"{title_month[0]:04d}-{title_month[1]:02d}":
+        score += 8
+    return score
+
+
+def dedupe_schedule_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    best_by_person_week: dict[tuple[str, str], tuple[int, dict[str, object]]] = {}
+    for entry in entries:
+        person_week_key = (
+            str(entry.get("week_start") or ""),
+            normalize_search_text(str(entry.get("name") or "")) + "|" + normalize_search_text(str(entry.get("position") or "")),
+        )
+        score = schedule_entry_score(entry)
+        previous = best_by_person_week.get(person_week_key)
+        if not previous or score > previous[0]:
+            best_by_person_week[person_week_key] = (score, entry)
+    return [item[1] for item in best_by_person_week.values()]
 
 
 def load_live_schedule(force: bool = False) -> dict[str, object]:
@@ -1875,9 +2038,11 @@ def load_live_schedule(force: bool = False) -> dict[str, object]:
     try:
         token = google_sheets_access_token()
         titles = spreadsheet_sheet_titles(token=token)
+        sheets_by_title = google_sheet_values_batch(titles, token=token)
         entries: list[dict[str, object]] = []
         for title in titles:
-            entries.extend(parse_schedule_sheet(title, google_sheet_values(title, token=token)))
+            entries.extend(parse_schedule_sheet(title, sheets_by_title.get(title, [])))
+        entries = dedupe_schedule_entries(entries)
         result = {
             "ok": True,
             "error": "",
@@ -2748,6 +2913,8 @@ def page_template(
     role: str = "manager",
     day: str = "today",
     page_class: str = "",
+    logo_href: str = "",
+    hub: str = "",
 ) -> bytes:
     errors = errors or {}
     alert = ""
@@ -2759,13 +2926,35 @@ def page_template(
     page_role = normalize_page_role(role)
     role = normalize_role(role)
     day = normalize_day(day)
+    hub = normalize_hub(hub)
     logo_src = logo_asset_url()
     classes = []
-    if page_role == "home":
+    is_schedules = "page-schedules" in (page_class or "")
+    if page_role == "home" and not is_schedules:
         classes.append("page-home")
+        if hub:
+            classes.append("page-home-hub")
+        else:
+            classes.append("page-home-landing")
     if page_class:
         classes.append(page_class)
     body_class = f' class="{" ".join(classes)}"' if classes else ""
+    day_q = day_query(selected_day(day))
+    home_href = logo_href or hub_home_href(day)
+    urodziny_href = hub_home_href(day, "urodziny")
+    grafiki_href = hub_home_href(day, "grafiki")
+    brand_markup = (
+        f'<a class="brand-link" href="{escape(home_href)}" aria-label="Strona główna">'
+        f'<img class="logo" src="{logo_src}" alt="iKids Park"></a>'
+    )
+    on_grafiki = is_schedules or hub == "grafiki"
+    on_urodziny = (not on_grafiki) and (
+        hub == "urodziny" or page_role in ROLE_DEFS
+    )
+    urodziny_current = ' aria-current="page"' if on_urodziny else ""
+    grafiki_current = ' aria-current="page"' if on_grafiki else ""
+    urodziny_link_class = "topbar-link is-active" if on_urodziny else "topbar-link"
+    grafiki_link_class = "topbar-link is-active" if on_grafiki else "topbar-link"
 
     document = f"""<!doctype html>
 <html lang="pl">
@@ -2886,10 +3075,29 @@ def page_template(
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
       align-items: center;
+      gap: 8px;
     }}
 
-    .date-month-label,
-    .install-button {{
+    .topbar-section {{
+      display: inline-flex;
+      align-items: center;
+      z-index: 2;
+      min-width: 0;
+    }}
+
+    .topbar-section-left {{
+      grid-column: 1;
+      grid-row: 1;
+      justify-self: start;
+    }}
+
+    .topbar-section-right {{
+      grid-column: 3;
+      grid-row: 1;
+      justify-self: end;
+    }}
+
+    .topbar-link {{
       box-sizing: border-box;
       padding: 7px 12px 7px 10px;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
@@ -2900,18 +3108,42 @@ def page_template(
       display: inline-flex;
       align-items: center;
       white-space: nowrap;
-      z-index: 2;
+      border: 1px solid #a6a6a6;
+      border-radius: 7px;
+      gap: 7px;
+      cursor: pointer;
+      text-decoration: none;
+      background: #fff;
+      color: #000;
+    }}
+
+    .topbar-link:hover {{
+      background: #f3f3f3;
+    }}
+
+    .topbar-link.is-active {{
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #fff;
+    }}
+
+    .topbar-link.is-active:hover {{
+      background: var(--brand-dark);
+      border-color: var(--brand-dark);
     }}
 
     .install-button {{
+      position: absolute;
+      top: 6px;
+      right: 10px;
+      z-index: 6;
+      box-sizing: border-box;
+      padding: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       border: 1px solid #a6a6a6;
       border-radius: 7px;
-      position: relative;
-      grid-column: 3;
-      grid-row: 1;
-      justify-self: end;
-      align-self: center;
-      gap: 7px;
       background: #000;
       color: #fff;
       cursor: pointer;
@@ -2921,20 +3153,31 @@ def page_template(
       background: #1a1a1a;
     }}
 
+    .topbar-link:focus-visible,
     .install-button:focus-visible {{
       outline: 2px solid var(--brand);
       outline-offset: 2px;
     }}
 
+    .topbar-link__icon,
     .install-button__icon {{
       width: 15px;
       height: 15px;
       flex: 0 0 15px;
       display: block;
-      fill: currentColor;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
     }}
 
-    .install-button__label {{
+    .install-button__icon {{
+      fill: currentColor;
+      stroke: none;
+    }}
+
+    .topbar-link__label {{
       font-size: inherit;
       font-weight: inherit;
       letter-spacing: inherit;
@@ -3020,16 +3263,24 @@ def page_template(
     }}
 
     .date-month-label {{
-      grid-column: 1;
-      grid-row: 1;
-      justify-self: start;
-      align-self: center;
+      position: absolute;
+      left: 50%;
+      top: 0;
+      transform: translateX(-50%);
+      z-index: 3;
       margin: 0;
-      padding: 7px 0;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid var(--line);
       color: var(--ink);
       text-transform: uppercase;
-      background: transparent;
-      border: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      line-height: 1;
+      white-space: nowrap;
       opacity: 0;
       visibility: hidden;
       pointer-events: none;
@@ -3053,6 +3304,21 @@ def page_template(
       min-width: 0;
       overflow: visible;
       pointer-events: none;
+    }}
+
+    .brand-link {{
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      text-decoration: none;
+      -webkit-tap-highlight-color: transparent;
+    }}
+
+    .brand-link:focus-visible {{
+      outline: 2px solid var(--brand);
+      outline-offset: 4px;
     }}
 
     .logo {{
@@ -4730,6 +4996,16 @@ def page_template(
       margin-bottom: 0;
     }}
 
+    .home-section-title {{
+      margin: 28px 0 0;
+      text-align: center;
+      font-size: clamp(1.35rem, 4vw, 1.85rem);
+      font-weight: 900;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--ink);
+    }}
+
     html:has(body.page-home) {{
       overflow: hidden;
       height: 100%;
@@ -6116,31 +6392,46 @@ def page_template(
         z-index: 1;
       }}
 
+      body.page-home-landing main {{
+        padding-bottom: max(24px, env(safe-area-inset-bottom, 0px));
+      }}
+
       .topbar {{
         align-items: center;
         min-height: 56px;
         overflow: visible;
       }}
 
-      .date-month-label {{
-        padding: 6px 0;
-        font-size: 0.82rem;
+      .topbar-section {{
+        min-width: 0;
       }}
 
-      .install-button {{
+      .topbar-link {{
         padding: 6px 10px 6px 8px;
         font-size: 0.82rem;
         gap: 6px;
       }}
 
+      .install-button {{
+        top: 4px;
+        right: 6px;
+        padding: 5px;
+      }}
+
+      .topbar-link__icon,
       .install-button__icon {{
         width: 14px;
         height: 14px;
         flex-basis: 14px;
       }}
 
-      .install-button__label {{
+      .topbar-link__label {{
         font-size: inherit;
+      }}
+
+      .date-month-label {{
+        padding: 4px 8px;
+        font-size: 0.72rem;
       }}
 
       .date-day {{
@@ -6501,16 +6792,36 @@ def page_template(
   </div>
   <header>
     <div class="topbar">
-      <p class="date-month-label" data-date-month-label aria-hidden="true"></p>
-      <div class="brand">
-        <img class="logo" src="{logo_src}" alt="iKids Park">
+      <div class="topbar-section topbar-section-left">
+        <a class="{urodziny_link_class}" href="{escape(urodziny_href)}"{urodziny_current} aria-label="Urodziny">
+          <svg class="topbar-link__icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8"/>
+            <path d="M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1"/>
+            <path d="M2 21h20"/>
+            <path d="M7 8v3M12 8v3M17 8v3"/>
+            <path d="M7 4h.01M12 4h.01M17 4h.01"/>
+          </svg>
+          <span class="topbar-link__label">Urodziny</span>
+        </a>
       </div>
-      <button class="install-button" type="button" data-install-app aria-label="Zainstaluj aplikację">
+      <div class="brand">
+        {brand_markup}
+      </div>
+      <div class="topbar-section topbar-section-right">
+        <a class="{grafiki_link_class}" href="{escape(grafiki_href)}"{grafiki_current} aria-label="Grafiki">
+          <svg class="topbar-link__icon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="18" rx="2"/>
+            <path d="M16 2v4M8 2v4M3 10h18"/>
+            <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>
+          </svg>
+          <span class="topbar-link__label">Grafiki</span>
+        </a>
+      </div>
+      <button class="install-button" type="button" data-install-app aria-label="Pobierz aplikację" title="Pobierz">
         <svg class="install-button__icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M11 3a1 1 0 0 1 2 0v8.586l2.293-2.293a1 1 0 0 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L11 11.586V3z"/>
           <path d="M5 18a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z"/>
         </svg>
-        <span class="install-button__label">Pobierz</span>
       </button>
     </div>
   </header>
@@ -6810,42 +7121,31 @@ def render_organizer_tools(role: str, day: str) -> str:
 """
 
 
-def render_nav(page_role: str, day: str) -> str:
+def normalize_hub(hub: str | None) -> str:
+    value = str(hub or "").strip().lower()
+    return value if value in {"urodziny", "grafiki"} else ""
+
+
+def hub_home_href(day: str, hub: str = "") -> str:
+    day_q = day_query(selected_day(normalize_day(day)))
+    params: dict[str, str] = {"role": "home", "day": day_q}
+    normalized = normalize_hub(hub)
+    if normalized:
+        params["hub"] = normalized
+    return "/?" + urlencode(params)
+
+
+def render_home_section_title(title: str) -> str:
+    if not title:
+        return ""
+    return f'<p class="home-section-title">{escape(title)}</p>'
+
+
+def render_date_toolbar(page_role: str, day: str, *, hub: str = "") -> str:
     page_role = normalize_page_role(page_role)
     day = normalize_day(day)
+    hub = normalize_hub(hub)
     target_day = selected_day(day)
-    role_links_by_key = {}
-    mobile_labels = {
-        "manager": "Kierownik<br>recepcja",
-        "organizer": "Organizator<br>urodzin",
-    }
-    for key, meta in ROLE_DEFS.items():
-        mobile_label = mobile_labels.get(key, escape(meta["label"]))
-        tab_content = (
-            f'<span class="tab-icon">{ROLE_NAV_ICONS[key]}</span>'
-            f'<span class="tab-label"><span class="tab-label-full">{escape(meta["label"])}</span>'
-            f'<span class="tab-label-mobile">{mobile_label}</span></span>'
-        )
-        role_links_by_key[key] = (
-            f'<a class="tab" href="{link_for(key, day_query(target_day))}" aria-current="page"'
-            f' title="{escape(meta["hint"])}">{tab_content}</a>'
-            if key == page_role
-            else f'<a class="tab" href="{link_for(key, day_query(target_day))}" title="{escape(meta["hint"])}">{tab_content}</a>'
-        )
-    home_current = ' aria-current="page"' if page_role == "home" else ""
-    home_link = (
-        f'<a class="tab tab-home" href="{link_for("home", day_query(target_day))}"'
-        f'{home_current} aria-label="Strona główna">'
-        f'<img class="tab-home-logo" src="{menu_logo_asset_url()}" alt="iKids Park"></a>'
-    )
-    role_links = [
-        role_links_by_key["manager"],
-        role_links_by_key["animators"],
-        home_link,
-        role_links_by_key["kitchen"],
-        role_links_by_key["organizer"],
-    ]
-
     strip_anchor_day = current_app_date()
     active_week_offset = week_page_offset_for_day(strip_anchor_day, target_day)
     week_pages = calendar_week_pages(strip_anchor_day, include_day=target_day)
@@ -6878,9 +7178,10 @@ def render_nav(page_role: str, day: str) -> str:
             if is_today:
                 day_attrs.append("data-today-day")
             attrs = f' {" ".join(day_attrs)}' if day_attrs else ""
+            href = link_for(page_role, query, hub=hub) if hub else link_for(page_role, query)
             day_links.append(
                 f"""
-            <a class="{" ".join(day_classes)}" href="{link_for(page_role, query)}"{attrs}>
+            <a class="{" ".join(day_classes)}" href="{href}"{attrs}>
               <span class="date-day-surface" aria-hidden="true"></span>
               <span class="date-day-name">{escape(weekday)}</span>
               <span class="date-day-number">{escape(strip_day.strftime("%d"))}</span>
@@ -6891,8 +7192,8 @@ def render_nav(page_role: str, day: str) -> str:
         )
 
     return f"""
-<div class="toolbar">
   <div class="date-toolbar">
+    <p class="date-month-label" data-date-month-label aria-hidden="true"></p>
     <button class="date-week-jump date-week-jump-prev" type="button" data-date-week-prev aria-label="Poprzedni tydzień">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
     </button>
@@ -6901,7 +7202,121 @@ def render_nav(page_role: str, day: str) -> str:
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
     </button>
   </div>
-  <div class="tabs">{''.join(role_links)}</div>
+"""
+
+
+def render_role_tabs(page_role: str, day: str, *, hub: str = "") -> str:
+    page_role = normalize_page_role(page_role)
+    day = normalize_day(day)
+    hub = normalize_hub(hub) or ("urodziny" if page_role in ROLE_DEFS else "urodziny")
+    target_day = selected_day(day)
+    day_q = day_query(target_day)
+    role_links_by_key = {}
+    mobile_labels = {
+        "manager": "Kierownik<br>recepcja",
+        "organizer": "Organizator<br>urodzin",
+    }
+    for key, meta in ROLE_DEFS.items():
+        mobile_label = mobile_labels.get(key, escape(meta["label"]))
+        tab_content = (
+            f'<span class="tab-icon">{ROLE_NAV_ICONS[key]}</span>'
+            f'<span class="tab-label"><span class="tab-label-full">{escape(meta["label"])}</span>'
+            f'<span class="tab-label-mobile">{mobile_label}</span></span>'
+        )
+        role_links_by_key[key] = (
+            f'<a class="tab" href="{link_for(key, day_q)}" aria-current="page"'
+            f' title="{escape(meta["hint"])}">{tab_content}</a>'
+            if key == page_role
+            else f'<a class="tab" href="{link_for(key, day_q)}" title="{escape(meta["hint"])}">{tab_content}</a>'
+        )
+    home_current = ' aria-current="page"' if page_role == "home" else ""
+    home_link = (
+        f'<a class="tab tab-home" href="{escape(hub_home_href(day, hub))}"'
+        f'{home_current} aria-label="Podsumowanie urodzin">'
+        f'<img class="tab-home-logo" src="{menu_logo_asset_url()}" alt="iKids Park"></a>'
+    )
+    role_links = [
+        role_links_by_key["manager"],
+        role_links_by_key["animators"],
+        home_link,
+        role_links_by_key["kitchen"],
+        role_links_by_key["organizer"],
+    ]
+    return f'<div class="tabs">{"".join(role_links)}</div>'
+
+
+def render_grafiki_department_tabs(
+    *,
+    role: str,
+    day: str,
+    selected_department: str = "",
+    selected_month: str = "",
+    selected_week: str = "",
+    selected_view: str = "week",
+    home_href: str = "",
+) -> str:
+    day = normalize_day(day)
+    day_q = day_query(selected_day(day))
+    home_url = home_href or hub_home_href(day, "grafiki")
+    department_items = [
+        ("managerowie", "Menedżerowie", "Menedżerowie", ROLE_NAV_ICONS["manager"]),
+        ("animatorzy", "Animatorzy", "Animatorzy", ROLE_NAV_ICONS["animators"]),
+        ("kuchnia", "Kuchnia", "Kuchnia", ROLE_NAV_ICONS["kitchen"]),
+        ("serwis", "Serwis", "Serwis", ROLE_NAV_ICONS["organizer"]),
+    ]
+
+    def department_tab(key: str, label: str, mobile_label: str, icon: str) -> str:
+        current = ' aria-current="page"' if key == selected_department else ""
+        href = schedule_url(
+            role=role if role != "home" else "home",
+            day=day,
+            department=key,
+            month=selected_month,
+            week=selected_week,
+            view=selected_view or "week",
+        )
+        return (
+            f'<a class="tab schedule-control" href="{escape(href)}"{current} title="{escape(label)}">'
+            f'<span class="tab-icon">{icon}</span>'
+            f'<span class="tab-label"><span class="tab-label-full">{escape(label)}</span>'
+            f'<span class="tab-label-mobile">{escape(mobile_label)}</span></span></a>'
+        )
+
+    managers_tab = department_tab(*department_items[0])
+    animators_tab = department_tab(*department_items[1])
+    kitchen_tab = department_tab(*department_items[2])
+    serwis_tab = department_tab(*department_items[3])
+    home_current = ' aria-current="page"' if not selected_department else ""
+    home_tab = (
+        f'<a class="tab tab-home" href="{escape(home_url)}"{home_current} '
+        f'aria-label="Podsumowanie grafików" title="Podsumowanie grafików">'
+        f'<img class="tab-home-logo" src="{menu_logo_asset_url()}" alt="iKids Park"></a>'
+    )
+    return f"""
+    <div class="tabs">
+      {managers_tab}
+      {animators_tab}
+      {home_tab}
+      {kitchen_tab}
+      {serwis_tab}
+    </div>
+    """
+
+
+def render_nav(page_role: str, day: str, *, hub: str = "", show_tabs: bool = True) -> str:
+    page_role = normalize_page_role(page_role)
+    day = normalize_day(day)
+    hub = normalize_hub(hub)
+    tabs = ""
+    if show_tabs:
+        if hub == "grafiki":
+            tabs = render_grafiki_department_tabs(role=page_role, day=day, home_href=hub_home_href(day, "grafiki"))
+        else:
+            tabs = render_role_tabs(page_role, day, hub=hub or "urodziny")
+    return f"""
+<div class="toolbar">
+  {render_date_toolbar(page_role, day, hub=hub)}
+  {tabs}
 </div>
 """
 
@@ -7283,14 +7698,6 @@ METRIC_ICONS = {
     "warsztaty": LOGISTICS_CHIP_ICONS["kitchen"].replace("logistics-chip-svg", "metric-svg"),
     "torty": LOGISTICS_CHIP_ICONS["cake"].replace("logistics-chip-svg", "metric-svg"),
     "piniaty": LOGISTICS_CHIP_ICONS["pinata"].replace("logistics-chip-svg", "metric-svg"),
-    "grafiki": (
-        '<svg class="metric-svg" viewBox="0 0 24 24" aria-hidden="true">'
-        '<rect x="3" y="4" width="18" height="18" rx="2"/>'
-        '<path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>'
-        '<path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/>'
-        '<path d="M8 18h.01"/><path d="M12 18h.01"/>'
-        "</svg>"
-    ),
 }
 
 
@@ -8310,11 +8717,6 @@ def render_metrics(rows: list[DbRow], day: str) -> str:
   {render_metric(pinatas, "piniaty", "piniaty", animators_link)}
   {render_metric(cakes, "torty", "torty", kitchen_link)}
   {render_metric(workshops, "warsztaty", "warsztaty", kitchen_link)}
-  <a class="metric" href="/grafiki?role=home&day={escape(current_day_query)}" target="_blank" rel="noopener">
-    <span class="metric-icon" aria-hidden="true">{METRIC_ICONS["grafiki"]}</span>
-    <strong>live</strong>
-    <span class="muted">grafiki</span>
-  </a>
 </div>
 """
 
@@ -8573,16 +8975,6 @@ def render_role_view(role: str, rows: list[DbRow], day: str) -> str:
     return render_manager_view(rows, role, day)
 
 
-def render_schedule_shift_cell(shift: dict[str, object]) -> str:
-    value = str(shift.get("shift") or "").strip()
-    hours = str(shift.get("hours") or "").strip()
-    empty = not value or normalize_search_text(value) in {"-", ".", "x"}
-    shift_class = " schedule-shift is-empty" if empty else " schedule-shift"
-    hours_markup = f'<span class="schedule-hours">{escape(hours)}</span>' if hours and not empty else ""
-    shift_markup = escape(value) if value else "<span>Wolne</span>"
-    return f'<td><div class="{shift_class}"><strong>{shift_markup}</strong>{hours_markup}</div></td>'
-
-
 def schedule_url(
     *,
     role: str,
@@ -8605,6 +8997,12 @@ def schedule_url(
 
 
 def schedule_entry_has_month(entry: dict[str, object], month: str) -> bool:
+    week_months = entry.get("week_months")
+    if isinstance(week_months, list) and week_months:
+        return month in {str(value) for value in week_months if value}
+    sheet_month = str(entry.get("sheet_month") or "").strip()
+    if sheet_month == month:
+        return True
     shifts = entry.get("shifts", [])
     return any(isinstance(shift, dict) and shift.get("month") == month for shift in shifts)
 
@@ -8614,12 +9012,22 @@ def schedule_entry_has_week(entry: dict[str, object], week: str) -> bool:
 
 
 def schedule_available_months(entries: list[dict[str, object]]) -> list[str]:
-    months = {
-        str(shift.get("month"))
-        for entry in entries
-        for shift in (entry.get("shifts", []) if isinstance(entry.get("shifts", []), list) else [])
-        if isinstance(shift, dict) and shift.get("month")
-    }
+    months: set[str] = set()
+    for entry in entries:
+        week_months = entry.get("week_months")
+        if isinstance(week_months, list):
+            for value in week_months:
+                if value:
+                    months.add(str(value))
+        sheet_month = str(entry.get("sheet_month") or "").strip()
+        if sheet_month:
+            months.add(sheet_month)
+        shifts = entry.get("shifts", [])
+        if not isinstance(shifts, list):
+            continue
+        for shift in shifts:
+            if isinstance(shift, dict) and shift.get("month"):
+                months.add(str(shift.get("month")))
     return sorted(months)
 
 
@@ -8669,7 +9077,27 @@ def schedule_filtered_entries(
 
 def schedule_shift_is_work(value: object) -> bool:
     normalized = normalize_search_text(value)
-    return bool(normalized) and normalized not in {"-", ".", "x", "w", "wolne"}
+    return bool(normalized) and normalized not in {
+        "-",
+        ".",
+        "x",
+        "w",
+        "wolne",
+        "u",
+        "urlop",
+        "?",
+    }
+
+
+def normalize_schedule_shift(value: object) -> str:
+    """Normalizuje wpis z arkusza: '10- 20' → '10-20', '9-15.30' → '9-15:30', '11-21B' → '11-21'."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"\s+", "", raw)
+    raw = re.sub(r"\.(\d{2})(?=$|-)", r":\1", raw)
+    raw = re.sub(r"([0-9:])[Bb]$", r"\1", raw)
+    return raw
 
 
 def schedule_month_days(month: str) -> list[date]:
@@ -8684,6 +9112,23 @@ def schedule_month_days(month: str) -> list[date]:
         days.append(current)
         current += timedelta(days=1)
     return days
+
+
+def schedule_week_days(week_start: str) -> list[date]:
+    try:
+        start = date.fromisoformat(week_start)
+    except ValueError:
+        return []
+    return [start + timedelta(days=offset) for offset in range(7)]
+
+
+def schedule_adjacent_week(week: str, weeks: list[str], delta: int) -> str:
+    if not weeks or week not in weeks:
+        return week
+    index = weeks.index(week) + delta
+    if index < 0 or index >= len(weeks):
+        return week
+    return weeks[index]
 
 
 def compact_schedule_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -8727,136 +9172,727 @@ def format_schedule_total(value: object) -> str:
     return str(number).replace(".", ",")
 
 
-def render_schedule_table(entries: list[dict[str, object]], title: str, subtitle: str = "") -> str:
-    if not entries:
-        return f"""
-        <section class="schedule-section">
-          <div class="section-head">
-            <div>
-              <h2>{escape(title)}</h2>
-              <p class="subtitle">{escape(subtitle)}</p>
-            </div>
-          </div>
-          <div class="empty">Brak odczytanych pozycji dla tego zakresu.</div>
-        </section>
-        """
+def parse_shift_start_hour(shift: object) -> float | None:
+    """Wyciąga godzinę startu z wartości typu '9-21', '15:30-21', '10-16:30'."""
+    raw = normalize_schedule_shift(shift)
+    if not raw or not schedule_shift_is_work(raw):
+        return None
+    match = re.match(r"^(\d{1,2})(?::(\d{2}))?", raw)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if hour > 23:
+        return None
+    return hour + (minute / 60.0)
 
-    first_shifts = entries[0].get("shifts", [])
-    day_headers = "".join(
-        f'<th>{escape(shift.get("day", ""))}<br><span>{escape(shift.get("date_label", "") or format_date(shift.get("date", "")))}</span></th>'
-        for shift in first_shifts
-        if isinstance(shift, dict)
-    )
-    rows = []
-    for entry in entries:
-        shifts = entry.get("shifts", [])
-        shift_cells = "".join(
-            render_schedule_shift_cell(shift)
-            for shift in shifts
-            if isinstance(shift, dict)
+
+def parse_shift_end_hour(shift: object) -> float | None:
+    """Wyciąga godzinę końca z zakresu typu '9-21', '15:30-21', '10:30-20:00'."""
+    raw = normalize_schedule_shift(shift)
+    if not raw or not schedule_shift_is_work(raw) or "-" not in raw:
+        return None
+    end_raw = raw.split("-", 1)[1]
+    match = re.match(r"^(\d{1,2})(?::(\d{2}))?", end_raw)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if hour > 23:
+        return None
+    return hour + (minute / 60.0)
+
+
+def estimate_hours_from_shift(shift: object) -> float:
+    """Szacuje długość zmiany z zakresu godzin, gdy brak kolumny 'ilość godzin'."""
+    start = parse_shift_start_hour(shift)
+    end = parse_shift_end_hour(shift)
+    if start is None or end is None:
+        return 0.0
+    if end < start:
+        end += 24.0
+    return round(end - start, 2)
+
+
+def cell_hours_value(shift: object, hours: object) -> float:
+    """Preferuje wpisaną liczbę godzin; inaczej liczy z zakresu '9-21'."""
+    parsed = parse_hours_number(hours)
+    if parsed > 0:
+        return parsed
+    return estimate_hours_from_shift(shift)
+
+
+SHIFT_REPORT_HALF_HOURS_MAX = 6.0  # do 6 h włącznie = pół zmiany; powyżej = cała
+
+# Pan Valery — codziennie na zmianie, nie występuje w arkuszu grafiku.
+SHIFT_REPORT_STANDING_KONSERWATOR = 1
+
+SHIFT_REPORT_ROLE_ORDER = [
+    "Administrator",
+    "Bar",
+    "Animatorzy",
+    "Organizator urodzin",
+    "Kelnerzy",
+    "Pracownia kreatywna",
+    "Sprzątaczki + zmywak",
+    "Recepcja",
+    "Kuchnia",
+    "Dyrekcja",
+    "Księgowość",
+    "Konserwator",
+    "Kierownik HR",
+    "Kierownik animatorów",
+    "Inne",
+]
+
+SHIFT_REPORT_ROLE_EMOJI = {
+    "Administrator": "👔",
+    "Bar": "🍸",
+    "Animatorzy": "🎈",
+    "Organizator urodzin": "🎉",
+    "Kelnerzy": "🍽️",
+    "Pracownia kreatywna": "🎨",
+    "Sprzątaczki + zmywak": "🧹",
+    "Recepcja": "🛎️",
+    "Kuchnia": "👨‍🍳",
+    "Dyrekcja": "💼",
+    "Księgowość": "📊",
+    "Konserwator": "🔧",
+    "Kierownik HR": "📋",
+    "Kierownik animatorów": "⭐",
+    "Inne": "➕",
+}
+
+# Gdy w arkuszu brak stanowiska (Managerowie) — znane przypisania po imieniu i nazwisku.
+SHIFT_REPORT_NAME_OVERRIDES: dict[str, str] = {
+    normalize_search_text("Agata Krzyżanowska"): "Kierownik HR",
+    normalize_search_text("Adam Tur"): "Kierownik animatorów",
+    normalize_search_text("Ania Hernacka"): "Księgowość",
+    normalize_search_text("Łukasz Aleksandrowicz"): "Dyrekcja",
+    normalize_search_text("Olga Dietkovska"): "Dyrekcja",
+    normalize_search_text("Maciej Pacholak"): "Kuchnia",
+    normalize_search_text("Weronika Walkowiak"): "Administrator",
+    normalize_search_text("Marek Dutkiewicz"): "Administrator",
+}
+
+
+def shift_has_bar_marker(value: object) -> bool:
+    """Dopisek B w komórce (np. 11-21B) = kelner obsługuje bar tego dnia."""
+    raw = re.sub(r"\s+", "", str(value or "").strip())
+    return bool(re.search(r"[Bb]$", raw))
+
+
+def report_role_name_override(name: object) -> str | None:
+    return SHIFT_REPORT_NAME_OVERRIDES.get(normalize_search_text(name))
+
+
+def report_role_for_shift(name: object, position: object, shift_raw: object) -> str:
+    if shift_has_bar_marker(shift_raw):
+        return "Bar"
+    override = report_role_name_override(name)
+    if override:
+        return override
+    return report_role_for(position)
+
+
+def report_role_for(position: object) -> str:
+    """Mapuje stanowisko z arkusza na linię raportu kierownika zmiany."""
+    hay = normalize_search_text(position)
+    if not hay:
+        return "Inne"
+    if "kierownik animator" in hay:
+        return "Kierownik animatorów"
+    if "organizator" in hay:
+        return "Organizator urodzin"
+    if "kierownik zmiany" in hay or "administrator" in hay or hay == "admin":
+        return "Administrator"
+    if "barman" in hay or hay == "bar":
+        return "Bar"
+    if "animator" in hay or "aniamator" in hay:
+        return "Animatorzy"
+    if "kelner" in hay:
+        return "Kelnerzy"
+    if "pracownia" in hay:
+        return "Pracownia kreatywna"
+    if "sprzataj" in hay or "zmywak" in hay:
+        return "Sprzątaczki + zmywak"
+    if "recepcja" in hay:
+        return "Recepcja"
+    if any(token in hay for token in ("kucharz", "cukiernik", "pizza", "soue", "kuchnia", "szef kuchni")):
+        return "Kuchnia"
+    if "dyrektor" in hay or "zastepca" in hay:
+        return "Dyrekcja"
+    if "ksiegow" in hay:
+        return "Księgowość"
+    if "konserwator" in hay:
+        return "Konserwator"
+    if hay == "hr" or hay.startswith("hr ") or hay.endswith(" hr"):
+        return "Kierownik HR"
+    return "Inne"
+
+
+def is_half_shift(hours: float) -> bool:
+    """Pół zmiana: do 6 godzin włącznie; powyżej 6 — cała zmiana."""
+    return hours <= SHIFT_REPORT_HALF_HOURS_MAX
+
+
+def format_staff_count(total: int, full: int, half: int) -> str:
+    if total <= 0:
+        return "0"
+    if half <= 0:
+        return str(total)
+    if full <= 0:
+        return f"{total} ({half} 1/2)"
+    return f"{total} ({half} 1/2, {full} cały)"
+
+
+def reservation_metrics_for_day(
+    target_day: date,
+    rows: list[DbRow] | None = None,
+) -> dict[str, int]:
+    if rows is None:
+        rows = get_reservations_for_day(target_day)
+    active = [row for row in rows if row["status"] == "active"]
+    return {
+        "banquets": sum(1 for row in active if not is_table_reservation(row)),
+        "tables": sum(1 for row in active if is_table_reservation(row)),
+        "animations": sum(len(animations_from_row(row)) for row in active),
+        "pinatas": sum(1 for row in active if is_enabled(row, "pinata_enabled")),
+        "workshops": sum(1 for row in active if is_enabled(row, "culinary_workshops_enabled")),
+    }
+
+
+def build_shift_report(
+    iso_date: str,
+    entries: list[dict[str, object]],
+    *,
+    reservation_rows: list[DbRow] | None = None,
+    compact_entries: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Buduje raport obsady + metryki rezerwacji dla jednego dnia (wszystkie działy)."""
+    target_day = date.fromisoformat(iso_date)
+    roles: dict[str, dict[str, int]] = {
+        label: {"full": 0, "half": 0} for label in SHIFT_REPORT_ROLE_ORDER
+    }
+    people = compact_entries if compact_entries is not None else compact_schedule_entries(entries)
+    for person in people:
+        name = str(person.get("name") or "").strip()
+        if not name:
+            continue
+        days_map = person.get("days", {})
+        cell = days_map.get(iso_date, {}) if isinstance(days_map, dict) else {}
+        if not isinstance(cell, dict):
+            continue
+        shift_raw = cell.get("shift") or ""
+        shift = normalize_schedule_shift(shift_raw)
+        if not schedule_shift_is_work(shift):
+            continue
+        hours_value = cell_hours_value(shift, cell.get("hours"))
+        role = report_role_for_shift(name, person.get("position"), shift_raw)
+        bucket = roles.setdefault(role, {"full": 0, "half": 0})
+        if is_half_shift(hours_value):
+            bucket["half"] += 1
+        else:
+            bucket["full"] += 1
+    konserwator = roles.setdefault("Konserwator", {"full": 0, "half": 0})
+    konserwator["full"] += SHIFT_REPORT_STANDING_KONSERWATOR
+    total_people = sum(bucket["full"] + bucket["half"] for bucket in roles.values())
+    return {
+        "date": iso_date,
+        "metrics": reservation_metrics_for_day(target_day, reservation_rows),
+        "roles": roles,
+        "total_people": total_people,
+    }
+
+
+def format_shift_report_text(report: dict[str, object]) -> str:
+    metrics = report.get("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    roles = report.get("roles", {})
+    if not isinstance(roles, dict):
+        roles = {}
+
+    def role_line(label: str, full: int, half: int) -> str:
+        emoji = SHIFT_REPORT_ROLE_EMOJI.get(label, "➕")
+        return f"{emoji} {label} - {format_staff_count(full + half, full, half)}"
+
+    lines = [
+        "Dzień dobry 👋",
+        "",
+        f"🎂 Bankiety – {int(metrics.get('banquets', 0))}",
+        f"🪑 Rezerwacje – {int(metrics.get('tables', 0))}",
+        f"🎭 Animacje – {int(metrics.get('animations', 0))}",
+        f"🪅 Piniata – {int(metrics.get('pinatas', 0))}",
+        f"🧁 Warsztaty (MK) – {int(metrics.get('workshops', 0))}",
+        "",
+    ]
+    for label in SHIFT_REPORT_ROLE_ORDER:
+        if label == "Inne":
+            continue
+        bucket = roles.get(label, {"full": 0, "half": 0})
+        if not isinstance(bucket, dict):
+            bucket = {"full": 0, "half": 0}
+        full = int(bucket.get("full", 0))
+        half = int(bucket.get("half", 0))
+        lines.append(role_line(label, full, half))
+    other = roles.get("Inne", {"full": 0, "half": 0})
+    if isinstance(other, dict):
+        other_full = int(other.get("full", 0))
+        other_half = int(other.get("half", 0))
+        if other_full + other_half > 0:
+            lines.append(role_line("Inne", other_full, other_half))
+    lines.append("")
+    lines.append(f"👥 Razem: {int(report.get('total_people', 0))} osób na zmianie")
+    return "\n".join(lines)
+
+
+def build_shift_reports_for_dates(
+    iso_dates: list[str],
+    entries: list[dict[str, object]],
+) -> dict[str, str]:
+    reports: dict[str, str] = {}
+    if not iso_dates:
+        return reports
+    reservation_cache = get_reservations_for_days(iso_dates)
+    compact = compact_schedule_entries(entries)
+    for iso in iso_dates:
+        report = build_shift_report(
+            iso,
+            entries,
+            reservation_rows=reservation_cache.get(iso, []),
+            compact_entries=compact,
         )
-        rows.append(
-            f"""
-            <tr>
-              <th class="schedule-person">
-                <strong>{escape(entry.get("name", ""))}</strong>
-                <span>{escape(entry.get("position", ""))}</span>
-              </th>
-              {shift_cells}
-              <td class="schedule-total">{escape(entry.get("total_hours", ""))}</td>
-            </tr>
-            """
-        )
-    return f"""
-    <section class="schedule-section">
-      <div class="section-head">
-        <div>
-          <h2>{escape(title)}</h2>
-          <p class="subtitle">{escape(subtitle)} · {len(entries)} pozycji</p>
-        </div>
-      </div>
-        <div class="schedule-table-wrap" data-fit-schedule>
-          <table class="schedule-table">
-          <thead>
-            <tr>
-              <th>Osoba</th>
-              {day_headers}
-              <th>Razem</th>
-            </tr>
-          </thead>
-          <tbody>{''.join(rows)}</tbody>
-        </table>
-      </div>
-    </section>
+        reports[iso] = format_shift_report_text(report)
+    return reports
+
+
+def shift_period_bucket(shift: object) -> str:
+    """System zmianowy iKids (z Google Sheets — zakresy godzin, nie litery D/N).
+
+    Na podstawie realnych wpisów (animatorzy: 9-15, 15-21, 9-21, 13-21…):
+    - DNIÓWKA (morning): start < 12  → 9-15, 9-16, 10-12, 9-21…
+    - POPOŁUDNIÓWKA (afternoon): 12 ≤ start < 16 → 12-20, 13-21, 15-21…
+    - NOCKA (evening): start ≥ 16 → 16-21…
     """
+    start = parse_shift_start_hour(shift)
+    if start is None:
+        return "afternoon"
+    if start < 12:
+        return "morning"
+    if start < 16:
+        return "afternoon"
+    return "evening"
 
 
-def render_schedule_month_matrix(entries: list[dict[str, object]], month: str, title: str, subtitle: str = "") -> str:
-    days = schedule_month_days(month)
-    compact_entries = compact_schedule_entries(entries)
-    if not compact_entries or not days:
-        return f"""
-        <section class="schedule-section schedule-section-compact">
-          <div class="section-head">
-            <div>
-              <h2>{escape(title)}</h2>
-              <p class="subtitle">{escape(subtitle)}</p>
-            </div>
-          </div>
-          <div class="empty">Brak danych dla wybranego miesiąca.</div>
-        </section>
-        """
-    headers = "".join(
-        f'<th class="schedule-month-day"><strong>{day.day}</strong><span>{WEEKDAY_LABELS[day.weekday()][:2]}</span></th>'
-        for day in days
+def parse_hours_number(value: object) -> float:
+    try:
+        return float(str(value or "").replace(",", ".").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def build_grafik_day_model(
+    entries: list[dict[str, object]],
+    days: list[date],
+    *,
+    month: str = "",
+    week: str = "",
+) -> dict[str, object]:
+    """Buduje model dni × osoby (miesiąc albo tydzień) w układzie grafik4600."""
+    compact = compact_schedule_entries(entries)
+    compact.sort(key=lambda item: normalize_search_text(item.get("name", "")))
+    today = current_app_date()
+
+    employees = [
+        {
+            "name": str(item.get("name") or "").strip(),
+            "position": str(item.get("position") or "").strip(),
+            "display_name": str(item.get("name") or "").strip(),
+            "total": item.get("total", 0.0),
+        }
+        for item in compact
+        if str(item.get("name") or "").strip()
+    ]
+
+    shifts_by_date: dict[str, dict[str, dict[str, str]]] = {}
+    day_totals: dict[str, dict[str, object]] = {}
+    schedule_rows: list[dict[str, object]] = []
+
+    for day in days:
+        iso = day.isoformat()
+        day_shifts: dict[str, dict[str, str]] = {}
+        people_count = 0
+        hours_sum = 0.0
+        for person in compact:
+            name = str(person.get("name") or "").strip()
+            if not name:
+                continue
+            days_map = person.get("days", {})
+            cell = days_map.get(iso, {}) if isinstance(days_map, dict) else {}
+            if not isinstance(cell, dict):
+                continue
+            shift = normalize_schedule_shift(cell.get("shift") or "")
+            hours = str(cell.get("hours") or "").strip()
+            if not schedule_shift_is_work(shift):
+                continue
+            day_shifts[name] = {"shift": shift, "hours": hours}
+            people_count += 1
+            hours_sum += parse_hours_number(hours)
+        shifts_by_date[iso] = day_shifts
+        day_totals[iso] = {
+            "people": people_count,
+            "hours": hours_sum,
+            "hours_label": format_schedule_total(hours_sum),
+        }
+        schedule_rows.append(
+            {
+                "date": iso,
+                "dd": f"{day.day:02d}",
+                "abbr": WEEKDAY_LABELS[day.weekday()][:3],
+                "is_off": day.weekday() >= 5,
+                "is_today": day == today,
+            }
+        )
+
+    return {
+        "month": month,
+        "week": week,
+        "employees": employees,
+        "schedule_rows": schedule_rows,
+        "shifts_by_date": shifts_by_date,
+        "day_totals": day_totals,
+    }
+
+
+def build_grafik_month_model(entries: list[dict[str, object]], month: str) -> dict[str, object]:
+    """Buduje model miesiąca w układzie grafik4600: dni × osoby."""
+    return build_grafik_day_model(entries, schedule_month_days(month), month=month)
+
+
+def build_grafik_week_model(
+    entries: list[dict[str, object]],
+    week_start: str,
+    *,
+    month: str = "",
+) -> dict[str, object]:
+    """Buduje model tygodnia w tym samym układzie co miesiąc (7 dni × osoby)."""
+    return build_grafik_day_model(
+        entries,
+        schedule_week_days(week_start),
+        month=month,
+        week=week_start,
     )
-    rows = []
-    for entry in compact_entries:
-        day_values = entry.get("days", {})
+
+
+def schedule_adjacent_month(month: str, delta: int) -> str:
+    try:
+        year_value, month_value = (int(part) for part in month.split("-", 1))
+        first_day = date(year_value, month_value, 1)
+    except ValueError:
+        return month
+    if delta < 0:
+        target = first_day - timedelta(days=1)
+    else:
+        if month_value == 12:
+            target = date(year_value + 1, 1, 1)
+        else:
+            target = date(year_value, month_value + 1, 1)
+    return target.strftime("%Y-%m")
+
+
+SCHEDULE_CHEVRON_LEFT = (
+    '<svg viewBox="0 0 24 24" aria-hidden="true">'
+    '<path d="M14.5 6.5 9 12l5.5 5.5" fill="none" stroke="currentColor" '
+    'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
+    "</svg>"
+)
+SCHEDULE_CHEVRON_RIGHT = (
+    '<svg viewBox="0 0 24 24" aria-hidden="true">'
+    '<path d="M9.5 6.5 15 12l-5.5 5.5" fill="none" stroke="currentColor" '
+    'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
+    "</svg>"
+)
+
+
+def schedule_day_nav_html(initial_display: str) -> str:
+    return (
+        '<div class="schedule-day-nav" aria-label="Nawigacja dnia">'
+        f'<button type="button" id="shift-prev-day" class="schedule-nav-arrow" aria-label="Poprzedni dzień">{SCHEDULE_CHEVRON_LEFT}</button>'
+        '<div class="shift-date-info">'
+        '<strong id="shift-date-label">DZISIAJ</strong>'
+        f'<span id="shift-date-display">{escape(initial_display)}</span>'
+        "</div>"
+        f'<button type="button" id="shift-next-day" class="schedule-nav-arrow" aria-label="Następny dzień">{SCHEDULE_CHEVRON_RIGHT}</button>'
+        "</div>"
+    )
+
+
+def schedule_roster_actions_html(people_count: int) -> str:
+    return (
+        '<div class="schedule-roster-actions">'
+        '<div class="shift-report-panel">'
+        '<button type="button" id="shift-report-copy" class="shift-report-copy" aria-label="Kopiuj raport zmiany do WhatsApp">'
+        '<span class="shift-report-copy__label">Raport zmiany</span>'
+        '<span class="shift-report-copy__icon" aria-hidden="true">'
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="9" y="9" width="13" height="13" rx="2"/>'
+        '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'
+        "</svg>"
+        "</span>"
+        "</button>"
+        "</div>"
+        f'<h3 class="roster-title">Na zmianie <span id="shifts-count" class="shifts-count">{int(people_count)}</span></h3>'
+        "</div>"
+    )
+
+
+def assemble_schedule_toolbar(
+    controls_html: str,
+    initial_display: str,
+    people_count: int,
+) -> str:
+    """Trzy strefy: okres+widok | DZISIAJ na środku | Raport + Na zmianie."""
+    day_nav = schedule_day_nav_html(initial_display)
+    actions = schedule_roster_actions_html(people_count)
+    marker = "<!--schedule-controls-end-->"
+    controls_open = '<div class="schedule-controls">'
+    if not controls_html.strip():
+        return (
+            f'<div class="schedule-controls">'
+            f'<div class="schedule-controls-side schedule-controls-left"></div>'
+            f'{day_nav}'
+            f'{actions}'
+            f"</div>"
+        )
+    patched = controls_html
+    if controls_open in patched:
+        # Lewa strona: istniejący period-cluster; środek: dzień; prawa: akcje.
+        patched = patched.replace(
+            controls_open,
+            controls_open + '<div class="schedule-controls-side schedule-controls-left">',
+            1,
+        )
+        # Zamknij lewą stronę przed markerem i wstaw środek + prawą.
+        if marker in patched:
+            return patched.replace(
+                marker,
+                f"</div>{day_nav}{actions}{marker}",
+                1,
+            )
+        return patched + f"</div>{day_nav}{actions}"
+    return controls_html + day_nav + actions
+
+
+def render_schedule_grafik_grid(
+    model: dict[str, object],
+    *,
+    title: str,
+    subtitle: str = "",
+    role: str = "manager",
+    day: str = "today",
+    department: str = "animatorzy",
+    months: list[str] | None = None,
+    weeks: list[str] | None = None,
+    week: str = "",
+    view: str = "month",
+    controls_html: str = "",
+    home_href: str = "/",
+    refresh_href: str = "",
+    shift_reports: dict[str, str] | None = None,
+) -> str:
+    """Widok miesiąc/tydzień grafików w shellu głównej aplikacji."""
+    employees = model.get("employees", [])
+    schedule_rows = model.get("schedule_rows", [])
+    shifts_by_date = model.get("shifts_by_date", {})
+    month = str(model.get("month") or "")
+    week = str(week or model.get("week") or "")
+    view = view if view in {"week", "month"} else "month"
+    months = months or []
+    weeks = weeks or []
+
+    empty = f"""
+<div class="grafiki-filters">{controls_html}</div>
+<div class="grafiki-empty">
+  <h2>{escape(title)}</h2>
+  <p class="muted">{escape(subtitle or "Brak danych dla wybranego zakresu.")}</p>
+  <a class="button" href="{escape(home_href)}">Ekran główny</a>
+</div>
+"""
+    if not isinstance(employees, list) or not isinstance(schedule_rows, list) or not schedule_rows:
+        return empty
+
+    employee_list = [emp for emp in employees if isinstance(emp, dict) and emp.get("name")]
+    if not employee_list:
+        return empty
+
+    today_iso = current_app_date().isoformat()
+    initial_date = today_iso
+    if not any(isinstance(row, dict) and row.get("date") == today_iso for row in schedule_rows):
+        first_row = schedule_rows[0] if isinstance(schedule_rows[0], dict) else {}
+        initial_date = str(first_row.get("date") or "")
+
+    def people_for_date(iso: str) -> list[dict[str, str]]:
+        people: list[dict[str, str]] = []
+        row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
+        if not isinstance(row_shifts, dict):
+            return people
+        for name in sorted(row_shifts.keys(), key=lambda value: normalize_search_text(value)):
+            cell = row_shifts.get(name, {})
+            if not isinstance(cell, dict):
+                continue
+            shift = str(cell.get("shift") or "").strip()
+            hours = str(cell.get("hours") or "").strip()
+            if not schedule_shift_is_work(shift):
+                continue
+            people.append({"name": name, "shift": shift, "hours": hours})
+        return people
+
+    initial_people = people_for_date(initial_date)
+    shift_reports = shift_reports or {}
+
+    def roster_html(people: list[dict[str, str]]) -> str:
+        if not people:
+            return '<p class="muted">brak przypisań</p>'
+        items = []
+        for person in people:
+            label = escape(person.get("name") or "")
+            shift = str(person.get("shift") or "").strip()
+            hours = str(person.get("hours") or "").strip()
+            meta = escape(shift)
+            if hours:
+                meta += f" · {escape(hours)}h"
+            items.append(f'<li><span class="roster-name">{label}</span><span class="roster-meta">{meta}</span></li>')
+        return "<ul>" + "".join(items) + "</ul>"
+
+    date_columns = [row for row in schedule_rows if isinstance(row, dict) and row.get("date")]
+
+    date_headers = "".join(
+        (
+            f'<th class="col-date{" today" if day.get("is_today") else ""}{" off-day" if day.get("is_off") else ""}" '
+            f'data-date="{escape(str(day.get("date") or ""))}" title="{escape(str(day.get("date") or ""))}">'
+            f'<span class="date-dd">{escape(str(day.get("dd") or ""))}</span>'
+            f'<span class="date-abbr">{escape(str(day.get("abbr") or ""))}</span></th>'
+        )
+        for day in date_columns
+    )
+
+    body_rows = []
+    hours_by_emp = {str(emp.get("name") or ""): 0.0 for emp in employee_list}
+    hours_grand_total = 0.0
+    people_by_date = {str(day.get("date") or ""): 0 for day in date_columns}
+
+    for emp in employee_list:
+        name = str(emp.get("name") or "")
+        display_name = str(emp.get("display_name") or name)
+        position = str(emp.get("position") or "")
         cells = []
-        for day in days:
-            item = day_values.get(day.isoformat(), {}) if isinstance(day_values, dict) else {}
-            shift = str(item.get("shift") or "").strip() if isinstance(item, dict) else ""
-            hours = str(item.get("hours") or "").strip() if isinstance(item, dict) else ""
+        for day in date_columns:
+            iso = str(day.get("date") or "")
+            row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
+            if not isinstance(row_shifts, dict):
+                row_shifts = {}
+            cell = row_shifts.get(name, {})
+            shift = ""
+            hours = ""
+            if isinstance(cell, dict):
+                shift = str(cell.get("shift") or "").strip()
+                hours = str(cell.get("hours") or "").strip()
             is_work = schedule_shift_is_work(shift)
-            cell_class = "schedule-month-cell is-work" if is_work else "schedule-month-cell is-empty"
-            label = escape(shift) if shift else ""
-            hours_label = f'<span>{escape(hours)}</span>' if hours and is_work else ""
-            cells.append(f'<td><div class="{cell_class}">{label}{hours_label}</div></td>')
-        rows.append(
-            f"""
-            <tr>
-              <th class="schedule-person schedule-person-compact">
-                <strong>{escape(entry.get("name", ""))}</strong>
-                <span>{escape(entry.get("position", ""))}</span>
-              </th>
-              {''.join(cells)}
-              <td class="schedule-total">{escape(format_schedule_total(entry.get("total")))}</td>
-            </tr>
-            """
+            display = escape(shift) if is_work else ""
+            hours_value = cell_hours_value(shift, hours) if is_work else 0.0
+            if is_work and hours_value > 0:
+                hours_by_emp[name] = hours_by_emp.get(name, 0.0) + hours_value
+                hours_grand_total += hours_value
+            if is_work:
+                people_by_date[iso] = people_by_date.get(iso, 0) + 1
+            title_attr = f"{shift} ({format_schedule_total(hours_value)}h)" if is_work and hours_value else shift
+            today_cell = " today" if day.get("is_today") else ""
+            off_cell = " off-day" if day.get("is_off") else ""
+            cell_class = f"col-date slot{today_cell}{off_cell}"
+            if is_work:
+                cell_class += " custom-shift"
+            cells.append(
+                f'<td class="{cell_class}" data-date="{escape(iso)}" data-employee="{escape(name)}" '
+                f'data-value="{escape(shift)}" data-hours="{escape(hours)}" '
+                f'data-hours-value="{hours_value}" title="{escape(title_attr)}">'
+                f"{display}</td>"
+            )
+        body_rows.append(
+            f'<tr data-employee="{escape(name)}">'
+            f'<th class="col-name" scope="row" title="{escape(position)}">'
+            f'<span class="emp-name">{escape(display_name)}</span></th>'
+            f'{"".join(cells)}'
+            f'<td class="col-summary hours-total-cell">{escape(format_schedule_total(hours_by_emp.get(name, 0.0)))}</td>'
+            "</tr>"
         )
+
+    people_total_cells = "".join(
+        f'<td class="col-date{" today" if day.get("is_today") else ""}" data-date="{escape(str(day.get("date") or ""))}">'
+        f'{people_by_date.get(str(day.get("date") or ""), 0)}</td>'
+        for day in date_columns
+    )
+    hours_total_row = (
+        '<tr class="hours-total-row people-total-row">'
+        '<th class="col-name" scope="row">liczba osób na zmianie</th>'
+        f"{people_total_cells}"
+        f'<td class="col-summary">{escape(format_schedule_total(hours_grand_total))}</td>'
+        "</tr>"
+    )
+
+    shifts_json = json.dumps(shifts_by_date, ensure_ascii=False)
+    shift_reports_json = json.dumps(shift_reports, ensure_ascii=False)
+    dates_json = json.dumps(
+        [str(day.get("date")) for day in date_columns if day.get("date")],
+        ensure_ascii=False,
+    )
+    try:
+        initial_display = datetime.fromisoformat(initial_date).strftime("%d.%m.%Y")
+    except ValueError:
+        initial_display = format_date(initial_date)
+
     return f"""
-    <section class="schedule-section schedule-section-compact">
-      <div class="section-head schedule-section-head-compact">
-        <div>
-          <h2>{escape(title)}</h2>
-          <p class="subtitle">{escape(subtitle)} · {len(compact_entries)} osób</p>
-        </div>
-      </div>
-      <div class="schedule-table-wrap schedule-month-wrap" data-fit-schedule>
-        <table class="schedule-table schedule-month-table">
+<div class="grafiki-filters">{assemble_schedule_toolbar(controls_html, initial_display, len(initial_people))}</div>
+
+<div class="grafiki-layout">
+  <div class="grafiki-stack">
+    <section class="grafiki-roster">
+      <div id="shifts-roster" class="shifts-roster">{roster_html(initial_people)}</div>
+    </section>
+
+    <section class="grafiki-table-panel">
+      <div class="table-wrap">
+        <table class="grafiki-table" id="grafik"
+               data-view="{escape(view)}"
+               data-month="{escape(month)}"
+               data-week="{escape(week)}"
+               data-initial-date="{escape(initial_date)}"
+               data-emp-count="{len(employee_list)}"
+               data-days-count="{len(date_columns)}">
           <thead>
             <tr>
-              <th>Osoba</th>
-              {headers}
-              <th>H</th>
+              <th class="col-name">Imię i nazwisko</th>
+              {date_headers}
+              <th class="col-summary">Σ h</th>
             </tr>
           </thead>
-          <tbody>{''.join(rows)}</tbody>
+          <tbody>
+            {''.join(body_rows)}
+          </tbody>
+          <tfoot>
+            {hours_total_row}
+          </tfoot>
         </table>
       </div>
     </section>
-    """
+  </div>
+</div>
+<script>
+  window.grafikShiftsData = {shifts_json};
+  window.grafikMonthDates = {dates_json};
+  window.grafikShiftReports = {shift_reports_json};
+</script>
+"""
 
 
 def render_schedule_controls(
@@ -8869,38 +9905,1073 @@ def render_schedule_controls(
     selected_view: str,
     months: list[str],
     weeks: list[str],
+    home_href: str = "/",
+    entries: list[dict[str, object]] | None = None,
 ) -> str:
-    department_items = [
-        ("all", "Wszystkie"),
-        ("animatorzy", "Animatorzy"),
-        ("managerowie", "Managerowie"),
-        ("kuchnia", "Kuchnia"),
-        ("serwis", "Serwis"),
-    ]
-    department_links = "".join(
-        f'<a class="schedule-control{" is-active" if key == selected_department else ""}" href="{escape(schedule_url(role=role, day=day, department=key, month=selected_month, week=selected_week, view=selected_view))}">{escape(label)}</a>'
-        for key, label in department_items
+    day = normalize_day(day)
+    home_url = home_href or hub_home_href(day, "grafiki")
+    department_tabs = render_grafiki_department_tabs(
+        role=role,
+        day=day,
+        selected_department=selected_department,
+        selected_month=selected_month,
+        selected_week=selected_week,
+        selected_view=selected_view,
+        home_href=home_url,
     )
-    month_links = "".join(
-        f'<a class="schedule-control{" is-active" if month == selected_month else ""}" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=month, week="", view=selected_view))}">{escape(schedule_month_label(month))}</a>'
-        for month in months
-    )
-    week_links = "".join(
-        f'<a class="schedule-control{" is-active" if week == selected_week else ""}" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=week, view="week"))}">{escape(schedule_week_label(week))}</a>'
-        for week in weeks
-    )
+
+    chevron_left = SCHEDULE_CHEVRON_LEFT
+    chevron_right = SCHEDULE_CHEVRON_RIGHT
+
+    def nav_in_list(current: str, items: list[str], delta: int) -> str:
+        if not current or not items or current not in items:
+            return ""
+        index = items.index(current) + delta
+        if index < 0 or index >= len(items):
+            return ""
+        return items[index]
+
+    def nav_arrow(*, direction: str, href: str, aria_label: str) -> str:
+        icon = chevron_left if direction == "prev" else chevron_right
+        if href:
+            return (
+                f'<a class="schedule-period-arrow schedule-control" href="{escape(href)}" '
+                f'aria-label="{escape(aria_label)}">{icon}</a>'
+            )
+        return (
+            f'<span class="schedule-period-arrow is-disabled" aria-disabled="true" '
+            f'aria-label="{escape(aria_label)}">{icon}</span>'
+        )
+
+    if selected_view == "week":
+        period_label = schedule_week_label(selected_week) if selected_week else "Tydzień"
+        prev_week = nav_in_list(selected_week, weeks, -1)
+        next_week = nav_in_list(selected_week, weeks, 1)
+        prev_month = selected_month
+        next_month = selected_month
+        if not prev_week and entries is not None:
+            adj_month = nav_in_list(selected_month, months, -1)
+            if adj_month:
+                adj_weeks = schedule_available_weeks(entries, adj_month, selected_department)
+                if adj_weeks:
+                    prev_week = adj_weeks[-1]
+                    prev_month = adj_month
+        if not next_week and entries is not None:
+            adj_month = nav_in_list(selected_month, months, 1)
+            if adj_month:
+                adj_weeks = schedule_available_weeks(entries, adj_month, selected_department)
+                if adj_weeks:
+                    next_week = adj_weeks[0]
+                    next_month = adj_month
+        prev_href = (
+            schedule_url(
+                role=role,
+                day=day,
+                department=selected_department,
+                month=prev_month,
+                week=prev_week,
+                view="week",
+            )
+            if prev_week
+            else ""
+        )
+        next_href = (
+            schedule_url(
+                role=role,
+                day=day,
+                department=selected_department,
+                month=next_month,
+                week=next_week,
+                view="week",
+            )
+            if next_week
+            else ""
+        )
+        prev_aria = "Poprzedni tydzień"
+        next_aria = "Następny tydzień"
+    else:
+        period_label = schedule_month_label(selected_month) if selected_month else "Miesiąc"
+        prev_month = nav_in_list(selected_month, months, -1)
+        next_month = nav_in_list(selected_month, months, 1)
+        prev_href = (
+            schedule_url(
+                role=role,
+                day=day,
+                department=selected_department,
+                month=prev_month,
+                week="",
+                view="month",
+            )
+            if prev_month
+            else ""
+        )
+        next_href = (
+            schedule_url(
+                role=role,
+                day=day,
+                department=selected_department,
+                month=next_month,
+                week="",
+                view="month",
+            )
+            if next_month
+            else ""
+        )
+        prev_aria = "Poprzedni miesiąc"
+        next_aria = "Następny miesiąc"
+
     view_links = "".join(
-        f'<a class="schedule-control{" is-active" if view == selected_view else ""}" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=selected_week, view=view))}">{label}</a>'
+        f'<a class="schedule-control{" is-active" if view == selected_view else ""}" '
+        f'href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=selected_week, view=view))}">{label}</a>'
         for view, label in (("week", "Tydzień"), ("month", "Miesiąc"))
     )
+
     return f"""
+    {department_tabs}
     <div class="schedule-controls">
-      <div class="schedule-control-group"><span>Dział</span><div>{department_links}</div></div>
-      <div class="schedule-control-group"><span>Miesiąc</span><div>{month_links}</div></div>
-      <div class="schedule-control-group"><span>Widok</span><div>{view_links}</div></div>
-      <div class="schedule-control-group"><span>Tydzień</span><div>{week_links or '<span class="muted">Brak tygodni</span>'}</div></div>
+      <div class="schedule-period-cluster">
+        <div class="schedule-period-nav" aria-label="Nawigacja okresu">
+          {nav_arrow(direction="prev", href=prev_href, aria_label=prev_aria)}
+          <span class="schedule-period-label">{escape(period_label)}</span>
+          {nav_arrow(direction="next", href=next_href, aria_label=next_aria)}
+        </div>
+        <div class="schedule-view-toggle" role="group" aria-label="Widok">
+          {view_links}
+        </div>
+      </div>
+      <!--schedule-controls-end-->
     </div>
     """
+
+
+def grafik4600_assets() -> str:
+    """Style ekranu grafików w języku wizualnym głównej aplikacji."""
+    return r"""
+<style>
+  .grafiki-filters {
+    margin-bottom: 10px;
+    display: grid;
+    gap: 12px;
+  }
+
+  .grafiki-filters .schedule-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: center;
+    gap: 10px 12px;
+    width: 100%;
+  }
+
+  .grafiki-filters .schedule-controls-left {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px 12px;
+    min-width: 0;
+    justify-self: start;
+  }
+
+  .grafiki-filters .schedule-day-nav {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    justify-self: center;
+    grid-column: 2;
+  }
+
+  .grafiki-filters .schedule-roster-actions {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    justify-self: end;
+    grid-column: 3;
+    min-width: 0;
+  }
+
+  .grafiki-filters .schedule-period-cluster {
+    display: inline-flex;
+    align-items: stretch;
+    flex-wrap: nowrap;
+    gap: 0;
+    min-width: 0;
+    border: 1px solid var(--line);
+    background: var(--surface-strong);
+    overflow: hidden;
+  }
+
+  .grafiki-filters .schedule-period-nav {
+    display: inline-flex;
+    align-items: stretch;
+    gap: 0;
+    min-width: 0;
+    border-right: 1px solid var(--line);
+  }
+
+  .grafiki-filters .schedule-period-label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 7.5rem;
+    padding: 0 12px;
+    text-align: center;
+    font-size: 0.88rem;
+    font-weight: 900;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+  }
+
+  .grafiki-filters .schedule-period-arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 10px;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--ink);
+    text-decoration: none;
+    flex: 0 0 auto;
+    line-height: 0;
+    font-size: 0;
+    font-weight: 800;
+    cursor: pointer;
+    appearance: none;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .grafiki-filters .schedule-period-arrow svg {
+    width: 16px;
+    height: 16px;
+    display: block;
+  }
+
+  .grafiki-filters a.schedule-period-arrow:hover {
+    background: #eeeeee;
+  }
+
+  .grafiki-filters .schedule-period-arrow.is-disabled {
+    opacity: 0.32;
+    pointer-events: none;
+    cursor: default;
+  }
+
+  .grafiki-filters .schedule-nav-arrow,
+  .grafiki-filters button.schedule-nav-arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    max-width: 36px;
+    max-height: 36px;
+    border: 0;
+    border-radius: 50%;
+    background: #000;
+    color: #fff;
+    text-decoration: none;
+    flex: 0 0 36px;
+    padding: 0;
+    margin: 0;
+    line-height: 0;
+    font-size: 0;
+    font-weight: 400;
+    cursor: pointer;
+    appearance: none;
+    overflow: hidden;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 0.15s ease, opacity 0.15s ease;
+  }
+
+  .grafiki-filters .schedule-nav-arrow svg {
+    width: 18px;
+    height: 18px;
+    display: block;
+    flex: 0 0 auto;
+  }
+
+  .grafiki-filters a.schedule-nav-arrow:hover,
+  .grafiki-filters button.schedule-nav-arrow:hover:not(:disabled):not(.is-disabled) {
+    background: #000;
+    color: #fff;
+    transform: scale(1.06);
+  }
+
+  .grafiki-filters .schedule-nav-arrow.is-disabled,
+  .grafiki-filters .schedule-nav-arrow:disabled,
+  .grafiki-filters button.schedule-nav-arrow:disabled {
+    opacity: 0.28;
+    pointer-events: none;
+    cursor: default;
+    background: #000;
+    color: #fff;
+    transform: none;
+  }
+
+  .grafiki-filters .schedule-view-toggle {
+    display: inline-flex;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 0;
+  }
+
+  .grafiki-filters .schedule-view-toggle .schedule-control {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 34px;
+    padding: 0 14px;
+    border: 0;
+    border-left: 1px solid var(--line);
+    border-radius: 0;
+    background: transparent;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 0.82rem;
+    font-weight: 800;
+  }
+
+  .grafiki-filters .schedule-view-toggle .schedule-control:first-child {
+    border-left: 0;
+  }
+
+  .grafiki-filters .schedule-view-toggle .schedule-control:hover {
+    background: #eeeeee;
+  }
+
+  .grafiki-filters .schedule-view-toggle .schedule-control.is-active {
+    background: var(--brand);
+    border-color: var(--brand);
+    color: #fff;
+  }
+
+  .grafiki-layout {
+    display: grid;
+    gap: 12px;
+    width: 100%;
+  }
+
+  .grafiki-stack {
+    display: grid;
+    gap: 12px;
+    width: 100%;
+  }
+
+  .page-schedules .grafiki-roster {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    overflow: visible;
+    width: 100%;
+  }
+
+  .page-schedules .grafiki-table-panel {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    overflow: visible;
+    width: 100vw;
+    max-width: 100vw;
+    margin-left: calc(50% - 50vw);
+    margin-right: calc(50% - 50vw);
+  }
+
+  .roster-head {
+    display: none;
+  }
+
+  .shift-date-info {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    line-height: 1.15;
+    width: 5.8rem;
+    min-width: 5.8rem;
+    text-align: center;
+  }
+
+  .shift-date-info strong {
+    display: block;
+    width: 100%;
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    text-align: center;
+  }
+
+  .shift-date-info span {
+    display: block;
+    width: 100%;
+    font-size: 0.82rem;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  .roster-title {
+    margin: 0;
+    font-size: 0.92rem;
+    font-weight: 900;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .shifts-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.8rem;
+    height: 1.6rem;
+    padding: 0 8px;
+    background: var(--orange);
+    color: #fff;
+    font-size: 0.82rem;
+    font-weight: 900;
+  }
+
+  .shifts-roster {
+    margin-top: 4px;
+  }
+
+  .shifts-roster ul {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 6px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .shifts-roster li {
+    display: inline-flex;
+    align-items: baseline;
+    justify-content: flex-start;
+    gap: 6px;
+    width: max-content;
+    max-width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--line);
+    background: var(--soft);
+    font-size: 0.82rem;
+  }
+
+  .shifts-roster .roster-name {
+    font-weight: 800;
+    white-space: nowrap;
+  }
+
+  .shifts-roster .roster-meta {
+    color: var(--muted);
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+
+  .shift-report-panel {
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+
+  .shift-report-copy {
+    appearance: none;
+    border: 1px solid var(--line);
+    background: var(--surface-strong);
+    color: var(--ink);
+    font: inherit;
+    font-weight: 800;
+    font-size: 0.82rem;
+    min-height: 36px;
+    padding: 0 10px 0 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+  }
+
+  .shift-report-copy:hover {
+    background: #eeeeee;
+  }
+
+  .shift-report-copy:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+  }
+
+  .shift-report-copy.is-copied {
+    background: color-mix(in srgb, var(--ok) 14%, white);
+    border-color: var(--ok);
+    color: #3f6212;
+  }
+
+  .shift-report-copy.is-copied .shift-report-copy__icon {
+    border-left-color: var(--ok);
+    color: #3f6212;
+  }
+
+  .shift-report-copy__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-left: 1px solid var(--line);
+    padding-left: 10px;
+    margin-left: 2px;
+    color: var(--brand);
+  }
+
+  .shift-report-copy__icon svg {
+    width: 16px;
+    height: 16px;
+    display: block;
+  }
+
+  .grafiki-table-panel {
+    padding: 0;
+  }
+
+  .grafiki-table-panel .table-wrap {
+    width: 100%;
+    overflow: auto;
+  }
+
+  .grafiki-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+    background: #fff;
+  }
+
+  .grafiki-table th,
+  .grafiki-table td {
+    border: 1px solid var(--line);
+    padding: 6px 4px;
+    text-align: center;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+
+  .grafiki-table thead th {
+    background: var(--soft);
+    font-weight: 900;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+
+  .grafiki-table .col-name {
+    text-align: left;
+    min-width: 148px;
+    max-width: 220px;
+    padding: 8px 10px;
+    font-weight: 800;
+    background: #fafafa;
+    position: sticky;
+    left: 0;
+    z-index: 3;
+  }
+
+  .grafiki-table thead .col-name {
+    z-index: 4;
+  }
+
+  .grafiki-table .col-name .emp-name {
+    display: block;
+    white-space: normal;
+    line-height: 1.2;
+  }
+
+  .grafiki-table thead .col-date {
+    min-width: 44px;
+    cursor: pointer;
+  }
+
+  .grafiki-table thead .col-date .date-dd {
+    display: block;
+    font-size: 0.86rem;
+    font-weight: 900;
+    line-height: 1.1;
+  }
+
+  .grafiki-table thead .col-date .date-abbr {
+    display: block;
+    font-size: 0.62rem;
+    font-weight: 700;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+
+  .grafiki-table .col-summary {
+    min-width: 48px;
+    font-weight: 800;
+    background: #fafafa;
+  }
+
+  .grafiki-table td.slot {
+    min-width: 52px;
+    font-weight: 700;
+    color: var(--ink);
+    cursor: pointer;
+  }
+
+  .grafiki-table td.slot.custom-shift {
+    background: color-mix(in srgb, var(--brand) 10%, white);
+    color: var(--brand-dark);
+  }
+
+  .grafiki-table .today {
+    box-shadow: inset 0 0 0 2px var(--brand);
+  }
+
+  .grafiki-table .off-day {
+    background: #f6f6f6;
+  }
+
+  .grafiki-table td.slot.off-day.custom-shift {
+    background: color-mix(in srgb, var(--brand) 8%, #f6f6f6);
+  }
+
+  .grafiki-table .is-selected-day {
+    outline: 2px solid var(--orange);
+    outline-offset: -2px;
+  }
+
+  .grafiki-table tfoot tr.hours-total-row th,
+  .grafiki-table tfoot tr.hours-total-row td {
+    background: var(--soft);
+    font-weight: 900;
+    border-top: 2px solid var(--brand);
+  }
+
+  .grafiki-table tfoot .people-total-row .col-name {
+    white-space: normal;
+    line-height: 1.15;
+    font-size: 0.72rem;
+    max-width: 220px;
+  }
+
+  .grafiki-table tfoot .hours-total-cell,
+  .grafiki-table tfoot .col-summary {
+    color: var(--brand-dark);
+  }
+
+  #grafik[data-view="week"] tbody td.slot {
+    height: clamp(42px, 7vh, 68px);
+  }
+
+  .grafiki-empty {
+    display: grid;
+    place-content: center;
+    gap: 12px;
+    min-height: 40vh;
+    text-align: center;
+    padding: 40px 16px;
+  }
+
+  .grafiki-empty h2 {
+    margin: 0;
+    font-size: 1.35rem;
+  }
+
+  main.is-grafiki-loading .grafiki-filters,
+  main.is-grafiki-loading .grafiki-layout,
+  main.is-grafiki-loading .grafiki-empty {
+    opacity: 0.55;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+  }
+
+  @media (max-width: 900px) {
+    .grafiki-filters .schedule-controls {
+      justify-content: center;
+    }
+  }
+
+  @media (max-width: 860px) {
+    .grafiki-filters .schedule-controls {
+      grid-template-columns: 1fr;
+      justify-items: stretch;
+    }
+
+    .grafiki-filters .schedule-controls-left,
+    .grafiki-filters .schedule-day-nav,
+    .grafiki-filters .schedule-roster-actions {
+      grid-column: 1;
+      justify-self: stretch;
+      width: 100%;
+    }
+
+    .grafiki-filters .schedule-controls-left {
+      justify-content: space-between;
+    }
+
+    .grafiki-filters .schedule-day-nav {
+      justify-content: center;
+      order: -1;
+    }
+
+    .grafiki-filters .schedule-roster-actions {
+      justify-content: space-between;
+    }
+
+    .grafiki-filters .schedule-period-cluster {
+      width: 100%;
+      justify-content: space-between;
+    }
+
+    .grafiki-filters .schedule-period-label {
+      min-width: 0;
+      flex: 1;
+      font-size: 0.86rem;
+    }
+
+    .shift-date-info {
+      width: 5.2rem;
+      min-width: 5.2rem;
+    }
+
+    .shift-date-info strong {
+      font-size: 0.66rem;
+    }
+
+    .shift-date-info span {
+      font-size: 0.74rem;
+    }
+
+    .grafiki-table .col-name {
+      min-width: 112px;
+      max-width: 140px;
+      font-size: 0.72rem;
+    }
+
+    .grafiki-table thead .col-date {
+      min-width: 36px;
+    }
+  }
+</style>
+"""
+
+
+def grafik4600_script() -> str:
+    """Skrypt panelu dnia + miękka nawigacja filtrów grafiku (bez pełnego reloadu)."""
+    return r"""
+<script>
+(() => {
+  const emptyHtml = '<p class="muted">brak przypisań</p>';
+
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function formatDayLabel(iso) {
+    const today = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const todayIso = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`;
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
+    const tomorrowIso = `${tomorrow.getFullYear()}-${pad(tomorrow.getMonth() + 1)}-${pad(tomorrow.getDate())}`;
+    const yesterdayIso = `${yesterday.getFullYear()}-${pad(yesterday.getMonth() + 1)}-${pad(yesterday.getDate())}`;
+    if (iso === todayIso) return "DZISIAJ";
+    if (iso === tomorrowIso) return "JUTRO";
+    if (iso === yesterdayIso) return "WCZORAJ";
+    const d = new Date(iso + "T12:00:00");
+    const names = ["Niedziela", "Poniedziałek", "Wtorek", "Środa", "Czwartek", "Piątek", "Sobota"];
+    return names[d.getDay()] || iso;
+  }
+
+  function formatDayDisplay(iso) {
+    const d = new Date(iso + "T12:00:00");
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+  }
+
+  function rosterHtml(people) {
+    if (!people.length) return emptyHtml;
+    return `<ul>${people.map((person) => {
+      const meta = person.hours ? `${escapeHtml(person.shift)} · ${escapeHtml(person.hours)}h` : escapeHtml(person.shift);
+      return `<li><span class="roster-name">${escapeHtml(person.name)}</span><span class="roster-meta">${meta}</span></li>`;
+    }).join("")}</ul>`;
+  }
+
+  function applyGrafikDataScripts(root) {
+    if (!root) return;
+    root.querySelectorAll("script").forEach((script) => {
+      const code = script.textContent || "";
+      if (!code.includes("grafikShiftsData") && !code.includes("grafikMonthDates") && !code.includes("grafikShiftReports")) {
+        return;
+      }
+      try {
+        new Function(code)();
+      } catch (_err) {
+        // ignore malformed payload
+      }
+    });
+  }
+
+  function replaceNode(current, next) {
+    if (!next) {
+      current?.remove();
+      return null;
+    }
+    const imported = document.importNode(next, true);
+    if (current) {
+      current.replaceWith(imported);
+    } else {
+      const main = document.querySelector("main");
+      const filters = document.querySelector(".grafiki-filters");
+      if (filters) filters.after(imported);
+      else main?.appendChild(imported);
+    }
+    return imported;
+  }
+
+  function initPanel() {
+    const shiftsByDate = window.grafikShiftsData || {};
+    const shiftReports = window.grafikShiftReports || {};
+    const dates = Array.isArray(window.grafikMonthDates) ? window.grafikMonthDates.slice() : [];
+    const table = document.getElementById("grafik");
+    if (!table || !dates.length) return;
+
+    let current = table.getAttribute("data-initial-date") || dates[0];
+    if (!dates.includes(current)) current = dates[0];
+    let currentReport = shiftReports[current] || "";
+    let copyFeedbackTimer = 0;
+
+    const copyButton = document.getElementById("shift-report-copy");
+
+    function showCopyFeedback() {
+      if (!copyButton) return;
+      copyButton.classList.add("is-copied");
+      window.clearTimeout(copyFeedbackTimer);
+      copyFeedbackTimer = window.setTimeout(() => {
+        copyButton.classList.remove("is-copied");
+      }, 1600);
+    }
+
+    async function copyCurrentReport() {
+      if (!currentReport) return;
+      try {
+        await navigator.clipboard.writeText(currentReport);
+        showCopyFeedback();
+        return;
+      } catch (_err) {
+        const helper = document.createElement("textarea");
+        helper.value = currentReport;
+        helper.setAttribute("readonly", "");
+        helper.style.position = "fixed";
+        helper.style.left = "-9999px";
+        document.body.appendChild(helper);
+        helper.select();
+        try {
+          document.execCommand("copy");
+          showCopyFeedback();
+        } finally {
+          helper.remove();
+        }
+      }
+    }
+
+    function syncDayNavButtons() {
+      const index = dates.indexOf(current);
+      const prev = document.getElementById("shift-prev-day");
+      const next = document.getElementById("shift-next-day");
+      const atStart = index <= 0;
+      const atEnd = index < 0 || index >= dates.length - 1;
+      if (prev) {
+        prev.classList.toggle("is-disabled", atStart);
+        prev.toggleAttribute("disabled", atStart);
+        prev.setAttribute("aria-disabled", atStart ? "true" : "false");
+      }
+      if (next) {
+        next.classList.toggle("is-disabled", atEnd);
+        next.toggleAttribute("disabled", atEnd);
+        next.setAttribute("aria-disabled", atEnd ? "true" : "false");
+      }
+    }
+
+    function updateDayPanel(iso) {
+      current = iso;
+      currentReport = shiftReports[iso] || "";
+      const rowShifts = shiftsByDate[iso] || {};
+      const people = [];
+      Object.keys(rowShifts)
+        .sort((a, b) => a.localeCompare(b, "pl"))
+        .forEach((name) => {
+          const cell = rowShifts[name] || {};
+          const shift = String(cell.shift || "").trim();
+          if (!shift || /^(?:-|\.|x|w|wolne|u|urlop|\?)$/i.test(shift)) return;
+          people.push({
+            name,
+            shift,
+            hours: String(cell.hours || "").trim(),
+          });
+        });
+
+      const label = document.getElementById("shift-date-label");
+      const display = document.getElementById("shift-date-display");
+      const count = document.getElementById("shifts-count");
+      const roster = document.getElementById("shifts-roster");
+      if (label) label.textContent = formatDayLabel(iso);
+      if (display) display.textContent = formatDayDisplay(iso);
+      if (count) count.textContent = String(people.length);
+      if (roster) roster.innerHTML = rosterHtml(people);
+
+      table.querySelectorAll("[data-date]").forEach((node) => {
+        node.classList.toggle("is-selected-day", node.getAttribute("data-date") === iso);
+      });
+      syncDayNavButtons();
+    }
+
+    function move(delta) {
+      const index = dates.indexOf(current);
+      if (index < 0) return;
+      const next = dates[index + delta];
+      if (!next) return;
+      updateDayPanel(next);
+    }
+
+    document.getElementById("shift-prev-day")?.addEventListener("click", () => move(-1));
+    document.getElementById("shift-next-day")?.addEventListener("click", () => move(1));
+    copyButton?.addEventListener("click", () => {
+      copyCurrentReport();
+    });
+    table.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-date]");
+      if (!target || !table.contains(target)) return;
+      const iso = target.getAttribute("data-date");
+      if (iso) updateDayPanel(iso);
+    });
+    updateDayPanel(current);
+  }
+
+  window.__ikidsGrafikiInitPanel = initPanel;
+
+  if (!window.__ikidsGrafikiSoftNav) {
+    window.__ikidsGrafikiSoftNav = true;
+    let navigating = false;
+
+    async function softNavigate(href, { historyMode = "push" } = {}) {
+      if (navigating) return;
+      const url = new URL(href, window.location.href);
+      if (url.origin !== window.location.origin || url.pathname !== "/grafiki") {
+        window.location.assign(url.href);
+        return;
+      }
+      if (url.href === window.location.href && historyMode === "push") return;
+
+      navigating = true;
+      const main = document.querySelector("main");
+      main?.classList.add("is-grafiki-loading");
+      try {
+        const response = await fetch(url.href, {
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "X-IKids-Navigation": "1" },
+        });
+        if (!response.ok) throw new Error("Bad response");
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const nextMain = doc.querySelector("main");
+        if (!nextMain) throw new Error("Missing main");
+
+        const nextFilters = nextMain.querySelector(".grafiki-filters");
+        const nextLayout = nextMain.querySelector(".grafiki-layout");
+        const nextEmpty = nextMain.querySelector(".grafiki-empty");
+        const currentFilters = document.querySelector(".grafiki-filters");
+        const currentLayout = document.querySelector(".grafiki-layout");
+        const currentEmpty = document.querySelector(".grafiki-empty");
+
+        if (nextFilters) {
+          if (currentFilters) currentFilters.replaceWith(document.importNode(nextFilters, true));
+          else main?.prepend(document.importNode(nextFilters, true));
+        }
+
+        if (nextLayout) {
+          replaceNode(currentLayout || currentEmpty, nextLayout);
+          currentEmpty?.remove();
+        } else if (nextEmpty) {
+          replaceNode(currentEmpty || currentLayout, nextEmpty);
+          currentLayout?.remove();
+        }
+
+        applyGrafikDataScripts(nextMain);
+        if (historyMode === "push") {
+          window.history.pushState({ ikidsGrafiki: true }, "", url.href);
+        } else if (historyMode === "replace") {
+          window.history.replaceState({ ikidsGrafiki: true }, "", url.href);
+        }
+        initPanel();
+        const tablePanel = document.querySelector(".grafiki-table-panel");
+        tablePanel?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      } catch (_err) {
+        window.location.assign(url.href);
+      } finally {
+        navigating = false;
+        main?.classList.remove("is-grafiki-loading");
+      }
+    }
+
+    window.__ikidsGrafikiSoftNavigate = softNavigate;
+
+    document.addEventListener("click", (event) => {
+      if (!document.body.classList.contains("page-schedules")) return;
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+        return;
+      }
+      const link = event.target.closest("a.schedule-control");
+      if (!link || link.classList.contains("is-disabled") || link.getAttribute("aria-disabled") === "true") {
+        return;
+      }
+      let url;
+      try {
+        url = new URL(link.href, window.location.href);
+      } catch (_err) {
+        return;
+      }
+      if (url.origin !== window.location.origin || url.pathname !== "/grafiki") return;
+      event.preventDefault();
+      softNavigate(url.href, { historyMode: "push" });
+    });
+
+    window.addEventListener("popstate", () => {
+      if (!document.body.classList.contains("page-schedules")) return;
+      if (window.location.pathname !== "/grafiki") return;
+      softNavigate(window.location.href, { historyMode: "none" });
+    });
+  }
+
+  initPanel();
+})();
+</script>
+"""
+
 
 
 def render_schedules_page(
@@ -8917,7 +10988,7 @@ def render_schedules_page(
     current_month = schedule_month_key(current_app_date())
     selected_month = requested_month if requested_month in months else (current_month if current_month in months else (months[0] if months else ""))
     requested_department = query.get("department", ["animatorzy"])[0]
-    department_keys = {"all", *(key for key, _ in SCHEDULE_DEPARTMENTS)}
+    department_keys = {key for key, _ in SCHEDULE_DEPARTMENTS}
     selected_department = requested_department if requested_department in department_keys else "animatorzy"
     selected_view = query.get("view", ["week"])[0]
     if selected_view not in {"week", "month"}:
@@ -8926,15 +10997,12 @@ def render_schedules_page(
     requested_week = query.get("week", [""])[0]
     selected_week = requested_week if requested_week in weeks else schedule_default_week(weeks, selected_month)
 
-    loaded_at = schedule.get("loaded_at") or "brak"
     error = str(schedule.get("error") or "")
-    sheet_titles = schedule.get("sheet_titles", [])
-    sheet_label = ", ".join(str(title) for title in sheet_titles) if isinstance(sheet_titles, list) and sheet_titles else "nie odczytano zakładek"
-    status_markup = (
-        f'<div class="message success">Połączono z arkuszem. Ostatni odczyt: {escape(loaded_at)}. Zakładki: {escape(sheet_label)}.</div>'
-        if schedule.get("ok")
-        else f'<div class="message error">Nie udało się pobrać grafików: {escape(error)}</div>'
-    )
+    status_markup = ""
+    if not schedule.get("ok"):
+        status_markup = f'<div class="alert error">Nie udało się pobrać grafików: {escape(error)}</div>'
+    day = normalize_day(day)
+    home_href = hub_home_href(day, "grafiki")
     controls = render_schedule_controls(
         role=role,
         day=day,
@@ -8944,158 +11012,69 @@ def render_schedules_page(
         selected_view=selected_view,
         months=months,
         weeks=weeks,
+        home_href=home_href,
+        entries=entries_list,
     )
-    selected_department_label = dict([("all", "Wszystkie działy"), *SCHEDULE_DEPARTMENTS]).get(selected_department, selected_department)
-    if selected_view == "month":
-        sections = render_schedule_month_matrix(
-            schedule_filtered_entries(
-                entries_list,
-                department=selected_department,
-                month=selected_month,
-            ),
-            selected_month,
-            schedule_month_label(selected_month),
-            selected_department_label,
+    selected_department_label = dict(SCHEDULE_DEPARTMENTS).get(selected_department, selected_department)
+    refresh_href = schedule_url(
+        role=role,
+        day=day,
+        department=selected_department,
+        month=selected_month,
+        week=selected_week,
+        view=selected_view,
+    )
+
+    if selected_view == "week":
+        week_entries = schedule_filtered_entries(
+            entries_list,
+            department=selected_department,
+            month=selected_month,
+            week=selected_week,
         )
+        model = build_grafik_week_model(week_entries, selected_week, month=selected_month)
+        title = schedule_week_label(selected_week) if selected_week else "Tydzień"
     else:
-        sections = render_schedule_table(
-            schedule_filtered_entries(
-                entries_list,
-                department=selected_department,
-                month=selected_month,
-                week=selected_week,
-            ),
-            schedule_week_label(selected_week) if selected_week else "Tydzień",
-            f"{selected_department_label} · {schedule_month_label(selected_month)}",
+        month_entries = schedule_filtered_entries(
+            entries_list,
+            department=selected_department,
+            month=selected_month,
         )
-    content = f"""
-<div class="stack schedules-layout">
-  <section class="schedule-hero">
-    <div class="section-head">
-      <div>
-        <h2>Grafiki pracowników</h2>
-        <p class="subtitle">Live z Google Sheets · szybki wybór działu, miesiąca i tygodnia.</p>
-      </div>
-      <div class="schedule-actions">
-        <a class="button secondary" href="/?role=home&day={escape(day)}">Ekran główny</a>
-        <a class="button secondary" href="{escape(schedule_url(role=role, day=day, department=selected_department, month=selected_month, week=selected_week, view=selected_view))}">Odśwież</a>
-      </div>
-    </div>
-    {status_markup}
-    {controls}
-  </section>
-  {sections}
-</div>
-<style>
-  .schedules-layout {{ gap: 18px; }}
-  body.page-schedules > header {{ display: none; }}
-  body.page-schedules main {{ padding-top: 8px; }}
-  .schedules-layout {{ gap: 8px; }}
-  .schedule-hero, .schedule-section {{ padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
-  .schedule-hero .section-head {{ margin-bottom: 6px; }}
-  .schedule-hero h2 {{ font-size: 1.05rem; }}
-  .schedule-hero .subtitle {{ font-size: 0.78rem; }}
-  .schedule-hero .message.success {{ display: none; }}
-  .schedule-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }}
-  .schedule-section-compact {{ padding: 10px; }}
-  .schedule-section-head-compact {{ margin-bottom: 8px; }}
-  .schedule-controls {{ display: grid; grid-template-columns: 1.15fr 0.75fr 0.65fr 1.45fr; gap: 6px; margin-top: 6px; }}
-  .schedule-control-group {{ display: grid; gap: 3px; min-width: 0; }}
-  .schedule-control-group > span {{ color: var(--muted); font-size: 0.62rem; font-weight: 800; text-transform: uppercase; }}
-  .schedule-control-group > div {{ display: flex; flex-wrap: wrap; gap: 3px; }}
-  .schedule-control {{ display: inline-flex; align-items: center; min-height: 23px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); text-decoration: none; background: #f8fafc; font-size: 0.72rem; font-weight: 700; }}
-  .schedule-control.is-active {{ background: #139bd7; border-color: #139bd7; color: #fff; }}
-  .schedule-table-wrap {{ overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }}
-  .schedule-table {{ width: 100%; border-collapse: collapse; min-width: 920px; background: #fff; table-layout: fixed; }}
-  .schedule-table th, .schedule-table td {{ border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); padding: 1px 3px; vertical-align: middle; }}
-  .schedule-table thead th {{ background: #256fd4; color: #fff; text-align: center; font-size: 0.62rem; line-height: 1; }}
-  .schedule-table thead th span {{ font-weight: 600; opacity: 0.9; }}
-  .schedule-person {{ width: 132px; text-align: left; background: #f8fafc; font-size: 0.64rem; line-height: 1; }}
-  .schedule-person span {{ display: block; color: var(--muted); font-size: 0.56rem; font-weight: 500; margin-top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .schedule-person strong {{ display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .schedule-shift {{ display: grid; gap: 0; min-height: 18px; align-content: center; text-align: center; color: #0f172a; font-size: 0.62rem; line-height: 1; }}
-  .schedule-shift.is-empty {{ color: #94a3b8; }}
-  .schedule-hours {{ font-size: 0.5rem; color: #2f6f26; font-weight: 700; }}
-  .schedule-total {{ width: 34px; background: #e8bfd3; text-align: center; font-size: 0.62rem; font-weight: 800; }}
-  .schedule-month-wrap {{ overflow-x: auto; }}
-  .schedule-month-table {{ min-width: 1220px; table-layout: fixed; }}
-  .schedule-month-table th, .schedule-month-table td {{ padding: 1px 2px; }}
-  .schedule-month-table .schedule-person {{ width: 112px; }}
-  .schedule-month-day {{ width: 25px; }}
-  .schedule-month-day strong, .schedule-month-day span {{ display: block; }}
-  .schedule-month-cell {{ min-height: 13px; display: grid; align-content: center; text-align: center; font-size: 0.46rem; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .schedule-month-cell.is-work {{ color: #0f172a; background: #dbeafe; border-radius: 3px; font-weight: 800; }}
-  .schedule-month-cell.is-empty {{ color: transparent; }}
-  .schedule-month-cell span {{ display: none; }}
-  .schedule-table-wrap[data-fit-schedule] {{
-    overflow: hidden;
-    position: relative;
-  }}
-  .schedule-table-wrap[data-fit-schedule] .schedule-table {{
-    transform-origin: top left;
-  }}
-  .schedule-fit-note {{
-    position: absolute;
-    right: 6px;
-    top: 6px;
-    z-index: 2;
-    padding: 2px 5px;
-    border-radius: 5px;
-    background: rgba(15, 23, 42, 0.72);
-    color: #fff;
-    font-size: 0.62rem;
-    pointer-events: none;
-  }}
-  .message.success {{ border-color: #bbf7d0; background: #f0fdf4; color: #166534; }}
-  .message.error {{ border-color: #fecaca; background: #fef2f2; color: #991b1b; }}
-  @media (min-width: 1350px) {{
-    .schedule-month-table {{ min-width: 100%; }}
-  }}
-  @media (max-width: 700px) {{
-    .schedule-hero, .schedule-section {{ padding: 12px; }}
-    .schedule-controls {{ grid-template-columns: 1fr; }}
-    .schedule-table {{ min-width: 860px; }}
-    .schedule-control {{ min-height: 34px; padding: 0 10px; font-size: 0.88rem; }}
-  }}
-</style>
-<script>
-(() => {{
-  function fitScheduleTables() {{
-    document.querySelectorAll("[data-fit-schedule]").forEach((wrap) => {{
-      const table = wrap.querySelector(".schedule-table");
-      if (!table) return;
-      table.style.transform = "";
-      table.style.width = "";
-      wrap.style.height = "";
-      wrap.style.overflow = "hidden";
-      wrap.querySelector(".schedule-fit-note")?.remove();
+        model = build_grafik_month_model(month_entries, selected_month)
+        title = schedule_month_label(selected_month)
 
-      const rect = wrap.getBoundingClientRect();
-      const availableWidth = Math.max(320, wrap.clientWidth - 2);
-      const availableHeight = Math.max(220, window.innerHeight - rect.top - 6);
-      const tableWidth = table.scrollWidth || table.getBoundingClientRect().width;
-      const tableHeight = table.scrollHeight || table.getBoundingClientRect().height;
-      if (!tableWidth || !tableHeight) return;
-      const scale = Math.min(1, availableWidth / tableWidth, availableHeight / tableHeight);
-      if (scale >= 0.995) return;
+    report_dates = [
+        str(row.get("date"))
+        for row in model.get("schedule_rows", [])
+        if isinstance(row, dict) and row.get("date")
+    ]
+    shift_reports = build_shift_reports_for_dates(report_dates, entries_list)
 
-      table.style.transform = `scale(${{scale}})`;
-      table.style.width = `${{tableWidth}}px`;
-      wrap.style.height = `${{Math.ceil(tableHeight * scale) + 2}}px`;
-      const note = document.createElement("span");
-      note.className = "schedule-fit-note";
-      note.textContent = `${{Math.round(scale * 100)}}%`;
-      wrap.appendChild(note);
-    }});
-  }}
-  window.addEventListener("resize", fitScheduleTables);
-  window.addEventListener("orientationchange", fitScheduleTables);
-  requestAnimationFrame(fitScheduleTables);
-  setTimeout(fitScheduleTables, 250);
-}})();
-</script>
-"""
-    return page_template(content, role=normalize_page_role(role), day=normalize_day(day), page_class="page-schedules")
+    grid = render_schedule_grafik_grid(
+        model,
+        title=title,
+        subtitle=selected_department_label,
+        role=role,
+        day=day,
+        department=selected_department,
+        months=months,
+        weeks=weeks,
+        week=selected_week,
+        view=selected_view,
+        controls_html=controls,
+        home_href=home_href,
+        refresh_href=refresh_href,
+        shift_reports=shift_reports,
+    )
+    content = grafik4600_assets() + status_markup + grid + grafik4600_script()
+    return page_template(
+        content,
+        role=role,
+        day=day,
+        page_class="page-schedules",
+        logo_href=hub_home_href(day),
+        hub="grafiki",
+    )
 
 
 def render_schema_summary() -> str:
@@ -9144,17 +11123,42 @@ def render_home(
     values: dict[str, object] | None = None,
     errors: dict[str, str] | None = None,
     edit_id: int | None = None,
+    hub: str = "",
 ) -> bytes:
     page_role = normalize_page_role(role)
     role = normalize_role(role)
     day = normalize_day(day)
+    hub = normalize_hub(hub)
     errors = errors or {}
     target_day = selected_day(day)
     rows = get_reservations_for_day(target_day)
 
     if page_role == "home":
-        content = render_nav(page_role, day) + f'<div class="home-summary">{render_metrics(rows, day)}</div>'
-        return page_template(content, message=message, errors=errors, role=page_role, day=day)
+        section_title = ""
+        tabs = ""
+        if hub == "urodziny":
+            section_title = render_home_section_title("URODZINY")
+            tabs = render_role_tabs("home", day, hub="urodziny")
+        elif hub == "grafiki":
+            section_title = render_home_section_title("GRAFIKI")
+            tabs = render_grafiki_department_tabs(
+                role="home",
+                day=day,
+                home_href=hub_home_href(day, "grafiki"),
+            )
+        content = (
+            f'<div class="toolbar">{render_date_toolbar("home", day, hub=hub)}</div>'
+            f'<div class="home-summary">{render_metrics(rows, day)}{section_title}</div>'
+            f"{tabs}"
+        )
+        return page_template(
+            content,
+            message=message,
+            errors=errors,
+            role=page_role,
+            day=day,
+            hub=hub,
+        )
 
     if role != "organizer":
         edit_id = None
@@ -9168,7 +11172,7 @@ def render_home(
     if values is None:
         values = default_form_values(target_day)
 
-    content = render_nav(page_role, day)
+    content = render_nav(page_role, day, hub="urodziny")
     if role == "organizer":
         content += f"""
 <div class="stack organizer-layout">
@@ -9192,7 +11196,14 @@ def render_home(
 </div>
 """
 
-    return page_template(content, message=message, errors=errors, role=page_role, day=day)
+    return page_template(
+        content,
+        message=message,
+        errors=errors,
+        role=page_role,
+        day=day,
+        hub="urodziny",
+    )
 
 
 def room_plan_script() -> str:
@@ -10151,14 +12162,17 @@ class ReservationHandler(BaseHTTPRequestHandler):
             return
 
         query = parse_qs(parsed.query)
-        role = normalize_page_role(query.get("role", ["manager"])[0])
+        role = normalize_page_role(query.get("role", ["home"])[0])
         day = normalize_day(query.get("day", ["today"])[0])
 
         if parsed.path == "/":
             message = query.get("message", [""])[0]
             edit_values = query.get("edit", [""])[0]
             edit_id = int(edit_values) if edit_values.isdigit() else None
-            self.send_bytes(render_home(role=role, day=day, message=message, edit_id=edit_id))
+            hub = normalize_hub(query.get("hub", [""])[0])
+            self.send_bytes(
+                render_home(role=role, day=day, message=message, edit_id=edit_id, hub=hub)
+            )
             return
 
         if parsed.path == "/logo.png":
@@ -10255,6 +12269,18 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.send_bytes(render_schema_page(role=role, day=day))
             return
 
+        if parsed.path in {"/static/grafik4600.css", "/grafik4600.css"}:
+            css_path = Path(__file__).resolve().parent / "assets" / "grafik4600.css"
+            if css_path.is_file():
+                self.send_bytes(
+                    css_path.read_bytes(),
+                    content_type="text/css; charset=utf-8",
+                    extra_headers={"Cache-Control": "no-cache"},
+                )
+                return
+            self.send_error(404)
+            return
+
         if parsed.path == "/grafiki":
             self.send_bytes(render_schedules_page(role=role, day=day, query=query))
             return
@@ -10291,6 +12317,18 @@ class ReservationHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in {"/static/grafik4600.css", "/grafik4600.css"}:
+            css_path = Path(__file__).resolve().parent / "assets" / "grafik4600.css"
+            if css_path.is_file():
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/css; charset=utf-8")
+                self.send_header("Content-Length", str(css_path.stat().st_size))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                return
+            self.send_error(404)
+            return
+
         if parsed.path == "/logo.png":
             self.send_response(HTTPStatus.OK if LOGO_PATH.exists() else HTTPStatus.NOT_FOUND)
             self.send_header("Content-Type", "image/png")

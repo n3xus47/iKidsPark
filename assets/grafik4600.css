@@ -1,0 +1,7498 @@
+:root{
+  /* 
+   * Paleta kolorów inspirowana Spotify z czerwonym akcentem Orlenu
+   * Wszystkie kolory są zdefiniowane jako zmienne CSS żeby łatwo je zmieniać
+   */
+  
+  /* Kolory podstawowe - ciemny motyw jak w Spotify */
+  --black: #121212;          /* Główne tło - głęboki czarny */
+  --gray: #1a1a1a;           /* Drugorzędne tło - ciemny szary */
+  --white: #ffffff;          /* Główny tekst - czysty biały */
+  --gray-text: #b3b3b3;      /* Drugorzędny tekst - szary */
+  --gray-light: #535353;     /* Jaśniejszy szary dla elementów */
+  
+  /* Kolory akcentowe - czerwony jak logo Orlenu */
+  --red: #ff0000;            /* Główny czerwony - przyciski, linki */
+  --red-hover: #ff3333;      /* Czerwony przy najechaniu myszką */
+  --red-light: #ff6666;      /* Jaśniejszy czerwony dla tekstu na ciemnym tle */
+  
+  /* Kolory funkcjonalne - zielony dla pozytywnych akcji */
+  --green: #00aa00;          /* Zielony dla międzyzmian, sukcesów */
+  --green-hover: #00cc00;    /* Zielony przy najechaniu myszką */
+  --green-light: #00dd00;    /* Jaśniejszy zielony dla tekstu */
+  
+  /* Kolory tła i tekstu - używane w całej aplikacji */
+  --bg: var(--black);                    /* Główne tło strony */
+  --bg-secondary: var(--gray);           /* Drugorzędne tło (karty, panele) */
+  --fg: var(--white);                    /* Główny tekst */
+  --fg-secondary: var(--gray-text);      /* Drugorzędny tekst */
+  --muted: var(--red);                   /* Kolor akcentowy */
+  
+  /* Kolory kart i elementów interfejsu */
+  --card: #1a1a1a;           /* Tło kart (np. karty pracowników) */
+  --card-hover: #2a2a2a;     /* Tło kart przy najechaniu myszką */
+  --border: #2a2a2a;         /* Kolor ramek */
+  --border-light: #404040;   /* Jaśniejsza ramka dla delikatnych elementów */
+  
+  /* Kolory dla trybu jasnego */
+  --light-bg: #ffffff;                   /* Główne tło w trybie jasnym */
+  --light-bg-secondary: #f8f9fa;         /* Drugorzędne tło w trybie jasnym */
+  --light-fg: #212529;                   /* Główny tekst w trybie jasnym */
+  --light-fg-secondary: #6c757d;         /* Drugorzędny tekst w trybie jasnym */
+  --light-card: #ffffff;                 /* Tło kart w trybie jasnym */
+  --light-card-hover: #f8f9fa;           /* Tło kart przy hover w trybie jasnym */
+  --light-border: #dee2e6;               /* Kolor ramek w trybie jasnym */
+  --light-border-light: #e9ecef;         /* Jaśniejsza ramka w trybie jasnym */
+  
+  /* Pozostałe zmienne - rozmiary, czcionki */
+  --gap: .5rem;              /* Odstęp między elementami */
+  --radius: 8px;             /* Promień zaokrąglenia rogów */
+  --maxw: 100%;              /* Maksymalna szerokość */
+  --font: 'Circular', 'Helvetica Neue', 'Helvetica', 'Arial', sans-serif;  /* Czcionka */
+  --font-weight-normal: 400; /* Normalna grubość czcionki */
+  --font-weight-medium: 500; /* Średnia grubość czcionki */
+  --font-weight-bold: 700;
+
+  /* header i layout */
+  --header-h: 72px; /* Wysokość header inspirowana Spotify */
+  --logo-size: 40px; /* Rozmiar logo - pomniejszony */
+  --logo-content-h: 32px; /* Wysokość części użytkowej logo */
+  --wrap-vmargin: 1rem;
+
+  /* tabela */
+  --cell-fs: 13px;
+  --cell-pad-v: 3px;
+  --cell-pad-h: 3px;
+  --thead-h: 18px;
+  --section-title-h: 24px;
+  --row-border: 1px;
+  --thead-borders: 2px;
+  --card-pad: 12px;
+
+  /* kolumny - usuwamy stałe szerokości dla skalowania */
+  --emp-col-w: auto;
+  --date-col-w: auto;
+  --day-col-w: auto;
+  --background-base: #121212;
+  --background-noise: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMDAiIGhlaWdodD0iMzAwIj48ZmlsdGVyIGlkPSJhIiB4PSIwIiB5PSIwIj48ZmVUdXJidWxlbmNlIGJhc2VGcmVxdWVuY3k9Ii43NSIgc3RpdGNoVGlsZXM9InN0aXRjaCIgdHlwZT0iZnJhY3RhbE5vaXNlIi8+PGZlQ29sb3JNYXRyaXggdHlwZT0ic2F0dXJhdGUiIHZhbHVlcz0iMCIvPjwvZmlsdGVyPjxwYXRoIGQ9Ik0wIDBoMzAwdjMwMEgweiIgZmlsdGVyPSJ1cmwoI2EpIiBvcGFjaXR5PSIuMDUiLz48L3N2Zz4=");
+}
+
+/* Performance optimizations */
+* {
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+/* Optimize rendering performance */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Reduce layout thrashing */
+.table, .slot, .col-date, .col-day, .col-emp, .col-summary {
+  contain: layout style;
+}
+
+/* Optimize animations */
+.btn, .spotify-function-card, .slot {
+  will-change: transform;
+  transform: translateZ(0); /* Force hardware acceleration */
+}
+
+/* Wyjątki - tylko pola input, textarea i edytowalne elementy mogą mieć zaznaczanie tekstu */
+input[type="text"],
+input[type="email"], 
+input[type="password"],
+input[type="number"],
+input[type="search"],
+input[type="tel"],
+input[type="url"],
+textarea,
+[contenteditable="true"],
+.slot[contenteditable="true"] {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  -ms-user-select: text !important;
+  cursor: text;
+  color: var(--white);
+}
+
+/* Domyślny kursor dla wszystkich elementów */
+* {
+  cursor: default;
+  color: var(--white);
+}
+
+/* Wyjątek dla podświetlania dzisiejszego dnia - musi być po globalnym stylu */
+/* Usunięto - pozwalamy na czerwony kolor dla dzisiejszego dnia */
+
+/* Elementy .muted w delikatnym czerwonym */
+.muted {
+  color: var(--fg-secondary) !important;
+}
+
+/* Spotify-style cards */
+.card {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: var(--card-pad);
+  border: 1px solid var(--border);
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.card:hover {
+  background: var(--card-hover);
+  border-color: var(--border-light);
+  transform: translate3d(0, -2px, 0);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+  transition: all 0.2s ease;
+}
+
+/* Kursor pointer dla przycisków i linków */
+button, .btn, .nav-btn, a, [role="button"] {
+  cursor: pointer;
+  font-family: var(--font);
+  font-weight: var(--font-weight-medium);
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* Spotify-style buttons */
+.btn {
+  background: var(--red);
+  color: var(--white);
+  border: none;
+  border-radius: 500px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: var(--font-weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  min-width: 100px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* New animated button style for hamburger menu function buttons */
+.spotify-function-card {
+  outline: none !important;
+  cursor: pointer !important;
+  border: none !important;
+  padding: 0.9rem 2rem !important;
+  margin: 0 !important;
+  font-family: inherit !important;
+  font-size: inherit !important;
+  position: relative !important;
+  display: flex !important;
+  letter-spacing: 0.05rem !important;
+  font-weight: 700 !important;
+  font-size: 17px !important;
+  border-radius: 500px !important;
+  overflow: hidden !important;
+  background: #2a2a2a !important; /* Szary domyślnie */
+  color: #ffffff !important; /* Biały tekst */
+  width: 100% !important;
+  text-align: left !important;
+  align-items: center !important;
+  gap: 8px !important;
+}
+
+.spotify-function-card .spotify-function-content {
+  position: relative !important;
+  z-index: 10 !important;
+  transition: color 0.4s !important;
+}
+
+.spotify-function-card .spotify-function-icon {
+  position: relative !important;
+  z-index: 10 !important;
+  transition: color 0.4s !important;
+}
+
+.spotify-function-card:hover .spotify-function-content,
+.spotify-function-card:hover .spotify-function-icon {
+  color: var(--white) !important;
+}
+
+.spotify-function-card::before,
+.spotify-function-card::after {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  z-index: 0 !important;
+}
+
+.spotify-function-card::before {
+  content: "" !important;
+  background: #2a2a2a !important; /* Szary domyślnie */
+  width: 120% !important;
+  left: -10% !important;
+  transform: skew(30deg) !important;
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1) !important;
+}
+
+.spotify-function-card:hover::before {
+  transform: translate3d(100%, 0, 0) !important;
+}
+
+/* HIGH END przyciski dla panelu funkcji - SPOTIFY/YOUTUBE/TWITCH STYLE */
+.w100 {
+  width: 100%;
+  margin: 0;
+  font-size: 0.875rem;
+  height: 40px;
+  min-width: auto;
+  background: transparent !important;
+  backdrop-filter: none !important;
+  color: rgba(255, 255, 255, 0.9) !important;
+  border: none !important;
+  border-radius: 0 !important;
+  text-transform: none !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+  position: relative !important;
+  overflow: hidden !important;
+  transition: transform 0.2s ease !important;
+  box-shadow: none !important;
+  padding: 0 1.5rem !important;
+  text-align: left !important;
+  will-change: transform;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  contain: layout style paint;
+  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif !important;
+}
+
+.w100::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 3px;
+  height: 100%;
+  background: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.w100:hover::before {
+  background: #1db954;
+}
+
+/* HIGH END przycisk wyloguj - SPOTIFY/YOUTUBE/TWITCH STYLE */
+.logout-area .btn {
+  width: 100% !important;
+  height: 40px !important;
+  margin: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  text-transform: none !important;
+  font-weight: 500 !important;
+  font-size: 0.875rem !important;
+  background: transparent !important;
+  backdrop-filter: none !important;
+  color: rgba(255, 255, 255, 0.7) !important;
+  border: none !important;
+  border-radius: 0 !important;
+  letter-spacing: 0 !important;
+  position: relative !important;
+  overflow: hidden !important;
+  transition: transform 0.2s ease !important;
+  box-shadow: none !important;
+  padding: 0 1.5rem !important;
+  text-align: left !important;
+  will-change: transform;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  contain: layout style paint;
+  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif !important;
+}
+
+.logout-area .btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 3px;
+  height: 100%;
+  background: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.logout-area .btn:hover::before {
+  background: #ff6b6b;
+}
+
+.btn:hover {
+  background: var(--red-hover);
+  transform: translate3d(0, -2px, 0);
+}
+
+.btn:active {
+  background: var(--red);
+  transform: translate3d(0, 0, 0);
+  /* Subtelny efekt aktywacji bez powiększania */
+}
+
+/* HIGH END hover effects dla przycisków funkcji */
+.w100:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: #ffffff !important;
+  transform: translate3d(0, 0, 0) !important;
+  box-shadow: none !important;
+}
+
+.logout-area .btn:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(255, 255, 255, 0.9) !important;
+  transform: translate3d(0, 0, 0) !important;
+  box-shadow: none !important;
+}
+
+.w100:active {
+  background: rgba(255, 255, 255, 0.12) !important;
+  transform: translate3d(0, 0, 0) !important;
+  box-shadow: none !important;
+}
+
+.logout-area .btn:active {
+  background: rgba(255, 255, 255, 0.12) !important;
+  transform: translate3d(0, 0, 0) !important;
+  box-shadow: none !important;
+}
+
+/* Style dla nagłówków paneli - HIGH END DESIGN */
+.right-panel h2 {
+  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif !important;
+  font-weight: 600 !important;
+  font-size: 0.875rem !important;
+  color: rgba(255, 255, 255, 0.9) !important;
+  margin: 0 !important;
+  padding: 1rem 1.5rem 0.5rem 1.5rem !important;
+  border: none !important;
+  text-align: left !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+  position: relative !important;
+  text-shadow: none !important;
+  letter-spacing: 0.5px !important;
+  text-transform: none !important;
+}
+
+.right-panel h2::after {
+  display: none;
+}
+
+/* Hover effect dla paneli - zmiana koloru linii */
+.right-panel:hover h2 {
+  border-bottom-color: var(--gray-light) !important;
+}
+
+/* Style dla podnagłówków w panelach */
+.right-panel h3 {
+  text-transform: uppercase !important;
+  font-weight: var(--font-weight-bold) !important;
+  letter-spacing: 0.8px !important;
+  font-size: 1rem !important;
+  color: var(--fg) !important;
+  margin: 0.8rem 0 0.5rem 0 !important;
+  padding: 0.3rem 0 !important;
+  border: none !important;
+  text-align: center !important;
+  background: transparent !important;
+  position: relative !important;
+}
+
+
+
+
+
+/* ===== TRYB EDYCJI - CIEMNIEJSZY KOLOR I CZERWONE AKCENTY ===== */
+body.edit-mode {
+  /* filter: brightness(0.8) saturate(1.1); - Wyłączone dla lepszej wydajności */
+  /* Dodatkowe style dla trybu edycji można dodać tutaj */
+  position: relative;
+}
+
+/* Podświetlenie tabeli na czerwono w trybie edycji */
+body.edit-mode .table-wrap {
+  border: 2px solid var(--red) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: 0 0 10px rgba(220, 38, 38, 0.3) !important;
+}
+
+
+
+
+
+
+
+
+
+
+
+/* ===== PODŚWIETLENIE DZISIEJSZEGO DNIA ===== */
+/* Podświetlenie tylko napisów w kolumnach DATA i DZIEŃ - czerwony kolor czcionki */
+.col-date.today, .col-day.today {
+  color: var(--red) !important;
+  font-weight: 700 !important;
+}
+
+/* Podświetlenie kolumny podsumowania w dzisiejszym dniu - czerwony kolor czcionki */
+.col-summary.today {
+  color: var(--red) !important;
+  font-weight: 700 !important;
+}
+
+/* Podświetlenie wszystkich komórek w dzisiejszym dniu - czerwony kolor czcionki */
+.slot.today {
+  color: var(--red) !important;
+  font-weight: 700 !important;
+  position: relative;
+}
+
+/* D - żółty tylko w dzisiejszym dniu */
+.slot.today.dniowka {
+  color: #FFD700 !important;
+  font-weight: 900 !important;
+}
+
+/* N - niebieski tylko w dzisiejszym dniu */
+.slot.today.nocka {
+  color: #00BFFF !important;
+  font-weight: 900 !important;
+}
+
+/* Międzyzmiany - zielony tylko w dzisiejszym dniu */
+.slot.today.poludniowka {
+  color: #00aa00 !important;
+  font-weight: 900 !important;
+}
+
+/* Własne napisy - czerwony tylko w dzisiejszym dniu */
+.slot.today.custom-shift {
+  color: #ff0000 !important;
+  font-weight: 900 !important;
+}
+
+/* Podświetlenie całego wiersza dzisiejszego dnia na szaro */
+.table tr.today-row {
+  background: rgba(128, 128, 128, 0.25) !important;
+}
+
+.table tr.today-row td {
+  background: inherit !important;
+}
+
+/* ===== WYRÓŻNIENIE ZALOGOWANEJ OSOBY ===== */
+/* Czerwone imię zalogowanej osoby w nagłówku */
+th.col-emp.current-user,
+th.col-emp.current-user .rot {
+  color: var(--red) !important;
+  font-weight: 700 !important;
+}
+
+/* Cała kolumna zalogowanej osoby - szare tło */
+th.col-emp.current-user {
+  background: rgba(128, 128, 128, 0.15) !important;
+}
+
+/* Wszystkie komórki w kolumnie zalogowanej osoby - szare tło */
+.slot.current-user {
+  background: rgba(128, 128, 128, 0.15) !important;
+}
+
+/* Zalogowany użytkownik w dzisiejszym dniu - czerwone tło z wyższym priorytetem */
+.table tr.today-row td.current-user {
+  background: rgba(211, 47, 47, 0.2) !important;
+  border: 2px solid var(--red) !important;
+}
+
+/* ===== PANEL ZMIAN Z NAWIGACJĄ ===== */
+.daily-shifts-header {
+  background: var(--card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  margin-bottom: 8px !important;
+  padding: 12px !important;
+}
+
+.shift-navigation {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 16px !important;
+}
+
+.shift-date-info {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  flex: 1 !important;
+}
+
+.shift-date-info h2 {
+  margin: 0 !important;
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  color: var(--text-primary) !important;
+}
+
+#shift-date-display {
+  font-size: 14px !important;
+  color: var(--text-secondary) !important;
+  margin-top: 4px !important;
+}
+
+.daily-shifts-container {
+  display: flex !important;
+  gap: 8px !important;
+  margin-bottom: 8px !important; /* Zmienione z 16px na 8px - odstęp między panelami a grafikiem */
+  margin-left: 8px !important; /* Odstęp od lewej krawędzi ekranu */
+  margin-right: 8px !important; /* Odstęp od prawej krawędzi ekranu */
+  grid-row: 1; /* Explicitnie ustawiamy na 1. rząd */
+  grid-column: 1; /* Explicitnie ustawiamy na 1. kolumnę */
+  background: #000000; /* Kompletna czerń identyczna jak w headerze */
+}
+
+.daily-shifts-bar {
+  /* Panel nad grafikiem - bez wpływu na inne elementy */
+  background-color: rgb(255, 193, 7); /* Żółty jako domyślny */
+  background-image: linear-gradient(rgba(0,0,0,1) 0,rgba(0,0,0,.6) 100%),var(--background-noise);
+  height: 256px;
+  flex: 1;
+  border-radius: 0 0 12px 12px; /* Zaokrąglone rogi tylko na dole */
+  padding: 16px;
+  position: relative; /* Potrzebne dla pseudo-elementu */
+}
+
+
+/* Kolory dla poszczególnych zmian */
+.dniowka-shift {
+  background-color: rgba(255, 193, 7, 0.8); /* Żółty dla dniówki */
+  color: #000000 !important;
+  font-weight: 800 !important;
+  border: none !important;
+}
+
+.popoludniowka-shift {
+  background-color: rgba(40, 167, 69, 0.8); /* Zielony dla popołudniówki */
+  color: #ffffff !important;
+  font-weight: 800 !important;
+  border: none !important;
+}
+
+.nocka-shift {
+  background-color: rgba(0, 123, 255, 0.8); /* Niebieski dla nocki */
+  color: #ffffff !important;
+  font-weight: 800 !important;
+  border: none !important;
+}
+
+.shifts-content {
+  display: flex !important;
+  flex-direction: column !important;
+  justify-content: center !important;
+  position: relative;
+  z-index: 10000; /* Nad zasłoną z najwyższym indexem */
+  align-items: center !important;
+  height: 100% !important;
+  width: 100% !important;
+}
+
+.shifts-section {
+  text-align: center !important;
+  width: 100% !important;
+}
+
+.shifts-section h3 {
+  margin: 0 0 12px 0 !important;
+  font-size: 18px !important;
+  font-weight: 800 !important;
+  color: var(--text-primary) !important;
+  background: none !important;
+  text-transform: uppercase !important;
+  letter-spacing: 1px !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3) !important;
+}
+
+.shifts-section ul {
+  list-style: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  display: flex !important;
+  flex-wrap: wrap !important;
+  gap: 8px !important;
+  justify-content: center !important;
+}
+
+.shifts-section li {
+  padding: 8px 16px !important;
+  margin: 0 !important;
+  background: rgba(255, 255, 255, 0.1) !important;
+  border-radius: 8px !important;
+  font-size: 16px !important;
+  font-weight: 700 !important;
+  color: var(--white) !important;
+  border: 1px solid rgba(255, 255, 255, 0.3) !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5) !important;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2) !important;
+  transition: all 0.2s ease !important;
+}
+
+.shifts-section li:hover {
+  background: rgba(255, 255, 255, 0.2) !important;
+  border-color: rgba(255, 255, 255, 0.5) !important;
+  transform: translate3d(0, -1px, 0) !important;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3) !important;
+}
+
+.shifts-section .muted {
+  color: var(--text-secondary) !important;
+  font-style: italic !important;
+  font-size: 12px !important;
+}
+
+.shifts-actions {
+  margin-top: 16px !important;
+  text-align: center !important;
+  display: flex !important;
+  gap: 8px !important;
+  justify-content: center !important;
+}
+
+/* ===== KOLUMNA LICZNIKA — jak data/dzień (bez starego 3-kolorowego layoutu) ===== */
+.col-summary {
+  display: table-cell !important;
+  text-align: center !important;
+  vertical-align: middle !important;
+  background: transparent !important;
+}
+
+.summary-item,
+.dniowka-count,
+.poludniowka-count,
+.nocka-count {
+  display: none !important;
+}
+
+body.edit-mode .col-summary {
+  background: transparent !important;
+}
+
+.col-summary.today {
+  background: transparent !important;
+}
+
+.table th.col-summary,
+thead th.col-summary {
+  background: transparent !important;
+}
+
+@media (max-width: 1200px) {
+  .col-summary {
+    font-size: 11px !important;
+    background: transparent !important;
+  }
+}
+
+
+html,body{margin:0;padding:0; overflow-x:hidden; overflow-y:auto}
+body{
+  background:#000000;color:var(--fg);font-family:var(--font);
+  font-weight: var(--font-weight-normal);
+  line-height:1.5;
+  font-size: 14px;
+}
+
+/* Pozwól na scrollowanie na urządzeniach mobilnych */
+@media (max-width: 900px) {
+  html, body {
+    overflow: auto;
+  }
+}
+
+/* ===== HEADER - SPOTIFY STYLE ===== */
+
+/* Kontener dla headera i panelu - pozwala na wysuwanie panelu */
+.header-container {
+  position: sticky;
+  top: 0;
+  z-index: 1001;
+  background: rgba(0, 0, 0, 0.9);
+  overflow: hidden; /* Ukrywa panel gdy jest ukryty */
+}
+
+/* Podstawowe style headera w stylu Spotify - OPTYMALIZOWANE */
+.site-header {
+  background: rgba(0, 0, 0, 0.9); /* Lekko przezroczysty czarny header */
+  position: relative; /* Zmienione z sticky na relative dla panelu */
+  top: 0;
+  z-index: 1001; /* Wyższy niż panel */
+  height: var(--header-h);
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* PERFORMANCE OPTIMIZATIONS */
+  will-change: transform;
+  contain: layout style paint;
+  transform: translateZ(0); /* Force GPU acceleration */
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+/* Kontener headera - grid 3-kolumnowy jak w Spotify - OPTYMALIZOWANY */
+.header-bar {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 0 1.5rem;
+  gap: 1rem;
+  position: relative;
+  /* PERFORMANCE OPTIMIZATIONS */
+  contain: layout style;
+  will-change: auto; /* Only change when needed */
+}
+
+/* Lewa sekcja - menu hamburger i logo - OPTYMALIZOWANA */
+.header-left {
+  justify-self: start;
+  display: flex;
+  align-items: center;
+  gap: 1rem; /* Odstęp między menu hamburger a logo */
+  /* PERFORMANCE OPTIMIZATIONS */
+  contain: layout style;
+}
+
+/* Środkowa sekcja - nawigacja dnia w stylu Spotify - OPTYMALIZOWANA */
+.header-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  z-index: 1;
+  background: var(--card);
+  border-radius: 500px;
+  padding: 8px 16px;
+  box-shadow: none;
+  cursor: pointer;
+  transition: background 0.15s ease, box-shadow 0.15s ease; /* Reduced duration */
+  width: 320px;
+  justify-content: center;
+  /* PERFORMANCE OPTIMIZATIONS */
+  will-change: background, box-shadow; /* Only animate these properties */
+  contain: layout style paint;
+}
+
+.header-center:hover {
+  background: var(--card-hover);
+  box-shadow: inset 0 0 0 1px hsla(0,0%,100%,.1);
+}
+
+/* Strzałki w header-center - na stałych pozycjach */
+/* Strzałki w header-center (nawigator dnia) - bliżej krawędzi i na środku */
+.header-center .nav-btn {
+  background: none;
+  border: none;
+  color: var(--white);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0.5rem;
+  border-radius: 50%;
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  position: relative;
+  align-self: center;
+  justify-self: center;
+}
+
+/* Lewa strzałka - na lewej pozycji */
+.header-center .nav-btn:first-child {
+  justify-self: start;
+}
+
+/* Prawa strzałka - na prawej pozycji */
+.header-center .nav-btn:last-child {
+  justify-self: end;
+}
+
+/* Informacje o dniu - w środku header-center */
+.shift-date-info {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-self: center;
+  text-align: center;
+}
+
+.shift-date-info h2 {
+  font-weight: var(--font-weight-bold);
+  color: var(--white);
+  font-size: 1.2rem;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  margin: 0;
+}
+
+.shift-date-info span {
+  color: var(--gray-text);
+  font-size: 0.9rem;
+  margin-top: 2px;
+}
+
+
+/* Nawigator miesiąca pod tabelą - identyczny jak nawigator dnia */
+.month-navigation-below-table {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  margin-top: 1.5rem;
+  margin-bottom: 1.5rem;
+  background: var(--card);
+  border-radius: 500px;
+  padding: 8px 16px;
+  box-shadow: none;
+  cursor: pointer;
+  transition: background 0.22s ease-in, box-shadow 0.22s ease-in;
+  width: 320px;
+  justify-content: center;
+  margin-left: auto;
+  margin-right: auto;
+  grid-row: 3; /* Explicitnie ustawiamy na 3. rząd */
+  grid-column: 1; /* Explicitnie ustawiamy na 1. kolumnę */
+}
+
+.month-navigation-below-table:hover {
+  background: var(--card-hover);
+  box-shadow: inset 0 0 0 1px hsla(0,0%,100%,.1);
+}
+
+
+.month-navigation-below-table .nav-btn {
+  background: none;
+  border: none;
+  color: var(--white);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0.5rem;
+  border-radius: 50%;
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  position: relative;
+  align-self: center;
+  justify-self: center;
+  text-decoration: none;
+}
+
+.month-navigation-below-table .nav-btn:hover {
+  color: var(--red);
+  transform: translate3d(0, -2px, 0) scale(1.05);
+}
+
+
+/* Lewa strzałka w nawigatorze miesiąca - na lewej pozycji */
+.month-navigation-below-table .nav-btn:first-child {
+  justify-self: start;
+}
+
+/* Prawa strzałka w nawigatorze miesiąca - na prawej pozycji */
+.month-navigation-below-table .nav-btn:last-child {
+  justify-self: end;
+}
+
+.month-navigation-below-table .month-label {
+  font-weight: var(--font-weight-bold);
+  color: var(--white);
+  font-size: 1.2rem;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  text-align: center;
+  justify-self: center;
+}
+
+
+/* Style dla przycisku wyloguj w hamburger menu */
+.menu-item-form {
+  display: contents; /* Pozwala formie zachowywać się jak element inline */
+}
+
+.logout-btn {
+  color: var(--red) !important; /* Czerwony kolor dla przycisku wyloguj */
+}
+
+.logout-btn:hover {
+  background: var(--red) !important;
+  color: var(--white) !important;
+}
+
+
+.header-center .nav-btn:hover {
+  color: var(--red);
+  transform: translate3d(0, -1px, 0) scale(1.02); /* Reduced transform for better performance */
+}
+
+/* Prawa sekcja - przyciski jak w Spotify - OPTYMALIZOWANA */
+.header-right {
+  position: absolute;
+  right: 2rem;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  z-index: 2;
+  /* PERFORMANCE OPTIMIZATIONS */
+  contain: layout style;
+}
+
+/* Przyciski w stylu Spotify */
+.spotify-btn {
+  background: transparent;
+  border: none;
+  color: var(--white);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  position: relative;
+}
+
+.spotify-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  transform: translate3d(0, 0, 0) scale(1.02); /* Reduced scale for better performance */
+}
+
+.spotify-btn:active {
+  transform: translate3d(0, 0, 0) scale(0.95);
+}
+
+/* Przycisk "Pobierz" w stylu Spotify */
+.spotify-download-btn {
+  background: transparent;
+  border: none;
+  color: var(--white);
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: 20px;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.spotify-download-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  transform: translate3d(0, 0, 0) scale(1.01); /* Further reduced scale */
+  text-decoration: none;
+  color: var(--white);
+}
+
+.spotify-download-btn:active {
+  transform: translate3d(0, 0, 0) scale(0.98);
+}
+
+.spotify-btn-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.spotify-btn-text {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+/* Przycisk menu hamburger */
+.hamburger-menu-btn {
+  background: transparent;
+  border: none;
+  color: var(--white);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+}
+
+.hamburger-menu-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  transform: translate3d(0, 0, 0) scale(1.02); /* Reduced scale for better performance */
+}
+
+.hamburger-menu-btn:active {
+  transform: translate3d(0, 0, 0) scale(0.95);
+}
+
+/* Ikona hamburger - 3 linie */
+.hamburger-icon {
+  width: 24px;
+  height: 18px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.hamburger-icon::before,
+.hamburger-icon::after,
+.hamburger-icon span {
+  content: '';
+  display: block;
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  transition: all 0.3s ease;
+}
+
+.hamburger-icon span {
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+}
+
+/* Animacja hamburger na hover */
+.hamburger-menu-btn:hover .hamburger-icon::before {
+  transform: translate3d(0, 2px, 0);
+}
+
+.hamburger-menu-btn:hover .hamburger-icon::after {
+  transform: translate3d(0, -2px, 0);
+}
+
+
+/* Przełącznik motywu */
+.theme-toggle {
+  background: none;
+  border: 2px solid var(--border);
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  color: var(--fg);
+  position: relative;
+  overflow: hidden;
+}
+
+.theme-toggle:hover {
+  border-color: var(--red);
+  background: var(--card-hover);
+  transform: translate3d(0, 0, 0) scale(1.05);
+}
+
+.theme-toggle:active {
+  transform: translate3d(0, 0, 0) scale(0.95);
+}
+
+.theme-toggle svg {
+  transition: all 0.3s ease;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3));
+}
+
+.theme-toggle:hover svg {
+  color: var(--red);
+}
+
+/* Animacja ikony przy przełączaniu */
+.theme-toggle svg {
+  animation: none;
+}
+
+.theme-toggle.rotating svg {
+  animation: rotate 0.5s ease-in-out;
+}
+
+@keyframes rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Logo - zachowuje proporcje oryginalne (1552x1114) */
+.logo {
+  height: var(--logo-size);
+  width: calc(var(--logo-size) * 1.4); /* Zachowaj proporcje 1.4:1 */
+  display: block;
+  margin: 0 2rem; /* Zwiększony odstęp od krawędzi 2x */
+  position: relative;
+  cursor: pointer; /* Logo jest klikalne */
+}
+
+/* Ścieżki logo - biały kolor w trybie ciemnym */
+.logo-path {
+  fill: white;
+  transition: fill 0.8s ease;
+}
+
+/* Hover effect dla logo - czerwone wypełnienie */
+.logo:hover .logo-path {
+  fill: #d32f2f; /* Czerwony kolor */
+}
+
+
+/* Etykieta miesiąca - Spotify style */
+.month-label {
+  font-weight: var(--font-weight-bold);
+  color: var(--white);
+  font-size: 1.2rem;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+/* Przyciski nawigacji - Spotify style */
+.nav-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  color: var(--fg-secondary);
+  text-decoration: none;
+  background: transparent;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  font-size: 24px; /* Powiększone strzałki */
+  font-weight: var(--font-weight-medium);
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.nav-btn:hover {
+  color: var(--red);
+}
+
+.nav-btn:active {
+  background: var(--card);
+  color: var(--red);
+}
+
+
+/* Przycisk PWA - Spotify style */
+.pwa-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  background: var(--red);
+  color: var(--white);
+  border: none;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: var(--font-weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  text-decoration: none;
+  min-height: 36px;
+}
+
+.pwa-btn:hover {
+  background: var(--red-hover);
+  transform: translateY(-1px);
+}
+
+.pwa-btn:active {
+  background: var(--red);
+  transform: translateY(0);
+}
+
+.pwa-btn svg {
+  flex-shrink: 0;
+}
+
+/* kontener na treść */
+.wrap{
+  max-width:var(--maxw);
+  width:100%;
+  margin: 0 auto; /* Usunięty margines pionowy - panele wyznaczają granice */
+  padding: 0; /* Usuwamy padding - zawartość ma się mieścić w 100% ekranu */
+}
+
+/* ===== KOMPLETNY RESET - NOWY UKŁAD GRID ===== */
+
+/* Usuwam wszystkie stare style i robię czysty grid */
+.grid3, .grid3 > * {
+  display: none !important;
+}
+
+/* Nowy układ pionowy - CZYSTY GRID */
+.grid3-vertical {
+  display: grid;
+  grid-template-rows: auto auto auto;
+  grid-template-columns: 1fr;
+  gap: 1rem 0; /* Odstęp między wierszami, brak między kolumnami */
+  width: 100%;
+  max-width: 100%; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  padding: 0; /* Usuwamy cały padding - tabela bezpośrednio pod headerem */
+  box-sizing: border-box; /* Padding wliczony w szerokość */
+  height: auto; /* Wysokość dostosowuje się do zawartości */
+  overflow: visible; /* Cała zawartość widoczna */
+  background: transparent; /* Przezroczyste tło - dziedziczy z body */
+}
+
+/* Nagłówek dla dzisiejszych zmian - RZĄD 1 */
+.shift-header {
+  grid-column: 1;
+  width: 100%;
+  background: var(--bg);
+  padding: 0.5rem 0;
+  text-align: center;
+  border-bottom: 2px solid var(--border);
+}
+
+.today-header {
+  grid-row: 1;
+}
+
+.tomorrow-header {
+  grid-row: 4;
+}
+
+.shift-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  font-weight: var(--font-weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--red);
+}
+
+/* Pasek z informacjami o dzisiejszych zmianach - RZĄD 2 - WĄSKI PASEK */
+.today-bar {
+  grid-row: 2;
+  grid-column: 1;
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3rem var(--card-pad);
+  margin-bottom: 0;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  position: relative;
+}
+
+.today-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 2rem;
+  width: 100%;
+}
+
+.today-section {
+  flex: 1;
+  text-align: center;
+  padding: 0.25rem;
+  border-right: 1px solid var(--border);
+}
+
+/* Kolory nagłówków w górnym pasku - odpowiadają kolorom w tabeli */
+.today-section h3 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.today-section:first-child h3 {
+  color: #FFD700 !important; /* Żółty - dniówka */
+}
+
+.today-section:nth-child(2) h3 {
+  color: #00aa00 !important; /* Zielony - popołudniówka */
+}
+
+.today-section:last-child h3 {
+  color: #00BFFF !important; /* Niebieski - nocka */
+}
+
+.today-section:last-child {
+  border-right: none;
+}
+
+/* Style dla przycisków akcji w pasku today-bar */
+.today-actions {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  gap: 0.5rem;
+  z-index: 10;
+  background: var(--card);
+  padding: 0.5rem;
+  border-radius: var(--radius);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--border);
+}
+
+.today-actions.hidden {
+  display: none;
+}
+
+.today-actions .btn {
+  width: 80px;
+  height: 32px;
+  font-size: 0.7rem;
+  padding: 0.3rem 0.6rem;
+  border: none;
+  border-radius: 500px;
+  background: var(--red);
+  color: var(--white);
+  cursor: pointer;
+  transition: all 0.1s ease-out;
+}
+
+.today-actions .btn:hover {
+  background: var(--white);
+  color: var(--black);
+  transform: none;
+}
+
+.today-actions .btn:active {
+  background: var(--red);
+  color: var(--white);
+}
+
+/* Pasek z informacjami o jutrzejszych zmianach - pod tabelą, nad funkcjami */
+.tomorrow-bar {
+  grid-row: 5;
+  grid-column: 1;
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3rem var(--card-pad);
+  margin-bottom: 1rem;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  position: relative;
+}
+
+.tomorrow-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 2rem;
+  width: 100%;
+}
+
+.tomorrow-section {
+  flex: 1;
+  text-align: center;
+  padding: 0.25rem;
+  border-right: 1px solid var(--border);
+}
+
+/* Kolory nagłówków w jutrzejszym pasku - odpowiadają kolorom w tabeli */
+.tomorrow-section h3 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.tomorrow-section:first-child h3 {
+  color: #FFD700 !important; /* Żółty - dniówka */
+}
+
+.tomorrow-section:nth-child(2) h3 {
+  color: #00aa00 !important; /* Zielony - popołudniówka */
+}
+
+.tomorrow-section:last-child h3 {
+  color: #00BFFF !important; /* Niebieski - nocka */
+}
+
+.tomorrow-section:last-child {
+  border-right: none;
+}
+
+/* Style dla przycisków akcji w pasku tomorrow-bar */
+.tomorrow-actions {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--border);
+}
+
+.tomorrow-actions.hidden {
+  display: none;
+}
+
+.tomorrow-actions .btn {
+  width: 80px;
+  height: 32px;
+  font-size: 0.7rem;
+  padding: 0.3rem 0.6rem;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--red);
+  color: var(--white);
+  cursor: pointer;
+  transition: all 0.1s ease-out;
+}
+
+.tomorrow-actions .btn:hover {
+  background: var(--white);
+  color: var(--black);
+  transform: none;
+}
+
+.tomorrow-actions .btn:active {
+  background: var(--red);
+  color: var(--white);
+}
+
+.tomorrow-section h3 {
+  margin: 0 0 0.15rem 0;
+  font-size: 0.7rem;
+  font-weight: var(--font-weight-bold);
+  color: var(--red);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.tomorrow-section ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+.tomorrow-section ul li {
+  margin: 0;
+  padding: 0.1rem 0.3rem;
+  background: var(--bg-secondary);
+  border-radius: 3px;
+  font-size: 0.65rem;
+  font-weight: var(--font-weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.tomorrow-section .muted {
+  color: var(--fg-secondary);
+  font-style: italic;
+  font-size: 0.6rem;
+}
+
+/* Panel wyboru godzin dla międzyzmiany */
+.p-hours-panel {
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.p-hours-panel.hidden {
+  display: none;
+}
+
+.hours-inputs {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.hours-inputs label {
+  font-size: 0.7rem;
+  font-weight: var(--font-weight-bold);
+  color: var(--text);
+}
+
+.hours-inputs input {
+  width: 60px;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.7rem;
+  text-align: center;
+}
+
+.hours-inputs input:focus {
+  outline: none;
+  border-color: var(--red);
+}
+
+/* Przycisk p-confirm - styl z menu burgerowego */
+#p-confirm {
+  width: 40px;
+  height: 24px;
+  font-size: 0.6rem !important; /* Jeszcze mniejsza czcionka */
+  padding: 0.2rem 0.4rem;
+  background: #2a2a2a !important; /* Szary jak w menu burgerowym */
+  color: #ffffff !important; /* Biały tekst widoczny od razu */
+  border: none;
+  border-radius: 500px;
+  cursor: pointer;
+  align-self: center;
+  transition: all 0.2s ease;
+  margin-top: 0.25rem;
+  position: relative;
+  overflow: hidden;
+  font-weight: 600;
+  z-index: 10; /* Tekst nad pseudo-elementem */
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 0.2rem !important; /* Odstęp między ikonką a tekstem */
+}
+
+/* Style dla ikon w p-confirm */
+#p-confirm svg {
+  flex-shrink: 0 !important;
+  z-index: 10 !important;
+}
+
+#p-confirm::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1; /* Zmienione na -1 żeby było za tekstem */
+  background: #2a2a2a;
+  transform: skew(30deg);
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1);
+}
+
+#p-confirm:hover {
+  background: #ff0000 !important; /* Czerwony jak w menu burgerowym */
+  color: #ffffff !important;
+  transform: translateY(-2px);
+}
+
+#p-confirm:hover::before {
+  transform: translate3d(100%, 0, 0);
+}
+
+/* Kolor zielony dla międzyzmian - tylko tekst w dzisiejszym dniu */
+.slot.today.poludniowka {
+  color: var(--green) !important;
+  font-weight: var(--font-weight-bold) !important;
+}
+
+/* Kolor czerwony dla własnych zmian - tylko tekst w dzisiejszym dniu */
+.slot.today.custom-shift {
+  color: var(--red) !important;
+  font-weight: var(--font-weight-bold) !important;
+}
+
+/* Responsywność dla przycisków w today-bar */
+@media (max-width: 768px) {
+  .today-actions {
+    padding: 0.3rem;
+    gap: 0.3rem;
+  }
+  
+  .today-actions .btn {
+    width: 70px;
+    height: 28px;
+    font-size: 0.65rem;
+    padding: 0.2rem 0.4rem;
+  }
+  
+  .tomorrow-actions {
+    padding: 0.3rem;
+    gap: 0.3rem;
+  }
+  
+  .tomorrow-actions .btn {
+    width: 70px;
+    height: 28px;
+    font-size: 0.65rem;
+    padding: 0.2rem 0.4rem;
+  }
+  
+  .hours-inputs {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .hours-inputs input {
+    width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .today-actions .btn {
+    width: 60px;
+    height: 26px;
+    font-size: 0.6rem;
+    padding: 0.15rem 0.3rem;
+  }
+}
+
+.today-section h3 {
+  margin: 0 0 0.15rem 0;
+  font-size: 0.7rem;
+  font-weight: var(--font-weight-bold);
+  color: var(--red);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.today-section ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+.today-section ul li {
+  margin: 0;
+  padding: 0.1rem 0.3rem;
+  background: var(--bg-secondary);
+  border-radius: 3px;
+  font-size: 0.65rem;
+  font-weight: var(--font-weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.today-section .muted {
+  color: var(--fg-secondary);
+  font-style: italic;
+  font-size: 0.6rem;
+}
+
+/* Główny panel z grafikiem - RZĄD 3 */
+.main-panel {
+  grid-row: 3;
+  grid-column: 1;
+  width: 100%;
+  background: #000000; /* Czarny odstęp między panelami a grafikiem */
+  border-radius: 12px; /* Zaokrąglone rogi jak panele */
+  padding: 8px; /* Odstęp od krawędzi strony */
+  /* Usuwamy background - tabela bezpośrednio na tle */
+}
+
+.main-panel .table-wrap {
+  width: 100%;
+  overflow: hidden; /* Zmienione z visible na hidden - potrzebne dla zaokrąglonych rogów */
+  position: relative;
+  background: var(--card); /* Tło tabeli */
+  border-radius: 12px; /* Zaokrąglone rogi tabeli */
+  border: 1px solid var(--border); /* Ramka tabeli */
+}
+
+/* Zaokrąglone rogi narożnych komórek tabeli */
+.main-panel .table thead tr:first-child th:first-child {
+  border-top-left-radius: 12px !important;
+}
+
+.main-panel .table thead tr:first-child th:last-child {
+  border-top-right-radius: 12px !important;
+}
+
+.main-panel .table tbody tr:last-child td:first-child {
+  border-bottom-left-radius: 12px !important;
+}
+
+.main-panel .table tbody tr:last-child td:last-child {
+  border-bottom-right-radius: 12px !important;
+}
+
+/* Dodatkowe style dla dolnych komórek - upewniamy się, że wszystkie narożne komórki są zaokrąglone */
+.main-panel .table tbody tr:last-child .col-date {
+  border-bottom-left-radius: 12px !important;
+}
+
+.main-panel .table tbody tr:last-child .col-summary {
+  border-bottom-right-radius: 12px !important;
+}
+
+/* Prawy panel - RZĄD 6, rozszerzony na całą szerokość - HIGH END DESIGN */
+.right-panel {
+  grid-row: 6;
+  grid-column: 1;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  background: rgba(18, 18, 18, 0.95);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0;
+  padding: 0;
+  min-height: auto;
+  height: auto;
+  overflow: hidden;
+  box-sizing: border-box;
+  position: relative;
+  box-shadow: none;
+  transition: all 0.2s ease;
+}
+
+.right-panel:hover {
+  background: rgba(18, 18, 18, 0.98);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+/* Klasa dla pełnej szerokości */
+.right-panel.full-width {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Style dla wewnętrznych elementów paneli */
+.right-panel h2 {
+  margin-bottom: 1rem;
+  text-align: center;
+}
+
+.right-panel .stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  position: relative;
+  z-index: 1;
+  padding: 0;
+}
+
+.right-panel .stack .btn {
+  width: 100%;
+  height: 70px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-width: 2px;
+  text-transform: uppercase;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+
+
+/* ===== RESPONSYWNOŚĆ DLA NOWEGO GRID ===== */
+
+/* Responsywność - nowy układ pionowy */
+@media (max-width: 900px) {
+  .grid3-vertical {
+    gap: 0.5rem 0; /* Odstęp między wierszami, brak między kolumnami */
+    padding: 0; /* Usuwamy padding - tabela bezpośrednio pod headerem */
+  }
+  
+  .main-panel {
+    padding: 6px; /* Zmniejszony padding dla mniejszych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.4rem 0.75rem;
+    min-height: 50px;
+  }
+  
+  .today-content {
+    gap: 1rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.75rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.3rem;
+  }
+  
+  .right-panel {
+    padding: 0.75rem;
+    min-height: 200px; /* Zmniejszona wysokość na węższych ekranach */
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+}
+
+/* Wąskie tablety - dodatkowe dostosowanie dla 730px */
+@media (max-width: 730px) {
+  .grid3-vertical {
+    gap: 0.4rem 0; /* Odstęp między wierszami, brak między kolumnami */
+    padding: 0; /* Usuwamy padding - tabela bezpośrednio pod headerem */
+  }
+  
+  .main-panel {
+    padding: 4px; /* Jeszcze mniejszy padding dla węższych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.3rem 0.6rem;
+    min-height: 45px;
+  }
+  
+  .today-content {
+    gap: 0.8rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.7rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.65rem;
+    padding: 0.08rem 0.25rem;
+  }
+  
+  .right-panel {
+    padding: 0.6rem;
+    min-height: 180px; /* Jeszcze mniejsza wysokość */
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Zmniejszamy czcionki w tabeli */
+  .table {
+    font-size: 10px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 9px !important;
+    padding: 2px 2px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 9px !important;
+    padding: 2px 2px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 9px !important;
+    padding: 2px 2px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 8px !important;
+    line-height: 1.0 !important;
+  }
+  
+  /* Zmniejszamy przyciski */
+  .btn {
+    padding: 0.5rem 0.7rem;
+    font-size: 0.8rem;
+    min-height: 40px;
+  }
+  
+  .stack .btn {
+    height: 55px;
+    font-size: 0.75rem;
+  }
+  
+  .actions .btn {
+    height: 35px;
+    font-size: 0.7rem;
+  }
+}
+
+/* Bardzo wąskie tablety - dla 650px */
+@media (max-width: 650px) {
+  .grid3-vertical {
+    gap: 0.3rem 0; /* Odstęp między wierszami, brak między kolumnami */
+    padding: 0; /* Usuwamy padding - tabela bezpośrednio pod headerem */
+  }
+  
+  .main-panel {
+    padding: 4px; /* Jeszcze mniejszy padding dla węższych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.25rem 0.5rem;
+    min-height: 40px;
+  }
+  
+  .today-content {
+    gap: 0.6rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.65rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.6rem;
+    padding: 0.08rem 0.2rem;
+  }
+  
+  .right-panel {
+    padding: 0.5rem;
+    min-height: 160px; /* Jeszcze mniejsza wysokość */
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Jeszcze mniejsze czcionki */
+  .table {
+    font-size: 9px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 8px !important;
+    padding: 1px 1px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 8px !important;
+    padding: 1px 1px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 8px !important;
+    padding: 1px 1px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 7px !important;
+    line-height: 0.9 !important;
+  }
+  
+  /* Jeszcze mniejsze przyciski */
+  .btn {
+    padding: 0.4rem 0.6rem;
+    font-size: 0.75rem;
+    min-height: 36px;
+  }
+  
+  .stack .btn {
+    height: 50px;
+    font-size: 0.7rem;
+  }
+  
+  .actions .btn {
+    height: 32px;
+    font-size: 0.65rem;
+  }
+}
+
+/* Bardzo wąskie ekrany - dla 600px i mniejszych */
+@media (max-width: 600px) {
+  .grid3-vertical {
+    gap: 0.2rem 0; /* Odstęp między wierszami, brak między kolumnami */
+    padding: 0; /* Usuwamy padding - tabela bezpośrednio pod headerem */
+  }
+  
+  .main-panel {
+    padding: 2px; /* Minimalny padding dla bardzo małych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.2rem 0.4rem;
+    min-height: 35px;
+  }
+  
+  .today-content {
+    gap: 0.4rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.6rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.55rem;
+    padding: 0.05rem 0.15rem;
+  }
+  
+  .right-panel {
+    padding: 0.4rem;
+    min-height: 140px;
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Bardzo małe czcionki */
+  .table {
+    font-size: 8px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 7px !important;
+    padding: 0.5px 0.5px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 7px !important;
+    padding: 0.5px 0.5px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 7px !important;
+    padding: 0.5px 0.5px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 6px !important;
+    line-height: 0.8 !important;
+  }
+  
+  /* Bardzo małe przyciski */
+  .btn {
+    padding: 0.3rem 0.5rem;
+    font-size: 0.7rem;
+    min-height: 32px;
+  }
+  
+  .stack .btn {
+    height: 45px;
+    font-size: 0.65rem;
+  }
+  
+  .actions .btn {
+    height: 28px;
+    font-size: 0.6rem;
+  }
+}
+
+/* Ekstremalnie wąskie ekrany - dla 500px i mniejszych */
+@media (max-width: 500px) {
+  .grid3-vertical {
+    gap: 0.1rem 0; /* Odstęp między wierszami, brak między kolumnami */
+    padding: 0; /* Usuwamy padding - tabela bezpośrednio pod headerem */
+  }
+  
+  .main-panel {
+    padding: 2px; /* Minimalny padding dla bardzo małych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.15rem 0.3rem;
+    min-height: 30px;
+  }
+  
+  .today-content {
+    gap: 0.3rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.55rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.5rem;
+    padding: 0.05rem 0.1rem;
+  }
+  
+  .right-panel {
+    padding: 0.3rem;
+    min-height: 120px;
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Ekstremalnie małe czcionki */
+  .table {
+    font-size: 7px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 6px !important;
+    padding: 0.25px 0.25px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 6px !important;
+    padding: 0.25px 0.25px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 6px !important;
+    padding: 0.25px 0.25px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 5px !important;
+    line-height: 0.7 !important;
+  }
+  
+  /* Ekstremalnie małe przyciski */
+  .btn {
+    padding: 0.25rem 0.4rem;
+    font-size: 0.65rem;
+    min-height: 28px;
+  }
+  
+  .stack .btn {
+    height: 48px;
+    font-size: 0.7rem;
+  }
+  
+  .w100 {
+    height: 36px !important;
+    font-size: 0.8rem !important;
+    margin-bottom: 0 !important;
+    padding: 0 1rem !important;
+  }
+  
+  .logout-area .btn {
+    height: 36px !important;
+    font-size: 0.8rem !important;
+    padding: 0 1rem !important;
+  }
+  
+  .actions .btn {
+    height: 24px;
+    font-size: 0.55rem;
+  }
+}
+.card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding: var(--card-pad);
+  min-height:0;
+}
+.muted{color:var(--muted)}
+
+ul{margin:.25rem 0 0 1rem;padding:0}
+h2{margin:0 0 .25rem 0;font-size:1.05rem;line-height:1}
+h2.center{text-align:center}
+h3{margin:.25rem 0 .25rem 0;font-size:.95rem}
+
+/* ===== STYLE DLA NOWEGO GRID ===== */
+
+.logout-area {
+  display: flex;
+  justify-content: center;
+  margin-top: 0;
+  padding: 0.5rem 0;
+  box-sizing: border-box;
+  position: relative;
+  z-index: 1;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Style dla przycisków w nowym układzie */
+.stack .btn {
+  width: 100% !important;
+  height: 70px !important;
+  margin: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  border-width: 2px !important;
+  text-transform: uppercase !important;
+  font-weight: 600 !important;
+  font-size: 0.85rem !important;
+}
+
+.actions .btn {
+  width: 100% !important;
+  height: 28px !important;
+  margin: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  border: none !important;
+  border-radius: 500px !important;
+  text-transform: uppercase !important;
+  font-weight: var(--font-weight-bold) !important;
+  font-size: 11px !important;
+  background: var(--red) !important;
+  color: var(--white) !important;
+  transition: background-color 0.15s ease, transform 0.15s ease !important;
+}
+
+.actions .btn:hover {
+  background: var(--white) !important;
+  color: var(--black) !important;
+  transform: none !important;
+}
+
+.actions .btn:active {
+  background: var(--red) !important;
+  color: var(--white) !important;
+}
+
+/* ===== STYLE DLA TABELI W NOWYM GRID ===== */
+
+/* Tabela w głównym panelu */
+.main-panel .table-wrap {
+  width: 100%;
+  overflow: visible;
+  position: relative;
+}
+
+/* Pozycjonowanie center-panel w grid */
+.center-panel {
+  grid-row: 2; /* Explicitnie ustawiamy na 2. rząd */
+  grid-column: 1; /* Explicitnie ustawiamy na 1. kolumnę */
+}
+
+/* Tabela w center-panel (dla kompatybilności) */
+.center-panel .table-wrap {
+  width: 100%;
+  overflow: visible;
+  position: relative;
+}
+
+.center-panel-no-title .table-wrap {
+  width: 100%;
+  overflow: visible;
+  position: relative;
+}
+
+/* tabela – pionowe linie, 100% szer./wys. */
+.table{
+  width:100%;
+  max-width: 100%; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  height:100%;
+  table-layout:fixed; /* FIXED - kolumny wypełniają całą szerokość */
+  border-collapse:separate;
+  border-spacing:0;
+}
+
+/* Tabela w panelu bez karty */
+.center-panel:not(.card) .table {
+  border-radius: 0;
+  overflow: hidden;
+  max-width: 100%; /* Zapewniamy, że nie przekracza szerokości ekranu */
+}
+.table thead th{
+  background: var(--bg-secondary);
+  height: var(--thead-h);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  color: var(--fg-secondary);
+  font-weight: 800;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 6px 4px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.table thead th:first-child{ border-left:1px solid var(--border) }
+
+/* Nagłówki tabeli w panelu bez karty */
+.center-panel:not(.card) .table thead th:first-child {
+  border-top-left-radius: 0;
+}
+
+.center-panel:not(.card) .table thead th:last-child {
+  border-top-right-radius: 0;
+}
+
+.table td{
+  border-bottom:1px solid var(--border);
+  border-right:1px solid var(--border);
+}
+.table td:first-child{ border-left:1px solid var(--border) }
+
+/* Ostatni wiersz tabeli w panelu bez karty - zaokrąglone rogi na dole */
+.center-panel:not(.card) .table tbody tr:last-child td:first-child {
+  border-bottom-left-radius: 0;
+}
+
+.center-panel:not(.card) .table tbody tr:last-child td:last-child {
+  border-bottom-right-radius: 0;
+}
+
+.table th,.table td{
+  padding: 6px 4px;
+  font-size: 11px;
+  text-align:center;
+  overflow:visible; /* Cała zawartość widoczna */
+  text-overflow:clip; /* Bez ellipsis */
+  white-space:normal; /* Pozwala na zawijanie tekstu */
+  word-wrap: break-word; /* Zawijanie długich słów */
+  word-break: break-word; /* Łamanie długich słów */
+  background: #0a0a0a;
+  min-width: 0; /* Pozwala na zmniejszenie */
+  font-weight: 500;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  color: #ffffff;
+}
+
+/* Komórki tabeli w panelu bez karty */
+.center-panel:not(.card) .table th,
+.center-panel:not(.card) .table td {
+  background: #0a0a0a;
+  border-color: var(--border);
+}
+
+/* Spotify-style slots */
+.slot {
+  cursor: pointer;
+  transition: background-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  border-radius: 0;
+  font-weight: 700;
+  font-size: 12px;
+  position: relative;
+  padding: 1px 0px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  background: #0f0f0f;
+  color: #ffffff;
+}
+
+.slot:hover {
+  background: var(--card-hover) !important;
+  transform: scale(1.02);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+}
+
+.slot:active {
+  background: var(--card) !important;
+}
+
+/* Style dla pustych komórek */
+.slot:empty {
+  background: rgba(255, 255, 255, 0.05) !important;
+  border: 1px dashed rgba(255, 255, 255, 0.1) !important;
+}
+
+.slot:empty:hover {
+  background: rgba(255, 255, 255, 0.1) !important;
+  border: 1px dashed rgba(255, 255, 255, 0.3) !important;
+}
+
+/* weekendy i święta — tylko lewa kolumna (data/dzień); sloty bez zmian */
+.table tbody tr.off-day td,
+.table tbody tr.off-day th{
+  background: #0a0a0a;
+  color: #ffffff;
+  font-style: normal;
+  border: 1px solid var(--border);
+}
+.table tbody tr.off-day td.col-date,
+.table tbody tr.off-day td.col-day,
+.table tbody tr.off-day td.col-summary{
+  color: rgba(180, 180, 180, 0.72);
+  background: transparent;
+  font-style: normal;
+}
+.table tbody tr.off-day td.slot{
+  background: #0f0f0f;
+  color: #ffffff;
+  font-style: normal;
+}
+
+/* Weekendy i święta w panelu bez karty */
+.center-panel:not(.card) .table tbody tr.off-day td,
+.center-panel:not(.card) .table tbody tr.off-day th {
+  background: #0a0a0a;
+  color: #ffffff;
+  font-style: normal;
+  border: 1px solid var(--border);
+}
+.center-panel:not(.card) .table tbody tr.off-day td.col-date,
+.center-panel:not(.card) .table tbody tr.off-day td.col-day,
+.center-panel:not(.card) .table tbody tr.off-day td.col-summary {
+  color: rgba(180, 180, 180, 0.72);
+  background: transparent;
+  font-style: normal;
+}
+.center-panel:not(.card) .table tbody tr.off-day td.slot {
+  background: #0f0f0f;
+  color: #ffffff;
+  font-style: normal;
+}
+
+/* WYSOKOŚĆ WIERSZY:
+   bierzemy wysokość całej siatki i odejmujemy:
+   - tytuł sekcji,
+   - thead (plus jego 2 bordery),
+   - górny i dolny padding karty,
+   - sumę borderów wszystkich wierszy tbody (days * 1px),
+   a resztę dzielimy przez liczbę dni. */
+.table tbody tr{
+  height: calc(
+    (
+      var(--grid-h)
+      - var(--section-title-h)
+      - var(--thead-h) - var(--thead-borders)
+      - (2 * var(--card-pad))
+      - (var(--row-border) * var(--days-count))
+    ) / var(--days-count)
+  );
+}
+
+/* WYSOKOŚĆ WIERSZY dla panelu bez tytułu */
+.center-panel-no-title .table tbody tr{
+  height: calc(
+    (
+      var(--grid-h)
+      - var(--thead-h) - var(--thead-borders)
+      - (2 * var(--card-pad))
+      - (var(--row-border) * var(--days-count))
+    ) / var(--days-count)
+  );
+}
+
+/* WYSOKOŚĆ WIERSZY dla panelu bez karty - równa wysokość */
+.center-panel:not(.card) .table tbody tr {
+  height: 30px; /* Stała wysokość zamiast calc */
+}
+
+/* WYSOKOŚĆ WIERSZY dla głównego panelu w układzie pionowym */
+.main-panel .table tbody tr {
+  height: 30px; /* Stała wysokość zamiast calc */
+}
+
+/* WYSOKOŚĆ WIERSZY dla panelu bez tytułu w układzie pionowym */
+.main-panel.center-panel-no-title .table tbody tr {
+  height: 30px; /* Stała wysokość zamiast calc */
+}
+
+/* szerokości kolumn – dostosowują się do ekranu */
+.col-emp  { min-width: 0; width: auto; max-width: none; }
+.col-date { min-width: 0; width: auto; max-width: none; }
+.col-day  { min-width: 0; width: auto; max-width: none; }
+.col-summary { min-width: 0; width: auto; max-width: none; }
+
+/* Szerokości kolumn - automatyczne skalowanie */
+.center-panel:not(.card) .table .col-emp,
+.main-panel .table .col-emp {
+  width: auto; /* Automatyczne skalowanie */
+  min-width: 0; /* Pozwala na zmniejszenie */
+  max-width: none; /* Usuwamy ograniczenie szerokości */
+}
+
+.center-panel:not(.card) .table .col-date,
+.center-panel:not(.card) .table .col-day,
+.center-panel:not(.card) .table .col-summary,
+.main-panel .table .col-date,
+.main-panel .table .col-day,
+.main-panel .table .col-summary {
+  width: auto; /* Automatyczne skalowanie */
+  min-width: 0; /* Pozwala na zmniejszenie */
+  max-width: none; /* Usuwamy ograniczenie szerokości */
+  background: transparent !important;
+}
+
+/* nagłówki w poziomie */
+.rot{
+  display:inline-block;
+  transform: none;
+  transform-origin: initial;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  word-wrap: break-word;
+  max-width: 100%;
+}
+
+/* wyrównanie zawartości nagłówków kolumn pracowników */
+.table thead th.col-emp{vertical-align: middle; padding-bottom: 0}
+
+/* Dodatkowe style dla ukośnych nagłówków */
+.table thead th.col-emp .rot {
+  font-size: 11px; /* Maksymalna czcionka dla ukośnych nagłówków */
+  line-height: 1.2;
+  padding: 0 2px; /* Dodatkowy padding */
+  transform-origin: bottom left; /* Lepsze pozycjonowanie ukośnego tekstu */
+  white-space: normal; /* Pozwala na zawijanie tekstu */
+  word-break: break-word; /* Łamanie długich słów */
+}
+
+/* ===== STYLE DLA KOLUMN Z IMIENIAMI PRACOWNIKÓW ===== */
+/* Zapewnienie, że imiona są widoczne */
+.table .col-emp {
+  max-width: none; /* Usuwamy ograniczenie szerokości */
+  overflow: visible; /* Cała zawartość widoczna */
+  text-overflow: clip; /* Bez ellipsis */
+  white-space: nowrap; /* Nie pozwala na zawijanie tekstu */
+  overflow: hidden; /* Ukrywa nadmiar tekstu */
+  text-overflow: ellipsis; /* Dodaje ... na końcu */
+  min-width: 0; /* Pozwala na zmniejszenie */
+}
+
+/* Responsywne czcionki dla imion pracowników */
+@media (max-width: 1024px) {
+  .table .col-emp {
+    font-size: 11px;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+  }
+}
+
+@media (max-width: 900px) {
+  .table .col-emp {
+    font-size: 11px;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+  }
+}
+
+@media (max-width: 768px) {
+  .table .col-emp {
+    font-size: 10px;
+    padding: 2px 3px !important;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+  }
+}
+
+@media (max-width: 480px) {
+  .table .col-emp {
+    font-size: 9px;
+    padding: 1px 2px !important;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+  }
+}
+
+@media (max-width: 360px) {
+  .table .col-emp {
+    font-size: 8px;
+    padding: 1px !important;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+  }
+}
+
+/* przyciski */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;
+  padding:.55rem .8rem;border-radius:10px;border:1px solid var(--border);
+  background:var(--card);color:var(--white);cursor:pointer;transition:all 0.2s
+}
+.btn:hover{
+  background: rgba(211, 47, 47, 0.8); 
+  border-color: var(--red);
+  transform: translateY(-1px);
+}
+.btn:active{
+  transform: translateY(0);
+}
+
+/* ===== RESPONSIVE DESIGN ===== */
+
+/* ===== HEADER RESPONSYWNOŚĆ ===== */
+
+/* Duże ekrany - pełny header */
+@media (min-width: 1200px) {
+  .header-bar {
+    padding: 0 1rem;
+    gap: 1rem;
+  }
+  
+  .logo {
+    height: 32px;
+    width: 45px; /* 32 * 1.4 */
+    margin: 20px 1.2rem;
+  }
+  
+  .pwa-btn {
+    padding: 10px 18px;
+    font-size: 13px;
+    min-height: 40px;
+  }
+  
+  .month-label {
+    font-size: 1.1rem;
+  }
+  
+  .nav-btn {
+    width: 36px;
+    height: 36px;
+    font-size: 1.2rem; /* Powiększone strzałki */
+  }
+  
+}
+
+/* Średnie ekrany - kompaktowy header */
+@media (max-width: 1199px) and (min-width: 900px) {
+  .header-bar {
+    padding: 0 0.75rem;
+    gap: 0.75rem;
+  }
+  
+  .logo {
+    height: 28px;
+    width: 39px; /* 28 * 1.4 */
+    margin: 22px 1rem;
+  }
+  
+  .pwa-btn {
+    padding: 8px 14px;
+    font-size: 11px;
+    min-height: 36px;
+  }
+  
+  .month-label {
+    font-size: 0.95rem;
+  }
+  
+  .nav-btn {
+    width: 34px;
+    height: 34px;
+    font-size: 1rem;
+  }
+  
+  
+  .header-right {
+    justify-self: end; /* Przyciski po prawej */
+  }
+  
+  .header-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+/* Wąskie tablety - stopniowe ukrywanie */
+@media (max-width: 899px) and (min-width: 700px) {
+  .header-bar {
+    padding: 0 0.5rem;
+    gap: 0.5rem;
+  }
+  
+  .logo {
+    height: 24px;
+    width: 34px; /* 24 * 1.4 */
+    margin: 24px 0.8rem;
+  }
+  
+  .month-label {
+    font-size: 0.9rem;
+  }
+  
+  .nav-btn {
+    width: 36px;
+    height: 36px;
+    font-size: 1.2rem; /* Powiększone strzałki */
+  }
+  
+  
+  .header-right {
+    justify-self: end; /* Przyciski po prawej */
+  }
+  
+  .header-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+/* Bardzo wąskie ekrany - ukryj prawą stronę */
+@media (max-width: 699px) and (min-width: 600px) {
+  .header-bar {
+    grid-template-columns: 1fr auto 1fr; /* Wycentrowany środkowy panel */
+    padding: 0 0.4rem;
+    gap: 0.4rem;
+  }
+  
+  .logo {
+    height: 20px;
+    width: 28px; /* 20 * 1.4 */
+    margin: 26px 0.6rem;
+  }
+  
+  .month-label {
+    font-size: 0.85rem;
+  }
+  
+  .nav-btn {
+    width: 34px;
+    height: 34px;
+    font-size: 1.1rem; /* Powiększone strzałki */
+  }
+  
+  
+  .header-right {
+    justify-self: end; /* Przyciski po prawej */
+  }
+  
+  .header-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+/* Telefony - kompaktowy header z wszystkimi elementami */
+@media (max-width: 599px) {
+  .site-header {
+    height: 72px; /* Wysokość header */
+  }
+  
+  .header-bar {
+    grid-template-columns: auto 1fr auto; /* Logo+PWA | Miesiąc | Zegar */
+    padding: 0 0.3rem;
+    gap: 0.2rem;
+    align-items: center;
+  }
+  
+  .header-left {
+    display: flex !important; /* Pokazujemy logo i przycisk PWA */
+    align-items: center;
+    gap: 0.3rem;
+    justify-self: start;
+    flex-shrink: 0;
+  }
+  
+  .header-right {
+    display: flex !important; /* Pokazujemy zegar */
+    align-items: center;
+    justify-self: end;
+    flex-shrink: 0;
+  }
+  
+  .spotify-btn {
+    width: 36px;
+    height: 36px;
+  }
+  
+  .spotify-download-btn {
+    padding: 6px 10px;
+    font-size: 0.8rem;
+  }
+  
+  .hamburger-menu-btn {
+    width: 36px;
+    height: 36px;
+  }
+  
+  .hamburger-icon {
+    width: 18px;
+    height: 14px;
+  }
+  
+  .header-center {
+    justify-self: center;
+    gap: 0.5rem;
+    min-width: 0; /* Pozwala na skracanie */
+  }
+  
+  
+  .logo {
+    height: 18px;
+    width: 25px; /* 18 * 1.4 */
+    margin: 27px 0.5rem;
+  }
+  
+  .month-label {
+    font-size: 0.9rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  
+  .nav-btn {
+    width: 32px;
+    height: 32px;
+    font-size: 1rem; /* Powiększone strzałki */
+  }
+  
+}
+
+/* Bardzo małe telefony */
+@media (max-width: 480px) {
+  .site-header {
+    height: 72px; /* Wysokość header */
+  }
+  
+  .header-bar {
+    padding: 0 0.25rem;
+    gap: 0.15rem;
+  }
+  
+  .header-left {
+    gap: 0.2rem;
+  }
+  
+  .header-center {
+    gap: 0.4rem;
+  }
+  
+  .logo {
+    height: 16px;
+    width: 22px; /* 16 * 1.4 */
+    margin: 28px 0.4rem;
+  }
+  
+  
+  .month-label {
+    font-size: 0.85rem;
+  }
+  
+  .nav-btn {
+    width: 30px;
+    height: 30px;
+    font-size: 0.9rem; /* Powiększone strzałki */
+  }
+  
+}
+
+/* Bardzo małe ekrany */
+@media (max-width: 360px) {
+  .site-header {
+    height: 72px; /* Wysokość header */
+  }
+  
+  .header-bar {
+    padding: 0 0.1rem;
+    gap: 0.1rem;
+  }
+  
+  .header-left {
+    gap: 0.15rem;
+  }
+  
+  .header-center {
+    gap: 0.3rem;
+  }
+  
+  .logo {
+    height: 14px;
+    width: 20px; /* 14 * 1.4 */
+    margin: 29px 0.3rem;
+  }
+  
+  .pwa-btn {
+    padding: 6px 10px;
+    font-size: 10px;
+    min-height: 32px;
+    gap: 4px;
+  }
+  
+  .pwa-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+  
+  .month-label {
+    font-size: 0.8rem;
+  }
+  
+  .nav-btn {
+    width: 28px;
+    height: 28px;
+    font-size: 0.8rem; /* Powiększone strzałki */
+  }
+  
+}
+
+/* Orientacja landscape na telefonach */
+@media (max-width: 768px) and (orientation: landscape) {
+  .site-header {
+    height: 72px; /* Wysokość header */
+  }
+  
+  .header-bar {
+    padding: 0 0.5rem;
+  }
+  
+  .month-label {
+    font-size: 0.9rem;
+  }
+  
+  .nav-btn {
+    width: 36px;
+    height: 36px;
+    font-size: 1.2rem; /* Powiększone strzałki */
+  }
+}
+
+/* Tablet - średnie ekrany */
+@media (max-width: 1024px) {
+  .grid3-vertical {
+    gap: 0.75rem 0; /* Odstęp między wierszami, brak między kolumnami */
+  }
+  
+  .card {
+    padding: 1rem;
+  }
+  
+  .today-bar {
+    padding: 1rem;
+  }
+  
+  .today-content {
+    gap: 1.5rem;
+  }
+  
+  .table th, .table td {
+    font-size: 11px;
+    padding: 2px 3px;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+    white-space: nowrap; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word; /* Zawijanie długich słów */
+    word-break: break-word; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 10px;
+  }
+}
+
+/* Tablet - małe ekrany - nowy układ pionowy */
+@media (max-width: 900px) {
+  .grid3-vertical {
+    gap: 0 0.5rem; /* Usuwamy przerwę między paskiem a tabelą */
+  }
+  
+  .main-panel {
+    padding: 4px; /* Jeszcze mniejszy padding dla węższych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.75rem;
+  }
+  
+  .today-content {
+    gap: 1rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.9rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.8rem;
+    padding: 0.15rem 0.4rem;
+  }
+  
+  .right-panel {
+    padding: 0.75rem;
+    min-height: 200px;
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Dostosowanie tabeli do węższych ekranów */
+  .table {
+    font-size: 11px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 10px !important;
+    padding: 2px 3px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day {
+    font-size: 10px !important;
+    padding: 2px 3px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table th, .table td {
+    padding: 2px 3px !important;
+    font-size: 10px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 9px !important;
+    line-height: 1.0 !important;
+  }
+}
+
+/* Mobile - duże telefony - nowy układ pionowy */
+@media (max-width: 768px) {
+  .wrap {
+    padding: 0; /* Usuwamy padding - zawartość ma się mieścić w 100% ekranu */
+    margin: 0 auto;
+  }
+  
+  .grid3-vertical {
+    gap: 0 0.4rem; /* Usuwamy przerwę między paskiem a tabelą */
+  }
+  
+  .main-panel {
+    padding: 4px; /* Jeszcze mniejszy padding dla węższych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.5rem;
+  }
+  
+  .today-content {
+    gap: 0.8rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.85rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.75rem;
+    padding: 0.1rem 0.3rem;
+  }
+  
+  .right-panel {
+    padding: 0.5rem;
+    min-height: 180px;
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Dostosowanie tabeli do telefonów */
+  .table {
+    font-size: 10px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 9px !important;
+    padding: 2px 2px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 9px !important;
+    padding: 2px 2px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 9px !important;
+    padding: 2px 2px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 8px !important;
+    line-height: 1.0 !important;
+  }
+  
+  .btn {
+    padding: 0.6rem 0.8rem;
+    font-size: 0.9rem;
+    min-height: 44px;
+  }
+  
+  .stack .btn {
+    height: 60px;
+    font-size: 0.8rem;
+  }
+  
+  .actions .btn {
+    height: 40px;
+    font-size: 0.75rem;
+  }
+}
+
+/* Mobile - małe telefony - nowy układ pionowy */
+@media (max-width: 480px) {
+  .wrap {
+    padding: 0; /* Usuwamy padding - zawartość ma się mieścić w 100% ekranu */
+    margin: 0 auto;
+  }
+  
+  .grid3-vertical {
+    gap: 0 0.3rem; /* Usuwamy przerwę między paskiem a tabelą */
+  }
+  
+  .main-panel {
+    padding: 4px; /* Jeszcze mniejszy padding dla węższych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.4rem;
+  }
+  
+  .today-content {
+    gap: 0.6rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.8rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.25rem;
+  }
+  
+  .right-panel {
+    padding: 0.4rem;
+    min-height: 160px;
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Dostosowanie tabeli do małych telefonów */
+  .table {
+    font-size: 9px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 8px !important;
+    padding: 1px 1px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 8px !important;
+    padding: 1px 1px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 8px !important;
+    padding: 1px 1px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 7px !important;
+    line-height: 0.9 !important;
+  }
+  
+  .btn {
+    padding: 0.5rem 0.7rem;
+    font-size: 0.85rem;
+    border-radius: 8px;
+    min-height: 44px;
+  }
+  
+  .stack .btn {
+    height: 55px;
+    font-size: 0.75rem;
+  }
+  
+  .actions .btn {
+    height: 40px;
+    font-size: 0.7rem;
+  }
+  
+  h2 {
+    font-size: 0.95rem;
+  }
+  
+  h3 {
+    font-size: 0.85rem;
+  }
+}
+
+/* Mobile - bardzo małe telefony - nowy układ pionowy */
+@media (max-width: 360px) {
+  .wrap {
+    padding: 0; /* Usuwamy padding - zawartość ma się mieścić w 100% ekranu */
+    margin: 0 auto;
+  }
+  
+  .grid3-vertical {
+    gap: 0 0.2rem; /* Usuwamy przerwę między paskiem a tabelą */
+  }
+  
+  .main-panel {
+    padding: 4px; /* Jeszcze mniejszy padding dla węższych ekranów */
+  }
+  
+  .today-bar {
+    padding: 0.3rem;
+  }
+  
+  .today-content {
+    gap: 0.4rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.75rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.65rem;
+    padding: 0.05rem 0.2rem;
+  }
+  
+  .right-panel {
+    padding: 0.3rem;
+    min-height: 140px;
+    min-width: 0; /* Pozwala na zmniejszenie poniżej zawartości */
+    height: auto; /* Wysokość dostosowuje się do zawartości */
+    overflow: visible; /* Cała zawartość widoczna */
+  }
+  
+  /* Dostosowanie tabeli do bardzo małych telefonów */
+  .table {
+    font-size: 8px !important;
+    max-width: 100% !important; /* Zapewniamy, że nie przekracza szerokości ekranu */
+  }
+  
+  .table .col-emp {
+    font-size: 7px !important;
+    padding: 0.5px 0.5px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+  }
+  
+  .table .col-date,
+  .table .col-day,
+  .table .col-summary {
+    font-size: 7px !important;
+    padding: 0.5px 0.5px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    background: transparent !important;
+  }
+  
+  .table th, .table td {
+    font-size: 7px !important;
+    padding: 0.5px 0.5px !important;
+    min-width: 0 !important; /* Pozwala na zmniejszenie */
+    max-width: none !important; /* Usuwamy ograniczenie szerokości */
+    white-space: normal !important; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word !important; /* Zawijanie długich słów */
+    word-break: break-word !important; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 6px !important;
+    line-height: 0.8 !important;
+  }
+  
+  .btn {
+    padding: 0.4rem 0.6rem;
+    font-size: 0.8rem;
+    border-radius: 6px;
+    min-height: 44px;
+  }
+  
+  .stack .btn {
+    height: 50px;
+    font-size: 0.7rem;
+  }
+  
+  .actions .btn {
+    height: 40px;
+    font-size: 0.65rem;
+  }
+}
+
+/* Landscape orientation dla telefonów */
+@media (max-width: 768px) and (orientation: landscape) {
+  .grid3-vertical {
+    gap: 0 0.3rem; /* Usuwamy przerwę między paskiem a tabelą */
+  }
+  
+  .today-bar {
+    padding: 0.4rem;
+  }
+  
+  .today-content {
+    gap: 0.6rem;
+  }
+  
+  .wrap {
+    margin: 0 auto; /* Usunięty margines pionowy */
+  }
+}
+
+/* Touch-friendly improvements */
+@media (hover: none) and (pointer: coarse) {
+  .btn, .nav-btn {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  
+  .table .slot {
+    min-height: 44px;
+  }
+  
+  .nav-btn {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+/* High DPI displays */
+@media (-webkit-min-device-pixel-ratio: 2), (min-resolution: 192dpi) {
+  .table th, .table td {
+    border-width: 0.5px;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+    white-space: nowrap; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word; /* Zawijanie długich słów */
+    word-break: break-word; /* Łamanie długich słów */
+  }
+  
+  .card {
+    border-width: 0.5px;
+  }
+}
+
+/* ===== JAVASCRIPT RESPONSIVE CLASSES ===== */
+
+/* Klasa dla widoku mobilnego */
+body.mobile-view .grid3-vertical {
+  gap: 0 0.5rem; /* Usuwamy przerwę między paskiem a tabelą */
+}
+
+body.mobile-view .card {
+  padding: 0.75rem;
+}
+
+body.mobile-view .today-bar {
+  padding: 0.75rem;
+}
+
+body.mobile-view .today-content {
+  gap: 1rem;
+}
+
+body.mobile-view .table-wrap {
+  overflow-x: hidden; /* Usuwamy poziomy scroll */
+  -webkit-overflow-scrolling: touch;
+}
+
+body.mobile-view .table {
+  min-width: 0; /* Pozwala na skalowanie */
+  width: 100%; /* Zajmuje całą dostępną szerokość */
+  max-width: 100%; /* Zapewniamy, że nie przekracza szerokości ekranu */
+}
+
+/* JavaScript responsive classes - header handled by CSS media queries */
+
+/* Klasa dla widoku tablet */
+body.tablet-view .grid3-vertical {
+  gap: 0 0.75rem; /* Usuwamy przerwę między paskiem a tabelą */
+}
+
+body.tablet-view .card {
+  padding: 1rem;
+}
+
+body.tablet-view .today-bar {
+  padding: 1rem;
+}
+
+body.tablet-view .today-content {
+  gap: 1.5rem;
+}
+
+/* Klasa dla orientacji landscape na mobile */
+body.landscape-mode .grid3-vertical {
+  gap: 0.3rem;
+}
+
+body.landscape-mode .today-bar {
+  padding: 0.4rem;
+}
+
+body.landscape-mode .today-content {
+  gap: 0.6rem;
+}
+
+/* Landscape mode - header handled by CSS media queries */
+
+body.landscape-mode .wrap {
+  margin: 0 auto; /* Usunięty margines pionowy */
+}
+
+/* Animacje dla responsywności */
+.grid3-vertical, .card, .table-wrap, .today-bar {
+  transition: background-color 0.2s ease, transform 0.2s ease;
+}
+
+/* Touch-friendly improvements dla JavaScript */
+body.mobile-view .btn,
+body.mobile-view .nav-btn {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+body.mobile-view .table .slot {
+  min-height: 44px;
+}
+
+/* Dodatkowe style dla responsywności tabeli */
+@media (max-width: 768px) {
+  .table-wrap {
+    position: relative;
+  }
+  
+  /* Usunięte czerwone gówno "przesuń w prawo" */
+}
+
+/* Poprawki dla bardzo małych ekranów */
+@media (max-width: 360px) {
+  .today-bar {
+    padding: 0.3rem;
+  }
+  
+  .today-content {
+    gap: 0.4rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.75rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.65rem;
+    padding: 0.05rem 0.2rem;
+  }
+  
+  .table th, .table td {
+    font-size: 8px;
+    padding: 0.5px;
+    min-width: 0; /* Pozwala na zmniejszenie */
+    max-width: none; /* Usuwamy ograniczenie szerokości */
+    white-space: nowrap; /* Pozwala na zawijanie tekstu */
+    word-wrap: break-word; /* Zawijanie długich słów */
+    word-break: break-word; /* Łamanie długich słów */
+  }
+  
+  .rot {
+    font-size: 6px;
+    line-height: 0.8;
+  }
+}
+
+/* Ukryj elementy na bardzo małych ekranach - handled by main header media queries */
+
+/* --- slot editor (inline overlay) - Spotify style --- */
+.slot-editor{
+  position:absolute; z-index:10; background:var(--card); border:1px solid var(--border);
+  border-radius:8px; padding:8px; width:100px; display:none;
+  box-shadow:0 8px 32px rgba(0,0,0,.4);
+  /* backdrop-filter: blur(10px); - Wyłączone dla lepszej wydajności */
+}
+
+/* Slot editor w panelu bez karty */
+.center-panel:not(.card) .slot-editor {
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 24px rgba(0,0,0,.35);
+}
+.slot-editor .row{display:flex; gap:6px; margin-bottom:6px}
+.slot-editor .row:last-child{margin-bottom:0}
+/* Przyciski w slot-editor - styl z menu burgerowego */
+.slot-editor .opt {
+  flex: 1;
+  padding: 0.35rem 0;
+  border-radius: 500px;
+  border: none;
+  background: #2a2a2a !important; /* Szary jak w menu burgerowym */
+  color: #ffffff !important; /* Biały tekst widoczny od razu */
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-weight: 600;
+  font-size: 0.8rem !important; /* Zmniejszona czcionka */
+  position: relative;
+  overflow: hidden;
+  z-index: 10; /* Tekst nad pseudo-elementem */
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 0.3rem !important; /* Odstęp między ikonką a tekstem */
+}
+
+/* Style dla ikon w slot editorze */
+.slot-editor .opt svg {
+  flex-shrink: 0 !important;
+  z-index: 10 !important;
+}
+
+.slot-editor .opt.center {
+  flex: 1;
+  margin: 0 2px;
+}
+
+.slot-editor .opt::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1; /* Zmienione na -1 żeby było za tekstem */
+  background: #2a2a2a;
+  transform: skew(30deg);
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1);
+}
+
+.slot-editor .opt:hover {
+  background: #ff0000 !important; /* Czerwony jak w menu burgerowym */
+  color: #ffffff !important;
+  transform: translateY(-2px);
+}
+
+.slot-editor .opt:hover::before {
+  transform: translate3d(100%, 0, 0);
+}
+.slot-editor input{width:100%; padding:.3rem .4rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--white)}
+.slot-editor.show{display:block !important}
+
+/* Klasa .show dla wszystkich elementów */
+.show {
+  display: block !important;
+}
+
+.show.flex {
+  display: flex !important;
+}
+
+.show.inline-flex {
+  display: inline-flex !important;
+}
+
+/* Responsywność slot editor */
+@media (max-width: 768px) {
+  .slot-editor {
+    width: 120px;
+    padding: 8px;
+  }
+  
+  .slot-editor .opt {
+    padding: 0.5rem 0;
+    font-size: 14px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  .slot-editor input {
+    padding: 0.5rem;
+    font-size: 16px;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 480px) {
+  .slot-editor {
+    width: 100px;
+    padding: 6px;
+  }
+  
+  .slot-editor .opt {
+    padding: 0.4rem 0;
+    font-size: 13px;
+    min-height: 40px;
+  }
+  
+  .slot-editor input {
+    padding: 0.4rem;
+    font-size: 16px;
+    min-height: 40px;
+  }
+}
+/* swap compose inline under table */
+.swap-compose{display:none; margin-top:.5rem; gap:.5rem}
+.swap-compose.show{display:flex}
+.swap-compose input{flex:1; min-width:0; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--white); padding:.35rem .5rem}
+
+/* Swap compose w panelu bez karty */
+.center-panel:not(.card) .swap-compose {
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 2px);
+  margin-left: var(--card-pad);
+  margin-right: var(--card-pad);
+  margin-bottom: var(--card-pad);
+}
+
+/* --- Login Screen Styles --- */
+.signin-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+  background: var(--bg);
+}
+
+.signin-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3rem 2rem;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+  max-width: 450px;
+  width: 100%;
+  text-align: center;
+}
+
+.signin-logo {
+  margin: 0 auto 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.signin-logo img {
+  max-width: 200px;
+  height: auto;
+  display: block;
+}
+
+.signin-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  color: var(--fg);
+}
+
+.signin-subtitle {
+  color: var(--fg);
+  margin-bottom: 2rem;
+  font-size: 1rem;
+}
+
+.google-signin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 24px;
+  background: var(--red);
+  color: var(--white);
+  text-decoration: none;
+  border-radius: 12px;
+  font-weight: 500;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  width: 100%;
+  margin-bottom: 1rem;
+}
+
+.google-signin-btn:hover {
+  background: rgba(211, 47, 47, 0.8);
+  transform: translateY(-1px);
+}
+
+.google-signin-btn svg {
+  width: 20px;
+  height: 20px;
+  margin-right: 12px;
+}
+
+.error-message {
+  background: rgba(211, 47, 47, 0.05);
+  color: var(--red);
+  padding: 1rem;
+  border-radius: 12px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  border: 1px solid rgba(211, 47, 47, 0.2);
+}
+
+.info-message {
+  color: var(--fg);
+  font-size: 0.9rem;
+  line-height: 1.4;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Auth Tabs */
+.auth-tabs {
+  display: flex;
+  margin-bottom: 2rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab-button {
+  flex: 1;
+  padding: 12px 16px;
+  background: none;
+  border: none;
+  color: var(--fg-secondary);
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border-bottom: 2px solid transparent;
+}
+
+.tab-button:hover {
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tab-button.active {
+  color: var(--red);
+  border-bottom-color: var(--red);
+  background: rgba(255, 0, 0, 0.05);
+}
+
+.tab-content {
+  display: none;
+}
+
+.tab-content.active {
+  display: block;
+}
+
+/* Auth Forms */
+.auth-form {
+  margin-bottom: 1.5rem;
+}
+
+.auth-form h3 {
+  color: var(--fg);
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  text-align: center;
+}
+
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.form-group input {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font-size: 16px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  box-sizing: border-box;
+}
+
+.form-group input:focus {
+  outline: none;
+  border-color: var(--red);
+}
+
+.form-group input::placeholder {
+  color: var(--fg-secondary);
+}
+
+.auth-btn {
+  width: 100%;
+  padding: 12px 24px;
+  background: var(--red);
+  color: var(--white);
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-top: 0.5rem;
+}
+
+.auth-btn:hover {
+  background: var(--red-hover);
+  transform: translateY(-1px);
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  margin: 1.5rem 0;
+  color: var(--fg-secondary);
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.auth-divider span {
+  padding: 0 1rem;
+  font-size: 14px;
+  background: var(--card);
+}
+
+/* Email Tabs */
+.email-tabs {
+  display: none;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.email-tab-content {
+  display: none;
+}
+
+.email-tab-content.active {
+  display: block;
+}
+
+/* Password Group */
+.password-group {
+  position: relative;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  transition: color 0.2s ease;
+}
+
+.password-toggle:hover {
+  color: var(--fg);
+}
+
+.eye-icon {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+/* Responsive dla strony logowania */
+@media (max-width: 768px) {
+  .signin-container {
+    padding: 1rem;
+  }
+  
+  .signin-card {
+    padding: 2rem 1.5rem;
+    max-width: 400px;
+  }
+  
+  .signin-logo img {
+    max-width: 180px;
+  }
+  
+  .signin-title {
+    font-size: 1.6rem;
+  }
+  
+  .signin-subtitle {
+    font-size: 0.9rem;
+  }
+  
+  .google-signin-btn {
+    padding: 14px 20px;
+    font-size: 15px;
+  }
+}
+
+@media (max-width: 480px) {
+  .signin-container {
+    padding: 0.75rem;
+  }
+  
+  .signin-card {
+    padding: 1.5rem 1rem;
+    max-width: 350px;
+  }
+  
+  .signin-logo img {
+    max-width: 160px;
+  }
+  
+  .signin-title {
+    font-size: 1.4rem;
+  }
+  
+  .signin-subtitle {
+    font-size: 0.85rem;
+  }
+  
+  .google-signin-btn {
+    padding: 12px 18px;
+    font-size: 14px;
+  }
+  
+  .google-signin-btn svg {
+    width: 18px;
+    height: 18px;
+    margin-right: 10px;
+  }
+}
+
+@media (max-width: 360px) {
+  .signin-card {
+    padding: 1.25rem 0.75rem;
+    max-width: 320px;
+  }
+  
+  .signin-logo img {
+    max-width: 140px;
+  }
+  
+  .signin-title {
+    font-size: 1.3rem;
+  }
+  
+  .google-signin-btn {
+    padding: 10px 16px;
+    font-size: 13px;
+  }
+}
+
+/* --- Ukrycie kursora tekstowego w grafiku --- */
+.table .slot:focus {
+  outline: none;       /* Brak outline przy focus */
+}
+
+.table th:focus,
+.table td:focus,
+.table .rot:focus,
+.table .col-date:focus,
+.table .col-day:focus,
+.table .col-emp:focus,
+.table .col-summary:focus {
+  outline: none;       /* Brak outline przy focus */
+}
+
+/* --- Ukrycie kursora tekstowego na całej stronie --- */
+/* Przyciski i elementy interaktywne */
+.btn:hover,
+.nav-btn:hover {
+  cursor: pointer;  /* Kursor pointer dla przycisków */
+}
+
+/* --- Klasa .hidden dla ukrywania elementów --- */
+.hidden {
+  display: none !important;
+}
+
+/* Dodatkowe zabezpieczenie dla przycisków z klasą hidden */
+.hidden.btn,
+.hidden.btn-secondary,
+button.hidden,
+#toggle-draft-mode.hidden {
+  display: none !important;
+}
+
+/* --- Klasa .show ma wyższy priorytet niż .hidden --- */
+.hidden.show {
+  display: block !important;
+}
+
+.hidden.show.flex {
+  display: flex !important;
+}
+
+.hidden.show.inline-flex {
+  display: inline-flex !important;
+}
+
+/* --- Style dla strony offline --- */
+.offline-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+  background: var(--bg);
+  text-align: center;
+}
+
+.offline-icon {
+  font-size: 4rem;
+  margin-bottom: 1rem;
+  color: var(--muted);
+}
+
+.offline-title {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: var(--fg);
+}
+
+.offline-message {
+  color: var(--fg);
+  margin-bottom: 2rem;
+  font-size: 1rem;
+  line-height: 1.5;
+  max-width: 400px;
+}
+
+.retry-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.75rem 1.5rem;
+  background: var(--red);
+  color: var(--white);
+  text-decoration: none;
+  border-radius: 8px;
+  font-weight: 500;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.retry-btn:hover {
+  background: rgba(211, 47, 47, 0.8);
+  transform: translateY(-1px);
+}
+
+/* Responsive dla strony offline */
+@media (max-width: 480px) {
+  .offline-container {
+    padding: 1rem;
+  }
+  
+  .offline-icon {
+    font-size: 3rem;
+  }
+  
+  .offline-title {
+    font-size: 1.3rem;
+  }
+  
+  .offline-message {
+    font-size: 0.9rem;
+  }
+}
+
+/* --- Animacje edycji grafiku --- */
+/* Czerwone pulsowanie podczas edycji */
+.slot.editing {
+  /* animation: pulse-red 1.5s ease-in-out infinite; - Wyłączone dla lepszej wydajności */
+  background: var(--red) !important;
+  border: 2px solid var(--red) !important;
+  transition: background-color 0.05s ease, color 0.05s ease !important;
+}
+
+@keyframes pulse-red {
+  0% {
+    background-color: rgba(255, 0, 0, 0.05);
+  }
+  50% {
+    background-color: rgba(255, 0, 0, 0.1);
+  }
+  100% {
+    background-color: rgba(255, 0, 0, 0.05);
+  }
+}
+
+/* Białe mryganie po zapisaniu */
+.slot.saved {
+  /* animation: flash-white 0.8s ease-in-out; - Wyłączone dla lepszej wydajności */
+  background: var(--green) !important;
+  border: 2px solid var(--green) !important;
+}
+
+@keyframes flash-white {
+  0% {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+  50% {
+    background-color: rgba(255, 255, 255, 0.3);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+/* Czerwone mryganie po usunięciu */
+.slot.deleted {
+  /* animation: flash-red 0.8s ease-in-out; - Wyłączone dla lepszej wydajności */
+  background: var(--red) !important;
+  border: 2px solid var(--red) !important;
+}
+
+@keyframes flash-red {
+  0% {
+    background-color: rgba(255, 0, 0, 0.1);
+  }
+  50% {
+    background-color: rgba(255, 0, 0, 0.3);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+/* --- Styl dla zaznaczonych komórek w wielokrotnym wyborze --- */
+.slot.selected {
+  background-color: rgba(255, 0, 0, 0.05) !important;  /* Czerwone tło */
+  border: 1px solid rgba(255, 0, 0, 0.3) !important;  /* Czerwona ramka */
+}
+
+.slot.selected.editing {
+  background-color: rgba(255, 0, 0, 0.05) !important;  /* Czerwone tło dla edytowanych */
+  border: 1px solid rgba(255, 0, 0, 0.3) !important;  /* Czerwona ramka */
+}
+
+/* Responsive adjustments */
+@media (max-width: 480px) {
+  .login-card {
+    padding: 2rem 1.5rem;
+  }
+  
+  .login-title {
+    font-size: 2rem;
+  }
+  
+  .login-btn {
+    padding: 0.875rem 1.25rem;
+    font-size: 1rem;
+  }
+}
+
+
+/* Modal system - 70% screen width */
+.emp-editor,
+#swap-editor,
+#compose-editor,
+#give-editor,
+#unavailability-modal,
+#shifts-editor {
+  position: fixed; 
+  inset: 0; 
+  display: none; 
+  align-items: center; 
+  justify-content: center; 
+  z-index: 10002; /* Najwyższy - nad menu hamburger (10001) */
+  /* backdrop-filter: blur(8px); - Wyłączone dla lepszej wydajności */
+  will-change: transform, opacity;
+  transform: translateZ(0); /* Wymusza hardware acceleration */
+}
+.emp-editor.show,
+#swap-editor.show {
+  display: flex !important;
+  align-items: flex-start !important;
+  justify-content: center !important;
+  padding-top: 0 !important;
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  width: 100vw !important;
+  height: auto !important;
+}
+
+#compose-editor.show,
+#give-editor.show,
+#unavailability-modal.show,
+#shifts-editor.show {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+.emp-editor::before,
+#swap-editor::before,
+#compose-editor::before,
+#give-editor::before,
+#unavailability-modal::before,
+#shifts-editor::before {
+  content: ""; 
+  position: absolute; 
+  inset: 0; 
+  background: rgba(0, 0, 0, 0.7);
+  /* backdrop-filter: blur(4px); - Wyłączone dla lepszej wydajności */
+}
+.emp-editor > *,
+#swap-editor > *,
+#compose-editor > *,
+#give-editor > *,
+#unavailability-modal > *,
+#shifts-editor > * {position: relative; z-index: 1;}
+
+/* Modal container - 80% of viewport width, full height from top */
+.emp-editor .emp-container {
+  position: relative; 
+  background: #000000;
+  background-image: radial-gradient(ellipse 100% 50% at 50% 100%, rgba(139, 0, 0, 0.9) 0%, transparent 70%);
+  border: none; 
+  border-radius: 0 0 16px 16px; 
+  padding: 1rem 2rem 2rem 2rem;
+  width: 80vw;
+  height: auto;
+  max-width: none;
+  min-width: none;
+  max-height: none;
+  overflow: visible;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  animation: modalSlideInFromTop 0.3s ease-out;
+  will-change: transform, opacity;
+  transform: translateZ(0);
+  margin: 0 auto;
+  font-family: var(--font);
+  color: #ffffff !important;
+  font-weight: 800 !important;
+}
+
+/* Panel skrzynki ma identyczny styl jak panel pracowników */
+#swap-editor .emp-container {
+  position: relative; 
+  background: #000000;
+  background-image: radial-gradient(ellipse 100% 50% at 50% 100%, rgba(139, 0, 0, 0.9) 0%, transparent 70%);
+  border: none; 
+  border-radius: 0 0 16px 16px; 
+  padding: 1rem 2rem 2rem 2rem;
+  width: 80vw;
+  height: auto;
+  max-width: none;
+  min-width: none;
+  max-height: none;
+  overflow: visible;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  animation: modalSlideInFromTop 0.3s ease-out;
+  will-change: transform, opacity;
+  transform: translateZ(0);
+  margin: 0 auto;
+  font-family: var(--font);
+  color: #ffffff !important;
+  font-weight: 800 !important;
+}
+
+/* Inne modale zachowują poprzedni styl */
+#compose-editor .emp-container,
+#give-editor .emp-container {
+  position: relative; 
+  background: var(--card); 
+  border: 1px solid var(--border); 
+  border-radius: 16px; 
+  padding: 2rem;
+  width: 70vw;
+  height: 70vh;
+  max-width: none;
+  min-width: none;
+  max-height: none;
+  overflow-y: auto;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  animation: modalSlideIn 0.2s ease-out;
+  will-change: transform, opacity;
+  transform: translateZ(0);
+}
+
+/* Unavailability modal - auto height, no scrolling */
+#unavailability-modal .emp-container {
+  position: relative; 
+  background: var(--card); 
+  border: 1px solid var(--border); 
+  border-radius: 16px; 
+  padding: 1.5rem;
+  width: 70vw;
+  height: auto;
+  max-width: 600px;
+  min-width: 400px;
+  max-height: 90vh;
+  overflow: visible;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  animation: modalSlideIn 0.2s ease-out;
+  will-change: transform, opacity;
+  transform: translateZ(0); /* Hardware acceleration */
+  display: flex;
+  flex-direction: column;
+}
+
+@keyframes modalSlideIn {
+  from {
+    opacity: 0;
+    transform: scale(0.9) translateY(-20px) translateZ(0);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0) translateZ(0);
+  }
+}
+
+@keyframes modalSlideInFromTop {
+  from {
+    transform: translateY(-100%) translateZ(0);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0) translateZ(0);
+    opacity: 1;
+  }
+}
+
+/* Modal header */
+.emp-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid #fff;
+}
+
+.emp-header h3 {
+  font-family: var(--font);
+  color: var(--white);
+  font-size: 1.2rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin: 0;
+}
+
+/* Nowy układ panelu pracowników */
+.emp-list-section {
+  margin-bottom: 1rem;
+  margin-top: 0;
+}
+
+/* Stare style h3 usunięte - przeniesione do emp-header */
+
+.emp-list-section .emp-list {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin: 0;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.emp-add-section {
+  margin-bottom: 1rem;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+}
+
+.emp-add-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 2px solid #fff;
+}
+
+.emp-add-header h3 {
+  color: var(--white);
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0;
+  font-family: inherit;
+}
+
+.emp-add-section .emp-add {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr auto;
+  gap: 0.75rem;
+  align-items: end;
+  margin: 0;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.emp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.emp-field label {
+  color: var(--white);
+  font-weight: 700;
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  text-align: center;
+  letter-spacing: 1px;
+}
+
+.emp-field input {
+  padding: 8px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--white);
+  font-size: 16px;
+  font-weight: 700;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+.emp-field input:focus {
+  outline: none;
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: translate3d(0, -1px, 0);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.emp-field input:hover {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: translate3d(0, -1px, 0);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.emp-field select,
+.emp-field textarea {
+  padding: 8px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--white);
+  font-size: 16px;
+  font-weight: 700;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+  font-family: inherit;
+}
+
+.emp-field select:focus,
+.emp-field textarea:focus {
+  outline: none;
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: translate3d(0, -1px, 0);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.emp-field select:hover,
+.emp-field textarea:hover {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: translate3d(0, -1px, 0);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.emp-field textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+
+/* Styl dla braku próśb w skrzynce */
+.no-requests {
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 2rem;
+  grid-column: 1 / -1;
+}
+
+/* Liczba pracowników */
+.emp-count {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.emp-count strong {
+  color: var(--white);
+  font-weight: 600;
+}
+
+/* Modal content areas - usunięte stare style dla emp-list */
+
+/* Stare style emp-add usunięte - zastąpione przez emp-add-section */
+
+/* Stare style usunięte */
+
+/* Style dla przycisku dodawania pracownika */
+#emp-add-btn {
+  background: #ffffff;
+  border: 1px solid #ffffff;
+  color: #000000;
+  font-weight: 600;
+  font-size: 0.7rem;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+  min-width: 60px;
+  align-self: end;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  height: calc(0.75rem + 0.75rem + 1rem + 2px);
+}
+#emp-add-btn:hover {
+  background: #000000;
+  border-color: #000000;
+  color: #ffffff;
+  transform: scale(1.05);
+}
+#emp-add-btn:active {
+  transform: scale(0.95);
+}
+#emp-add-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+.emp-editor .email-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.emp-editor .btn-remove {
+  background: #f44336 !important;
+  color: white !important;
+}
+
+.emp-editor .btn-remove:hover {
+  background: #d32f2f !important;
+}
+
+/* Stare style inputów usunięte - zastąpione przez emp-field */
+
+/* Close button - better positioned */
+.emp-editor .emp-close{
+  background: transparent;
+  border: none;
+  color: var(--white);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  position: relative;
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.emp-editor .emp-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  transform: translate3d(0, 0, 0) scale(1.02);
+}
+
+.emp-editor .emp-close:active {
+  transform: translate3d(0, 0, 0) scale(0.95);
+}
+
+/* Click outside to close */
+.emp-editor::before {
+  cursor: pointer;
+}
+
+/* Stare style usunięte */
+
+.swap-clear-btn {
+  display: none;
+}
+
+.swap-clear-btn.show {
+  display: inline-flex !important;
+}
+
+.emp-row{
+  display:flex; 
+  justify-content: space-between;
+  align-items: flex-start;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px; 
+  padding: 8px 16px;
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 0;
+  height: 80px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+.emp-row:hover {
+  background: rgba(255, 255, 255, 0.2) !important;
+  border-color: rgba(255, 255, 255, 0.5) !important;
+  transform: translate3d(0, -1px, 0) !important;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3) !important;
+}
+
+.emp-row .emp-name-display {
+  color: var(--white) !important;
+  font-weight: 700 !important;
+  font-size: 20px !important;
+}
+
+.emp-row .emp-code-display {
+  color: var(--white) !important;
+  font-weight: 700 !important;
+  font-size: 16px !important;
+}
+
+.emp-row .emp-email-display {
+  color: var(--white) !important;
+  font-weight: 500 !important;
+  font-size: 11px !important;
+}
+
+.emp-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 4px;
+  height: 100%;
+  background: var(--red);
+  transform: scaleY(0);
+  transition: transform 0.3s ease;
+}
+.emp-row:hover {
+  background: var(--bg-secondary);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  border-color: var(--red);
+}
+.emp-row:hover::before {
+  transform: scaleY(1);
+}
+.emp-row .meta{
+  color: var(--text-muted); 
+  font-size: .85em;
+  font-weight: 500;
+}
+.emp-row .email-meta {
+  color: var(--text-muted);
+  font-size: 0.8em;
+  font-style: italic;
+  margin-top: 0.25rem;
+  display: block;
+}
+
+/* Zawartość wiersza pracownika */
+.emp-row > div:first-child {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  justify-content: flex-start;
+}
+
+.emp-row .emp-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  margin-left: 1rem;
+}
+
+/* Nazwa pracownika i kod w jednej linii */
+.emp-row > div:first-child {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--white);
+  line-height: 1.2;
+}
+
+.emp-row > div:first-child > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.emp-row .meta {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-left: 0.5rem;
+  display: inline;
+  flex-shrink: 0;
+  min-width: 60px;
+  text-align: right;
+}
+
+.emp-row .email-meta {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-style: italic;
+  margin-top: 0.1rem;
+  display: block;
+  word-break: break-all;
+  line-height: 1.1;
+}
+
+/* Style dla edycji inline */
+.emp-name-code-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.emp-name-edit,
+.emp-code-edit {
+  display: flex;
+  align-items: center;
+}
+
+.emp-name-input,
+.emp-code-input,
+.emp-email-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--white);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.9rem;
+  width: 100%;
+  max-width: 120px;
+}
+
+.emp-name-input:focus,
+.emp-code-input:focus,
+.emp-email-input:focus {
+  outline: none;
+  border-color: var(--red);
+  box-shadow: 0 0 0 2px rgba(211, 47, 47, 0.2);
+}
+
+.emp-email-input {
+  max-width: 150px;
+  font-size: 0.75rem;
+}
+
+.emp-code-edit .emp-code-display {
+  min-width: 60px;
+  text-align: right;
+}
+
+/* Responsywność modali */
+@media (max-width: 1024px) {
+  .emp-editor .emp-container,
+  #swap-editor .emp-container {
+    width: 90vw;
+    height: auto;
+    max-height: none;
+  }
+  
+  .emp-list-section .emp-list {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  
+  .emp-add-section .emp-add {
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  
+  .emp-add-section .emp-field:last-of-type {
+    grid-column: 1 / -1;
+  }
+  
+  /* Stare style usunięte */
+}
+
+@media (max-width: 768px) {
+  .emp-editor .emp-container,
+  #swap-editor .emp-container {
+    width: 95vw;
+    height: auto;
+    max-height: none;
+  }
+  
+  .emp-list-section .emp-list {
+    grid-template-columns: 1fr;
+  }
+  
+  .emp-add-section .emp-add {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+  
+  /* Stare style usunięte */
+}
+
+
+@media (max-width: 480px) {
+  .emp-editor .emp-container,
+  #swap-editor .emp-container {
+    width: 95vw;
+    height: 90vh;
+    padding: 1rem;
+  }
+  
+  .emp-editor .emp-head {
+    font-size: 1.2rem;
+    margin-bottom: 0.75rem;
+  }
+  
+  /* Stare style usunięte */
+  
+  /* Stare style usunięte - przycisk teraz w flexbox */
+}
+
+/* Style dla akcji pracowników */
+.emp-actions{
+  display: flex; 
+  gap: 0.5rem;
+  align-items: center;
+}
+.emp-actions .btn {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 16px;
+  transition: all 0.2s ease;
+  min-width: 60px;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  background: #ffffff;
+  border: 1px solid #ffffff;
+  color: #000000;
+}
+
+.emp-actions .btn svg {
+  color: #dc3545;
+  width: 14px;
+  height: 14px;
+}
+
+.emp-actions .btn:hover {
+  background: #000000;
+  border-color: #000000;
+  color: #ffffff;
+  transform: scale(1.05);
+}
+
+.emp-actions .btn:active {
+  transform: scale(0.95);
+}
+.emp-actions .btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+/* Style dla formularza edycji */
+.emp-edit-form{
+  margin-top: 1rem;
+  padding: 1rem;
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+}
+.emp-edit-actions{
+  display: flex; 
+  gap: 1rem; 
+  margin-top: 1.5rem; 
+  justify-content: center;
+}
+.emp-edit-actions .btn {
+  padding: 0.75rem 2rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  border-radius: 8px;
+  min-width: 120px;
+  transition: all 0.2s ease;
+}
+.emp-edit-actions .btn:first-child {
+  background: var(--red);
+  border-color: var(--red);
+  color: white;
+}
+.emp-edit-actions .btn:first-child:hover {
+  background: rgba(211, 47, 47, 0.9);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(211, 47, 47, 0.3);
+}
+.emp-edit-actions .btn:last-child {
+  background: #6c757d;
+  border-color: #6c757d;
+  color: white;
+}
+.emp-edit-actions .btn:last-child:hover {
+  background: #5a6268;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(108, 117, 125, 0.3);
+}
+
+/* Status indicators for swap requests */
+.status-approved{color:var(--white); font-weight:600}
+.status-rejected{color:var(--red); font-weight:600}
+.status-pending{color:var(--yellow); font-weight:600}
+.status-waiting{color:var(--gray); font-weight:600}
+
+/* Historia próśb */
+.status-display {
+  margin-top: 5px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.8em;
+  display: inline-block;
+}
+
+.comment-display {
+  margin-top: 5px;
+  font-style: italic;
+  color: #666;
+  font-size: 0.9em;
+}
+
+#history-modal .emp-list {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+#history-modal .emp-row {
+  border-bottom: 1px solid #eee;
+  padding: 10px 0;
+}
+
+#history-modal .emp-row:last-child {
+  border-bottom: none;
+}
+
+/* Comment styling for swap requests */
+.swap-comment{
+  color: var(--muted);
+  font-size: 0.9em;
+  margin-top: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  background: rgba(156, 163, 175, 0.1);
+  border-radius: 6px;
+  border-left: 3px solid var(--muted);
+}
+.comment-label{
+  margin-right: 0.25rem;
+}
+
+/* Compose form styling */
+.compose-section{
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.compose-section h4{
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.compose-actions{
+  margin-top: 1.5rem;
+  text-align: center;
+}
+.btn-primary{
+  background: var(--red);
+  border-color: var(--red);
+  font-weight: 600;
+  padding: 0.75rem 1.5rem;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.btn-primary:hover{
+  background: rgba(211, 47, 47, 0.8);
+  border-color: var(--red);
+}
+textarea{
+  resize: vertical;
+  min-height: 80px;
+  font-family: inherit;
+}
+
+/* Dodatkowe style dla pól select i textarea */
+select option {
+  background: #111;
+  color: #fff;
+}
+
+select:focus, input:focus, textarea:focus {
+  outline: none;
+  border-color: var(--red);
+  transform: scale(1.02);
+}
+
+/* Responsywność dla paska "Dziś" - układ pionowy na małych ekranach */
+@media (max-width: 600px) {
+  .today-content {
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  
+  .today-section {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.3rem;
+  }
+  
+  .today-section:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+}
+
+/* Dodatkowa responsywność dla bardzo małych ekranów */
+@media (max-width: 400px) {
+  .today-content {
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  
+  .today-section {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.2rem;
+  }
+  
+  .today-section:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+}
+
+/* Responsywność dla paska "Dziś" na bardzo małych ekranach */
+@media (max-width: 320px) {
+  .today-bar {
+    padding: 0.1rem 0.2rem;
+    min-height: 25px;
+  }
+  
+  .today-content {
+    gap: 0.2rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.6rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.5rem;
+    padding: 0.05rem 0.1rem;
+  }
+}
+
+/* Responsywność dla paska "Dziś" na ekstremalnie małych ekranach */
+@media (max-width: 280px) {
+  .today-bar {
+    padding: 0.08rem 0.1rem;
+    min-height: 20px;
+  }
+  
+  .today-content {
+    gap: 0.1rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.55rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.45rem;
+    padding: 0.05rem 0.08rem;
+  }
+}
+
+/* Responsywność dla paska "Dziś" na ekstremalnie małych ekranach */
+@media (max-width: 240px) {
+  .today-bar {
+    padding: 0.05rem 0.08rem;
+    min-height: 18px;
+  }
+  
+  .today-content {
+    gap: 0.05rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.5rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.4rem;
+    padding: 0.05rem 0.05rem;
+  }
+}
+
+/* Responsywność dla paska "Dziś" na ekstremalnie małych ekranach */
+@media (max-width: 200px) {
+  .today-bar {
+    padding: 0.02rem 0.05rem;
+    min-height: 15px;
+  }
+  
+  .today-content {
+    gap: 0.02rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.45rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.35rem;
+    padding: 0.02rem 0.02rem;
+  }
+}
+
+/* Responsywność dla paska "Dziś" na ekstremalnie małych ekranach */
+@media (max-width: 160px) {
+  .today-bar {
+    padding: 0.01rem 0.03rem;
+    min-height: 12px;
+  }
+  
+  .today-content {
+    gap: 0.01rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.4rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.3rem;
+    padding: 0.01rem 0.01rem;
+  }
+}
+
+/* Responsywność dla paska "Dziś" na ekstremalnie małych ekranach */
+@media (max-width: 120px) {
+  .today-bar {
+    padding: 0.005rem 0.02rem;
+    min-height: 10px;
+  }
+  
+  .today-content {
+    gap: 0.005rem;
+  }
+  
+  .today-section h3 {
+    font-size: 0.35rem;
+  }
+  
+  .today-section ul li {
+    font-size: 0.25rem;
+    padding: 0.005rem 0.005rem;
+  }
+}
+
+/* Usuń domyślne strzałki w select na WebKit */
+select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6,9 12,15 18,9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 16px;
+  padding-right: 32px;
+}
+
+/* Style dla list rozwijanych w formularzu */
+.compose-section select {
+  min-width: 0;
+  flex: 1;
+}
+
+.compose-section select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Responsywność dla panelu bez karty */
+@media (max-width: 900px) {
+  .center-panel:not(.card) {
+    padding: 0.75rem;
+    border-radius: 8px;
+  }
+  
+  .center-panel:not(.card) .table-wrap {
+    border-radius: 6px;
+  }
+  
+  .center-panel:not(.card) .swap-compose {
+    margin-left: 0.75rem;
+    margin-right: 0.75rem;
+    margin-bottom: 0.75rem;
+    padding: 0.4rem;
+  }
+  
+  .today-bar {
+    padding: 0.75rem;
+  }
+  
+  .today-content {
+    gap: 1rem;
+  }
+}
+
+@media (max-width: 768px) {
+  .center-panel:not(.card) {
+    padding: 0.5rem;
+    border-radius: 6px;
+  }
+  
+  .center-panel:not(.card) .table-wrap {
+    border-radius: 4px;
+  }
+  
+  .center-panel:not(.card) .swap-compose {
+    margin-left: 0.5rem;
+    margin-right: 0.5rem;
+    margin-bottom: 0.5rem;
+    padding: 0.3rem;
+  }
+  
+  .today-bar {
+    padding: 0.5rem;
+  }
+  
+  .today-content {
+    gap: 0.8rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .center-panel:not(.card) {
+    padding: 0.4rem;
+    border-radius: 4px;
+  }
+  
+  .center-panel:not(.card) .table-wrap {
+    border-radius: 3px;
+  }
+  
+  .center-panel:not(.card) .swap-compose {
+    margin-left: 0.4rem;
+    margin-right: 0.4rem;
+    margin-bottom: 0.4rem;
+    padding: 0.25rem;
+  }
+  
+  .today-bar {
+    padding: 0.4rem;
+  }
+  
+  .today-content {
+    gap: 0.6rem;
+  }
+}
+
+/* Licznik zmian - podsumowanie */
+.shift-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.75rem;
+  line-height: 1.2;
+}
+
+.shift-count {
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 3px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+.shift-count.dniowka {
+  background-color: rgba(255, 193, 7, 0.2);
+  color: #ffc107;
+}
+
+.shift-count.nocka {
+  background-color: rgba(0, 123, 255, 0.2);
+  color: #007bff;
+}
+
+.shift-count.custom {
+  background-color: rgba(108, 117, 125, 0.2);
+  color: #6c757d;
+}
+
+.shift-total {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 3px;
+  border-radius: 2px;
+  background-color: rgba(255, 255, 255, 0.1);
+  color: var(--white);
+  font-weight: 600;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* ===== STYLE DLA NIEDYSPOZYCJI ===== */
+
+.unavailability-content {
+  padding: 0;
+  max-width: 100%;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.month-selector {
+  margin-bottom: 0.75rem;
+  text-align: center;
+}
+
+.month-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.month-navigation .nav-btn {
+  background: transparent;
+  color: var(--gray-light);
+  border: none;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 1.2rem;
+  transition: all 0.2s ease;
+}
+
+.month-navigation .nav-btn:hover {
+  color: var(--red);
+  transform: scale(1.1);
+}
+
+.month-navigation .month-label {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--fg);
+  min-width: 150px;
+}
+
+.month-selector label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.month-selector input[type="month"] {
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--fg);
+  font-size: 1rem;
+}
+
+.calendar-container {
+  margin-bottom: 0.75rem;
+}
+
+.mini-calendar {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem;
+}
+
+.mini-calendar .day-header {
+  text-align: center;
+  font-weight: 600;
+  padding: 0.5rem 0.25rem;
+  color: var(--fg-secondary);
+  font-size: 0.8rem;
+}
+
+.mini-calendar .day-cell {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  transition: all 0.2s ease;
+  border: 1px solid transparent;
+}
+
+.mini-calendar .day-cell:hover {
+  background: var(--card-hover);
+}
+
+.mini-calendar .day-cell.selected {
+  background: var(--red);
+  color: var(--white);
+  font-weight: 600;
+}
+
+.mini-calendar .day-cell.other-month {
+  color: var(--gray-light);
+  cursor: not-allowed;
+}
+
+.mini-calendar .day-cell.other-month:hover {
+  background: transparent;
+}
+
+.selected-days {
+  margin-bottom: 0.75rem;
+  padding: 0.75rem;
+  background: var(--card);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.selected-days h4 {
+  margin: 0 0 0.5rem 0;
+  color: var(--fg);
+  font-size: 1rem;
+}
+
+#selected-days-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  max-height: 120px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+/* Stylowanie scrollbara dla wybranych dni */
+#selected-days-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+#selected-days-list::-webkit-scrollbar-track {
+  background: var(--card-hover);
+  border-radius: 3px;
+}
+
+#selected-days-list::-webkit-scrollbar-thumb {
+  background: var(--gray-light);
+  border-radius: 3px;
+}
+
+#selected-days-list::-webkit-scrollbar-thumb:hover {
+  background: var(--gray);
+}
+
+/* Shifts modal styles */
+#shifts-editor .emp-container {
+  position: relative; 
+  background: var(--card); 
+  border: 1px solid var(--border); 
+  border-radius: 16px; 
+  padding: 1.5rem;
+  width: 70vw;
+  height: auto;
+  max-width: 700px;
+  min-width: 500px;
+  max-height: 90vh;
+  overflow: visible;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  animation: modalSlideIn 0.2s ease-out;
+  will-change: transform, opacity;
+  transform: translateZ(0);
+}
+
+/* Shift type selector */
+.shift-type-selector {
+  margin-bottom: 1.5rem;
+}
+
+.shift-type-options {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.shift-type-option {
+  flex: 1;
+  min-width: 150px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 1rem;
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  transition: all 0.2s ease;
+}
+
+.shift-type-option:hover {
+  border-color: var(--red);
+  background: var(--card-hover);
+}
+
+.shift-type-option input[type="radio"] {
+  margin-right: 0.75rem;
+  transform: scale(1.2);
+}
+
+.shift-type-option input[type="radio"]:checked + .shift-type-label {
+  color: var(--red);
+}
+
+.shift-type-option:has(input[type="radio"]:checked) {
+  border-color: var(--red);
+  background: var(--red-light);
+}
+
+.shift-type-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.shift-type-label strong {
+  font-size: 1rem;
+  color: var(--fg);
+}
+
+.shift-type-label small {
+  font-size: 0.8rem;
+  color: var(--gray);
+}
+
+/* Shift forms */
+.shift-form {
+  display: none;
+}
+
+.shift-form.active {
+  display: block;
+}
+
+/* Button styles */
+.btn-secondary {
+  background: var(--gray-light);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  background: var(--gray);
+  color: var(--white);
+}
+
+.selected-day-tag {
+  background: var(--red);
+  color: var(--white);
+  padding: 0.25rem 0.5rem;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.selected-day-tag .remove-day {
+  cursor: pointer;
+  font-weight: bold;
+  margin-left: 0.25rem;
+}
+
+.selected-day-tag .remove-day:hover {
+  color: var(--red-light);
+}
+
+.unavailability-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
+.btn-secondary {
+  background: var(--gray-light);
+  color: var(--fg);
+}
+
+.btn-secondary:hover {
+  background: var(--gray);
+}
+
+/* JASNY MOTYW USUNIĘTY */
+
+/* ============================================================================
+   HAMBURGER MENU Z GÓRY - PEŁNA SZEROKOŚĆ
+   ============================================================================ */
+
+/* Logo jako trigger hamburger menu */
+.hamburger-trigger {
+  cursor: pointer;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.hamburger-trigger:hover {
+  transform: scale(1.05);
+  opacity: 0.8;
+}
+
+/* ============================================================================
+   SPOTIFY-STYLE FUNCTION PANEL
+   ============================================================================ */
+
+/* Główny panel w stylu Spotify - W NORMALNYM FLOW DOKUMENTU */
+.spotify-panel {
+  position: relative; /* Zmienione z absolute na relative */
+  width: 100%;
+  height: auto;
+  max-height: 80vh;
+  background: #121212 !important;
+  /* border-bottom: 1px solid #2a2a2a; - USUNIĘTE */
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  z-index: 1000;
+  transform: translateY(-100%); /* Ukryty powyżej swojej pozycji */
+  transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  overflow-y: auto;
+  overflow-x: hidden;
+  will-change: transform;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  contain: layout style paint;
+}
+
+.spotify-panel:not(.hidden) {
+  transform: translate3d(0, 0, 0);
+}
+
+/* Zawartość panelu */
+.spotify-panel-content {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #121212 !important;
+}
+
+/* Header panelu w stylu Spotify - ROZSZERZONY Z PRZYCISKAMI */
+.spotify-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 16px 60px;
+  background: #000 !important;
+  flex-shrink: 0;
+  min-height: auto;
+}
+
+.spotify-panel-title-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+}
+
+/* Kontener przycisków funkcji w headerze - 5 KOLUMN */
+.spotify-function-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+  width: 100%;
+}
+
+/* Nowe style przycisków z animacją szarego tła i tylko ikonami */
+.spotify-function-buttons .spotify-function-card {
+  outline: none;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+  font-size: inherit;
+  position: relative;
+  display: inline-block;
+  letter-spacing: 0.05rem;
+  font-weight: 700;
+  font-size: 17px;
+  border-radius: 500px;
+  overflow: hidden;
+  background: #2a2a2a !important; /* Szary domyślnie */
+  color: #ffffff !important; /* Biały tekst */
+  width: 80px; /* Szerokość żeby pomieścić ikonkę i tekst */
+  height: 44px; /* Wysokość jak przyciski nawigacji */
+  opacity: 0;
+  transform: translateY(20px);
+  animation: fadeInUpButton 0.5s ease forwards;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Różne opóźnienia dla przycisków */
+.spotify-function-buttons .spotify-function-card:nth-child(1) {
+  animation-delay: 0.3s;
+}
+.spotify-function-buttons .spotify-function-card:nth-child(2) {
+  animation-delay: 0.4s;
+}
+.spotify-function-buttons .spotify-function-card:nth-child(3) {
+  animation-delay: 0.5s;
+}
+.spotify-function-buttons .spotify-function-card:nth-child(4) {
+  animation-delay: 0.6s;
+}
+.spotify-function-buttons .spotify-function-card:nth-child(5) {
+  animation-delay: 0.7s;
+}
+
+.spotify-function-buttons .spotify-function-card span {
+  position: relative;
+  z-index: 10;
+  transition: color 0.4s;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  gap: 4px;
+  padding: 4px;
+}
+
+.spotify-function-buttons .spotify-function-icon {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.spotify-function-buttons .spotify-function-text {
+  font-size: 12px;
+  font-weight: var(--font-weight-bold);
+  color: #ffffff !important;
+  text-align: center;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: visible;
+  max-width: 100%;
+  font-family: var(--font);
+  letter-spacing: 0.2px;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 16px;
+  opacity: 1;
+}
+
+/* Hover effect - czerwony kolor */
+.spotify-function-buttons .spotify-function-card:hover {
+  background: #ff0000 !important; /* Czerwony po najechaniu */
+  color: #ffffff !important;
+}
+
+.spotify-function-buttons .spotify-function-card:hover span {
+  color: #ffffff !important;
+}
+
+.spotify-function-buttons .spotify-function-card::before {
+  content: "";
+  background: #000;
+  width: 120%;
+  left: -10%;
+  transform: skew(30deg);
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1);
+}
+
+.spotify-function-buttons .spotify-function-card:hover::before {
+  transform: translate3d(100%, 0, 0);
+}
+
+.spotify-function-buttons .spotify-function-icon {
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 11;
+}
+
+.spotify-function-buttons .spotify-function-icon svg {
+  width: 24px;
+  height: 24px;
+  color: currentColor;
+}
+
+/* Animacja fadeInUp dla przycisków */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Nowe animacje dla tytułu i ikon */
+@keyframes fadeInUpTitle {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInUpIcon {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInUpButton {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.spotify-function-buttons .spotify-function-title {
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  margin: 0 !important;
+  line-height: 1.2 !important;
+  font-family: var(--font) !important;
+}
+
+.spotify-function-buttons .spotify-function-description {
+  display: none !important;
+}
+
+.spotify-title-with-icon {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.spotify-functions-icon {
+  width: 24px;
+  height: 24px;
+  fill: #dc2626;
+  flex-shrink: 0;
+  opacity: 0;
+  transform: translateY(20px);
+  animation: fadeInUpIcon 0.6s ease 0.1s forwards; /* Opóźnienie 0.1s */
+}
+
+.spotify-panel-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: #ffffff !important;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  opacity: 0;
+  transform: translateY(20px);
+  animation: fadeInUpTitle 0.6s ease 0.2s forwards; /* Opóźnienie 0.2s */
+}
+
+.spotify-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.spotify-close-btn {
+  background: none;
+  border: none;
+  color: #b3b3b3 !important;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.spotify-close-btn:hover {
+  background-color: #2a2a2a !important;
+  color: #ffffff !important;
+}
+
+.spotify-close-x {
+  font-size: 16px;
+  font-weight: bold;
+}
+
+.spotify-icon {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+/* Filtry w stylu Spotify - przeniesione do header */
+.spotify-filter-chips {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.spotify-filter-chips::-webkit-scrollbar {
+  display: none;
+}
+
+.spotify-chip {
+  background: #2a2a2a !important;
+  border: none;
+  border-radius: 16px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.spotify-chip:hover {
+  background: #3a3a3a !important;
+  transform: scale(1.02);
+}
+
+.spotify-chip.active {
+  background: #ffffff !important;
+  color: #000000 !important;
+}
+
+.spotify-chip-text {
+  font-size: 14px;
+  font-weight: 500;
+  color: inherit;
+}
+
+/* BODY PANELU - PROSTY PADDING */
+.spotify-panel-body {
+  /* PROSTY PADDING - MOŻESZ ZMIENIAĆ BEZ FLEXBOX */
+  padding-top: 20px;
+  padding-left: 24px;
+  padding-right: 24px;
+  padding-bottom: 20px;
+  background: #121212 !important;
+}
+
+/* SEKCJE FUNKCJI - RÓWNOMIERNE SPACING */
+.spotify-section {
+  background: #121212 !important;
+  margin-top: 0;
+  margin-bottom: 20px;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.spotify-section.hidden {
+  display: none;
+}
+
+/* Siatka funkcji */
+.spotify-function-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+/* Karty funkcji w stylu Spotify */
+.spotify-function-card {
+  background: #2a2a2a !important; /* Szary domyślnie */
+  border: none;
+  border-radius: 8px;
+  padding: 20px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  text-align: left;
+  width: 100%;
+}
+
+.spotify-function-card:hover {
+  background: #ff0000 !important; /* Czerwony po najechaniu */
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.spotify-function-card.logout-card {
+  background: #1a1a1a !important;
+}
+
+.spotify-function-card.logout-card:hover {
+  background: #4a1a1a !important;
+}
+
+.spotify-function-icon {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  color: #1db954;
+}
+
+.spotify-function-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+.spotify-function-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.spotify-function-title {
+  margin: 0 0 4px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffffff !important;
+  letter-spacing: -0.01em;
+}
+
+.spotify-function-description {
+  margin: 0;
+  font-size: 12px;
+  color: #b3b3b3 !important;
+  line-height: 1.4;
+}
+
+/* Formularz dla przycisku wylogowania */
+.spotify-function-card-form {
+  display: contents;
+}
+
+/* Responsywność */
+@media (max-width: 768px) {
+  .spotify-panel {
+    max-height: 70vh;
+  }
+  
+  .spotify-panel-header {
+    padding: 12px 16px;
+    min-height: auto;
+  }
+  
+  .spotify-panel-title-section {
+    gap: 12px;
+  }
+  
+  .spotify-title-with-icon {
+    gap: 10px;
+  }
+  
+  .spotify-functions-icon {
+    width: 20px;
+    height: 20px;
+  }
+  
+  .spotify-panel-title {
+    font-size: 18px;
+  }
+  
+  /* PRZYCISKI FUNKCJI NA MOBILE - 2 KOLUMNY */
+  .spotify-function-buttons {
+    gap: 8px;
+    margin-top: 6px;
+    grid-template-columns: 1fr 1fr;
+  }
+  
+  .spotify-function-buttons .spotify-function-card {
+    min-width: 50px;
+    height: 50px;
+  }
+  
+  .spotify-function-buttons .spotify-function-icon {
+    width: 24px;
+    height: 24px;
+  }
+  
+  .spotify-function-buttons .spotify-function-icon svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+@media (max-width: 480px) {
+  .spotify-panel {
+    max-height: 60vh;
+  }
+  
+  .spotify-panel-header {
+    padding: 10px 12px;
+    min-height: 45px;
+  }
+  
+  .spotify-panel-title {
+    font-size: 16px;
+  }
+  
+  .spotify-panel-body {
+    padding: 16px 12px 8px 12px;
+  }
+  
+  .spotify-function-buttons .spotify-function-card {
+    min-width: 45px;
+    height: 45px;
+  }
+  
+  .spotify-function-buttons .spotify-function-icon {
+    width: 20px;
+    height: 20px;
+  }
+  
+  .spotify-function-buttons .spotify-function-icon svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+/* Overlay dla panelu - USUNIĘTY (panel wysuwa się z headera) */
+
+/* Animacje */
+@keyframes slideInFromTop {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.spotify-panel:not(.hidden) {
+  animation: slideInFromTop 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Nowe style hamburger menu z czarnym tłem i animacją z góry */
+.hamburger-menu-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: auto;
+  min-height: 200px;
+  max-height: 100vh; /* Pełna wysokość ekranu */
+  background: #000000; /* Czarny background */
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  z-index: 10001;
+  transform: translateY(-140%); /* Zaczyna się znacznie wyżej poza ekranem - zaczyna się renderować poza stroną */
+  opacity: 0;
+  transition: transform 1.5s cubic-bezier(0.25, 0.46, 0.45, 0.94), 
+              opacity 1.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.hamburger-menu-panel:not(.hidden) {
+  transform: translateY(0); /* Wysuwa się do pełnej pozycji */
+  opacity: 1;
+}
+
+.hamburger-menu-content {
+  padding: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #121212 !important;
+}
+
+.hamburger-menu-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 20px;
+  border-bottom: 1px solid #2a2a2a;
+  background: #1a1a1a !important;
+  flex-shrink: 0;
+}
+
+.hamburger-menu-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #ffffff !important;
+}
+
+.hamburger-close {
+  background: none;
+  border: none;
+  color: #b3b3b3 !important;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+  font-size: 16px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hamburger-close:hover {
+  background-color: #2a2a2a !important;
+  color: #ffffff !important;
+}
+
+.hamburger-menu-items {
+  flex: 1;
+  padding: 12px 20px;
+  display: flex;
+  flex-direction: row;
+  gap: 16px;
+  align-items: flex-start;
+  justify-content: space-between;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2a #1a1a1a;
+}
+
+.hamburger-menu-items::-webkit-scrollbar {
+  height: 4px;
+}
+
+.hamburger-menu-items::-webkit-scrollbar-track {
+  background: #1a1a1a;
+}
+
+.hamburger-menu-items::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 2px;
+}
+
+.hamburger-menu-items::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+
+.menu-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0; /* Pozwala na skurczenie */
+}
+
+.menu-section h4 {
+  margin: 0;
+  padding: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #b3b3b3 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  text-align: center;
+  border-bottom: 2px solid #2a2a2a;
+  padding-bottom: 4px;
+  white-space: nowrap;
+}
+
+/* Rzędy menu - poziomo bez zawijania */
+.menu-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: center;
+  overflow-x: auto;
+}
+
+/* Elementy menu - kompaktowe poziome */
+.menu-item {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  background: #1a1a1a !important;
+  border: 2px solid #2a2a2a;
+  border-radius: 6px;
+  color: #ffffff !important;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+  min-width: 120px;
+  max-width: 140px;
+  flex: 0 0 auto;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-item:hover {
+  background-color: #2a2a2a !important;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+}
+
+.menu-item svg {
+  margin-right: 6px;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: #b3b3b3 !important;
+}
+
+.menu-item span {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Responsywność dla mniejszych ekranów */
+@media (max-width: 768px) {
+  .hamburger-menu-items {
+    gap: 12px;
+    padding: 8px 16px;
+  }
+  
+  .menu-item {
+    min-width: 100px;
+    max-width: 120px;
+    padding: 6px 10px;
+    font-size: 11px;
+  }
+  
+  .menu-item svg {
+    width: 14px;
+    height: 14px;
+    margin-right: 4px;
+  }
+  
+  .menu-section h4 {
+    font-size: 12px;
+  }
+}
+
+/* Overlay dla zamknięcia menu */
+.hamburger-menu-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.3);
+  z-index: 999;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.3s ease;
+}
+
+.hamburger-menu-overlay:not(.hidden) {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Responsywność */
+@media (max-width: 768px) {
+  .hamburger-menu-panel {
+    min-height: 180px;
+    max-height: 70vh;
+  }
+  
+  .hamburger-menu-items {
+    flex-direction: column;
+    gap: 12px;
+    padding: 8px 15px;
+  }
+  
+  .menu-section {
+    width: 100%;
+  }
+  
+  .menu-row {
+    justify-content: center;
+    gap: 6px;
+  }
+  
+  .menu-item {
+    padding: 8px 12px;
+    font-size: 12px;
+    min-width: 100px;
+  }
+  
+  .menu-item svg {
+    width: 16px;
+    height: 16px;
+    margin-right: 8px;
+  }
+}
+
+@media (max-width: 480px) {
+  .hamburger-menu-panel {
+    min-height: 160px;
+    max-height: 60vh;
+  }
+  
+  .menu-item {
+    padding: 6px 10px;
+    font-size: 11px;
+    min-width: 80px;
+  }
+  
+  .menu-item svg {
+    width: 14px;
+    height: 14px;
+    margin-right: 6px;
+  }
+}
+
+/* Dark mode adjustments */
+.dark-mode .hamburger-menu-panel {
+  border-bottom-color: #2a2a2a !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  background: #121212 !important;
+}
+
+.dark-mode .hamburger-menu-header {
+  background: #1a1a1a !important;
+  border-bottom-color: #2a2a2a !important;
+}
+
+.dark-mode .menu-item {
+  background: #1a1a1a !important;
+  border-color: #2a2a2a !important;
+  color: #ffffff !important;
+}
+
+.dark-mode .hamburger-menu-content {
+  background: #121212 !important;
+}
+
+.dark-mode .hamburger-menu-header h3 {
+  color: #ffffff !important;
+}
+
+.dark-mode .menu-section h4 {
+  color: #b3b3b3 !important;
+  border-bottom-color: #2a2a2a !important;
+}
+
+.dark-mode .menu-item svg {
+  color: #b3b3b3 !important;
+}
+
+.dark-mode .hamburger-close {
+  color: #b3b3b3 !important;
+}
+
+.dark-mode .hamburger-close:hover {
+  background-color: #2a2a2a !important;
+  color: #ffffff !important;
+}
+
+/* Animacje - z góry */
+@keyframes slideInTop {
+  from {
+    transform: translateY(-100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideOutTop {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-100%);
+  }
+}
+
+.hamburger-menu-panel.slide-in {
+  animation: slideInTop 0.3s ease;
+}
+
+.hamburger-menu-panel.slide-out {
+  animation: slideOutTop 0.3s ease;
+}
+
+
+/* ============================================================================
+   PANEL AKCJI ZMIAN - W STYLU DAILY-SHIFTS-BAR
+   ============================================================================ */
+
+.shifts-actions {
+  width: 20%;
+  margin: 0 auto;
+  background: #000000;
+  border: 1px solid #808080;
+  border-radius: 8px;
+  transform: translateY(-100%);
+  transition: transform 0.3s ease;
+}
+
+.shifts-actions:not(.hidden) {
+  transform: translateY(0);
+}
+
+.horizontal-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+}
+
+.section {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+}
+
+.top-section {
+  justify-content: center;
+}
+
+#edit-mode-status {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  margin: 0;
+  text-align: center;
+}
+
+.draft-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+}
+
+.draft-mode-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+}
+
+.edit-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.shifts-actions .btn {
+  padding: 10px 20px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-weight: bold;
+  font-family: 'Arial', sans-serif;
+  min-width: 160px;
+  text-align: center;
+}
+
+/* Layout dla układu 2x2 */
+.grid-container {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 1rem !important;
+  width: 100% !important;
+  height: 100% !important;
+  padding: 1.5rem !important;
+}
+
+.row {
+  display: flex !important;
+  gap: 1rem !important;
+  align-items: center !important;
+  justify-content: center !important;
+  flex: 1 !important;
+}
+
+.cell {
+  flex: 1 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-height: 0 !important;
+}
+
+.left-top {
+  justify-content: flex-start !important;
+}
+
+.right-top {
+  justify-content: center !important;
+}
+
+.left-bottom {
+  justify-content: center !important;
+}
+
+.right-bottom {
+  justify-content: center !important;
+}
+
+/* Ukryte przyciski trybu roboczego - teraz są dynamicznie przenoszone */
+.draft-mode-controls {
+  display: none !important;
+}
+
+.draft-mode-controls.hidden {
+  display: none !important;
+}
+
+/* Style dla przycisków w komórkach układu 2x2 */
+.cell button {
+  width: 90% !important;
+  max-width: 180px !important;
+  margin: 0 auto !important;
+  min-width: 160px !important;
+  font-size: 0.7rem !important;
+  line-height: 1.2 !important;
+  white-space: normal !important;
+  text-align: center !important;
+  padding: 0.8rem 0.5rem !important;
+}
+
+/* Jednakowa szerokość dla wszystkich napisów w przyciskach */
+.cell button span,
+.cell button {
+  width: 160px !important;
+  text-align: center !important;
+}
+
+/* Wyrównanie dla wszystkich komórek */
+.left-top,
+.right-top,
+.left-bottom,
+.right-bottom {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0.5rem !important;
+  overflow: hidden !important;
+}
+
+/* Specjalne wyrównanie dla lewego górnego (tytuł) */
+.left-top {
+  justify-content: center !important;
+}
+
+.left-top h2 {
+  font-size: 0.9rem !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+/* Dodatkowe style dla przycisków w komórkach */
+.cell button {
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+/* Style dla kontenerów przycisków */
+.edit-actions {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 1rem !important;
+  align-items: center !important;
+  width: 100% !important;
+}
+
+/* Przyciski w trybie edycji - styl z menu burgerowego */
+.shifts-actions .btn-secondary,
+.shifts-actions .btn-warning,
+.shifts-actions .btn-success,
+.shifts-actions .btn:not(.btn-secondary):not(.btn-warning):not(.btn-success) {
+  outline: none !important;
+  cursor: pointer !important;
+  border: none !important;
+  padding: 1rem 1.5rem !important;
+  margin: 0 !important;
+  font-family: inherit !important;
+  font-size: 0.7rem !important; /* Mniejsza czcionka */
+  position: relative !important;
+  display: flex !important;
+  letter-spacing: 0.05rem !important;
+  font-weight: 600 !important;
+  border-radius: 500px !important;
+  overflow: hidden !important;
+  background: #2a2a2a !important; /* Szary domyślnie jak w menu burgerowym */
+  color: #ffffff !important; /* Biały tekst widoczny od razu */
+  min-width: 160px !important;
+  max-width: 160px !important;
+  width: 160px !important;
+  min-height: 50px !important;
+  text-align: center !important;
+  align-items: center !important;
+  justify-content: center !important;
+  transition: all 0.2s ease !important;
+  z-index: 10 !important; /* Tekst nad pseudo-elementem */
+  gap: 0.5rem !important; /* Odstęp między ikonką a tekstem */
+  line-height: 1.2 !important;
+  white-space: normal !important;
+  padding: 0.8rem 0.5rem !important;
+}
+
+/* Style dla ikon w przyciskach */
+.shifts-actions .btn-secondary svg,
+.shifts-actions .btn-warning svg,
+.shifts-actions .btn-success svg,
+.shifts-actions .btn:not(.btn-secondary):not(.btn-warning):not(.btn-success) svg {
+  flex-shrink: 0 !important;
+  z-index: 10 !important;
+}
+
+.shifts-actions .btn-secondary::before,
+.shifts-actions .btn-warning::before,
+.shifts-actions .btn-success::before,
+.shifts-actions .btn:not(.btn-secondary):not(.btn-warning):not(.btn-success)::before {
+  content: "" !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  z-index: -1 !important; /* Zmienione na -1 żeby było za tekstem */
+  background: #2a2a2a !important; /* Szary domyślnie */
+  transform: skew(30deg) !important;
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1) !important;
+}
+
+/* Hover dla przycisku "Włącz tryb roboczy" - żółty */
+.shifts-actions .btn-secondary:hover {
+  background: #ffc107 !important; /* Żółty */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+/* Hover dla przycisku "Zapisz wersję roboczą" - niebieski */
+.shifts-actions .btn-warning:hover {
+  background: #007bff !important; /* Niebieski */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+/* Hover dla przycisku "Prześlij zmiany" - zielony */
+.shifts-actions .btn-success:hover {
+  background: #28a745 !important; /* Zielony */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+/* Hover dla przycisku "Zapisz" - zielony */
+#save-shifts:hover {
+  background: #28a745 !important; /* Zielony dla przycisku Zapisz */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+/* Hover dla przycisku "Anuluj" - czerwony */
+#cancel-shifts:hover {
+  background: #dc3545 !important; /* Czerwony dla przycisku Anuluj */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+.shifts-actions .btn-secondary:hover::before,
+.shifts-actions .btn-warning:hover::before,
+.shifts-actions .btn-success:hover::before,
+#save-shifts:hover::before,
+#cancel-shifts:hover::before {
+  transform: translate3d(100%, 0, 0) !important;
+}
+
+/* Przyciski trybu roboczego - styl z menu burgerowego */
+#toggle-draft-mode.active {
+  background: #ff0000 !important; /* Czerwony jak w menu burgerowym */
+  border-color: #ff0000;
+}
+
+#save-draft-version {
+  background: #2a2a2a !important; /* Szary jak w menu burgerowym */
+  color: #ffffff !important; /* Biały tekst widoczny od razu */
+  padding: 0.6rem 1.2rem !important; /* Zmniejszony padding */
+  border-radius: 500px !important;
+  font-weight: 600 !important;
+  font-size: 0.75rem !important; /* Zmniejszona czcionka */
+  transition: all 0.2s ease !important;
+  position: relative !important;
+  overflow: hidden !important;
+  border: none !important;
+  z-index: 10 !important; /* Tekst nad pseudo-elementem */
+  width: 160px !important;
+  max-width: 160px !important;
+  min-width: 160px !important;
+}
+
+#save-draft-version::before {
+  content: "" !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  z-index: -1 !important; /* Zmienione na -1 żeby było za tekstem */
+  background: #2a2a2a !important;
+  transform: skew(30deg) !important;
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1) !important;
+}
+
+#save-draft-version:hover {
+  background: #007bff !important; /* Niebieski dla zapisz wersję roboczą */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+#save-draft-version:hover::before {
+  transform: translate3d(100%, 0, 0) !important;
+}
+
+#save-draft-version:disabled {
+  background: #6c757d !important;
+  color: #fff !important;
+  cursor: not-allowed !important;
+  transform: none !important;
+}
+
+#save-draft-version:disabled::before {
+  display: none !important;
+}
+
+#save-draft-shifts {
+  background: #2a2a2a !important; /* Szary jak w menu burgerowym */
+  color: #ffffff !important; /* Biały tekst widoczny od razu */
+  border: none !important;
+  font-weight: 600 !important;
+  font-size: 0.75rem !important; /* Zmniejszona czcionka */
+  position: relative !important;
+  overflow: hidden !important;
+  border-radius: 500px !important;
+  padding: 0.6rem 1.2rem !important; /* Zmniejszony padding */
+  z-index: 10 !important; /* Tekst nad pseudo-elementem */
+}
+
+#save-draft-shifts::before {
+  content: "" !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  z-index: -1 !important; /* Zmienione na -1 żeby było za tekstem */
+  background: #2a2a2a !important;
+  transform: skew(30deg) !important;
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1) !important;
+}
+
+#save-draft-shifts:hover {
+  background: #ffc107 !important; /* Żółty dla zapisz wersję roboczą */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+#save-draft-shifts:hover::before {
+  transform: translate3d(100%, 0, 0) !important;
+}
+
+#publish-draft-shifts {
+  background: #2a2a2a !important; /* Szary jak w menu burgerowym */
+  color: #ffffff !important; /* Biały tekst widoczny od razu */
+  border: none !important;
+  font-weight: 600 !important;
+  font-size: 0.75rem !important; /* Zmniejszona czcionka */
+  position: relative !important;
+  overflow: hidden !important;
+  border-radius: 500px !important;
+  padding: 0.6rem 1.2rem !important; /* Zmniejszony padding */
+  z-index: 10 !important; /* Tekst nad pseudo-elementem */
+  width: 160px !important;
+  max-width: 160px !important;
+  min-width: 160px !important;
+}
+
+#publish-draft-shifts::before {
+  content: "" !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  z-index: -1 !important; /* Zmienione na -1 żeby było za tekstem */
+  background: #2a2a2a !important;
+  transform: skew(30deg) !important;
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.8, 1) !important;
+}
+
+#publish-draft-shifts:hover {
+  background: #28a745 !important; /* Zielony dla prześlij zmiany */
+  color: #000000 !important; /* Czarny tekst */
+  transform: translateY(-2px) !important;
+}
+
+#publish-draft-shifts:hover::before {
+  transform: translate3d(100%, 0, 0) !important;
+}
+
+/* Dark mode dla przycisków trybu roboczego */
+.dark-mode #toggle-draft-mode {
+  background: #ff9800;
+  color: white;
+}
+
+.dark-mode #toggle-draft-mode:hover {
+  background: #f57c00;
+}
+
+.dark-mode #save-draft-version {
+  background: #ffc107;
+  color: #212529;
+}
+
+.dark-mode #save-draft-shifts {
+  background: #ff9800;
+  color: white;
+}
+
+.dark-mode #publish-draft-shifts {
+  background: #28a745;
+  color: white;
+}
+
+/* JASNY MOTYW CAŁKOWICIE USUNIĘTY */
+
+/* Spotify-style login design */
+.spotify-login-main {
+  background: #000;
+  color: #fff;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  font-family: 'Circular', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+.spotify-login-header {
+  padding: 2rem 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.spotify-logo-container {
+  height: 80px;
+  width: 80px;
+}
+
+.spotify-logo {
+  height: 100%;
+  width: auto;
+  object-fit: contain;
+}
+
+.spotify-login-section {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 2rem;
+}
+
+.spotify-login-content {
+  width: 100%;
+  max-width: 400px;
+}
+
+.spotify-welcome-container {
+  text-align: center;
+}
+
+.spotify-welcome-text {
+  margin-bottom: 2rem;
+}
+
+.spotify-welcome-title {
+  font-size: 2rem;
+  font-weight: 700;
+  margin: 0;
+  color: #fff;
+}
+
+.spotify-spacing {
+  height: 1rem;
+}
+
+.spotify-error-message {
+  background: #e22134;
+  color: #fff;
+  padding: 1rem;
+  border-radius: 4px;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+}
+
+.spotify-login-tabs {
+  margin-bottom: 1rem;
+}
+
+.spotify-tab-buttons {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.spotify-tab-button {
+  background: transparent;
+  border: 1px solid #535353;
+  color: #b3b3b3;
+  padding: 0.5rem 1rem;
+  border-radius: 500px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.spotify-tab-button:hover {
+  border-color: #fff;
+  color: #fff;
+}
+
+.spotify-tab-button.active {
+  background: #fff;
+  color: #000;
+  border-color: #fff;
+}
+
+.spotify-email-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.spotify-tab-content {
+  display: none;
+}
+
+.spotify-tab-content.active {
+  display: block;
+}
+
+.spotify-email-tab-content {
+  display: none;
+}
+
+.spotify-email-tab-content.active {
+  display: block;
+}
+
+.spotify-google-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  width: 100%;
+  background: #fff;
+  color: #000;
+  border: none;
+  border-radius: 500px;
+  padding: 1rem;
+  font-size: 1rem;
+  font-weight: 700;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  margin-bottom: 1rem;
+}
+
+.spotify-google-btn:hover {
+  transform: scale(1.04);
+  background: #f1f1f1;
+}
+
+.spotify-btn-icon-wrapper {
+  display: flex;
+  align-items: center;
+}
+
+.spotify-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.spotify-form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.spotify-form-group__label-group {
+  display: flex;
+  align-items: center;
+}
+
+.spotify-form-group__label {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #fff;
+  margin: 0;
+}
+
+.spotify-form-group__label-inner {
+  display: block;
+}
+
+.spotify-form-input {
+  background: #121212;
+  border: 1px solid #535353;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 1rem;
+  padding: 1rem;
+  transition: all 0.2s ease;
+}
+
+.spotify-form-input:focus {
+  outline: none;
+  border-color: #dc2626;
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2);
+}
+
+.spotify-form-input::placeholder {
+  color: #b3b3b3;
+}
+
+.spotify-password-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.spotify-password-group .spotify-form-input {
+  padding-right: 3rem;
+}
+
+.spotify-password-toggle {
+  position: absolute;
+  right: 1rem;
+  background: none;
+  border: none;
+  color: #b3b3b3;
+  cursor: pointer;
+  padding: 0.5rem;
+  display: flex;
+  align-items: center;
+  transition: color 0.2s ease;
+}
+
+.spotify-password-toggle:hover {
+  color: #fff;
+}
+
+.spotify-eye-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.spotify-primary-btn {
+  background: #dc2626;
+  color: #fff;
+  border: none;
+  border-radius: 500px;
+  padding: 1rem;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-top: 1rem;
+}
+
+.spotify-primary-btn:hover {
+  background: #ef4444;
+  transform: scale(1.04);
+}
+
+.spotify-btn-inner {
+  display: block;
+}
+
+.spotify-divider {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin: 2rem 0;
+}
+
+.spotify-divider-line {
+  flex: 1;
+  height: 1px;
+  background: #535353;
+}
+
+.spotify-divider-text {
+  color: #b3b3b3;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.spotify-info-message {
+  text-align: center;
+  margin-top: 2rem;
+}
+
+.spotify-info-text {
+  color: #b3b3b3;
+  font-size: 0.875rem;
+  margin: 0;
+  line-height: 1.4;
+}
+
+/* Responsive design for Spotify login */
+@media (max-width: 768px) {
+  .spotify-login-section {
+    padding: 1rem;
+  }
+  
+  .spotify-login-content {
+    max-width: 350px;
+  }
+  
+  .spotify-welcome-title {
+    font-size: 1.75rem;
+  }
+  
+  .spotify-tab-buttons {
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  
+  .spotify-tab-button {
+    padding: 0.75rem 1rem;
+    font-size: 1rem;
+  }
+  
+  .spotify-google-btn {
+    padding: 1.25rem;
+    font-size: 1.125rem;
+  }
+  
+  .spotify-form-input {
+    padding: 1.25rem;
+    font-size: 1.125rem;
+  }
+  
+  .spotify-primary-btn {
+    padding: 1.25rem;
+    font-size: 1.125rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .spotify-login-content {
+    max-width: 320px;
+  }
+  
+  .spotify-welcome-title {
+    font-size: 1.5rem;
+  }
+  
+  .spotify-google-btn {
+    padding: 1rem;
+    font-size: 1rem;
+  }
+  
+  .spotify-form-input {
+    padding: 1rem;
+    font-size: 1rem;
+  }
+  
+  .spotify-primary-btn {
+    padding: 1rem;
+    font-size: 1rem;
+  }
+}
+
+
+
+
+
