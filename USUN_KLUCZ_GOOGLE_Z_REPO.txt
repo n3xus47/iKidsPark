@@ -1,0 +1,9 @@
+TYMCZASOWE ROZWIAZANIE.
+
+Plik google-service-account.json zostal dodany do prywatnego repo tylko po to,
+zeby latwo przeniesc konfiguracje na inny komputer.
+
+Po przeniesieniu:
+1. usun google-service-account.json z repo,
+2. dodaj go z powrotem do .gitignore,
+3. najlepiej utworz nowy klucz w Google Cloud i usun stary.
