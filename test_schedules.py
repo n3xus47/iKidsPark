@@ -78,6 +78,7 @@ def test_build_grafik_month_model_days_and_mapping() -> None:
     assert "Alicja Fitzner" in shifts
     assert shifts["Alicja Fitzner"]["shift"] == "15-21"
     assert shifts["Alicja Fitzner"]["hours"] == "6"
+    assert shifts["Alicja Fitzner"]["position"] == "A"
 
     # wolne / "-" nie trafia do shifts_by_date
     assert "Karol Pańczyk" not in model["shifts_by_date"].get("2026-07-08", {})
@@ -129,6 +130,23 @@ def test_estimate_hours_from_shift() -> None:
     assert main.cell_hours_value("9-21", "") == 12.0
 
 
+def test_schedule_position_modifier_class() -> None:
+    assert main.schedule_position_modifier_class("A") == "emp-position--animator"
+    assert main.schedule_position_modifier_class("ou") == "emp-position--organizer"
+    assert main.schedule_position_modifier_class("KU") == "emp-position--kuchnia"
+    assert main.schedule_position_modifier_class("D") == "emp-position--dyrekcja"
+    assert main.schedule_position_modifier_for_label("Animator") == "emp-position--animator"
+    assert main.schedule_position_modifier_for_label("Dyrekcja") == "emp-position--dyrekcja"
+    assert main.schedule_position_watermark_label("Animator") == "Animator"
+
+
+def test_schedule_grafik_short_name() -> None:
+    assert main.schedule_grafik_short_name("Nikodem Bondarczuk") == "Nikodem B."
+    assert main.schedule_grafik_short_name("Alicja Fitzner") == "Alicja F."
+    assert main.schedule_grafik_short_name("Jan") == "Jan"
+    assert main.schedule_grafik_short_name("Anna Maria Kowalska") == "Anna Maria K."
+
+
 def test_report_role_for_mapping() -> None:
     assert main.report_role_for("Animator") == "Animatorzy"
     assert main.report_role_for("Organizator Urodzin") == "Organizator urodzin"
@@ -139,10 +157,19 @@ def test_report_role_for_mapping() -> None:
     assert main.report_role_for("Osoba sprzątająca") == "Sprzątaczki + zmywak"
     assert main.report_role_for("Kierownik animatorów") == "Kierownik animatorów"
     assert main.report_role_for("HR") == "Kierownik HR"
+    assert main.report_role_for("Dyrekcja") == "Dyrekcja"
     assert main.report_role_for("Nieznane stanowisko") == "Inne"
     assert main.report_role_for_shift("Agata Krzyżanowska", "", "9-17") == "Kierownik HR"
     assert main.report_role_for_shift("Adam Tur", "", "10-20") == "Kierownik animatorów"
     assert main.report_role_for_shift("Maciej Pacholak", "", "10-21") == "Kuchnia"
+    assert main.report_role_for_shift("Łukasz Aleksandrowicz", "", "9-17") == "Dyrekcja"
+    assert main.schedule_employee_display_position("Maciej Pacholak", "") == "SK"
+    assert main.schedule_employee_display_position("Maciej Pacholak", "Kuchnia") == "SK"
+    assert main.schedule_employee_display_position("Alicja Fitzner", "Animator") == "A"
+    assert main.schedule_employee_display_position("Jan Kowalski", "Organizator Urodzin") == "OU"
+    assert main.schedule_employee_display_position("Łukasz Aleksandrowicz", "Dyrekcja") == "D"
+    assert main.schedule_employee_display_position("Łukasz Aleksandrowicz", "") == "D"
+    assert main.schedule_employee_full_position("Alicja Fitzner", "Animator") == "Animator"
     assert main.report_role_for_shift("Weronika Walkowiak", "", "9-21") == "Administrator"
     assert main.report_role_for_shift("Hanna Hodmash", "Kelner", "11-21B") == "Bar"
     assert main.shift_has_bar_marker("11-21B") is True
@@ -230,6 +257,142 @@ def test_format_shift_report_text_layout() -> None:
     assert text.endswith("👥 Razem: 2 osób na zmianie")
 
 
+def test_schedule_person_key_collapses_whitespace() -> None:
+    assert main.schedule_person_key("Anastazja  Adaszak") == main.schedule_person_key("Anastazja Adaszak")
+    assert main.schedule_clean_person_name("  Kinga   Piotrowska ") == "Kinga Piotrowska"
+
+
+def test_compact_schedule_entries_skips_redundant_duplicate_row() -> None:
+    shifts = [
+        {"date": "2026-07-06", "shift": "13-21", "hours": "8"},
+        {"date": "2026-07-08", "shift": "9-15", "hours": "6"},
+        {"date": "2026-07-10", "shift": "15-21", "hours": "6"},
+    ]
+    entries = [
+        {"name": "Anastazja Adaszak", "position": "Animator", "shifts": shifts},
+        {"name": "Anastazja  Adaszak", "position": "", "shifts": list(shifts)},
+    ]
+    compact = main.compact_schedule_entries(entries)
+    assert len(compact) == 1
+    assert compact[0]["total"] == 20.0
+
+
+def test_compact_schedule_entries_merges_same_name_different_position() -> None:
+    entries = [
+        {
+            "name": "Kinga Piotrowska",
+            "position": "",
+            "shifts": [
+                {"date": "2026-07-06", "shift": "15-21", "hours": "6"},
+                {"date": "2026-07-10", "shift": "9-21", "hours": "12"},
+            ],
+        },
+        {
+            "name": "Kinga Piotrowska",
+            "position": "Animator",
+            "shifts": [
+                {"date": "2026-07-10", "shift": "-", "hours": ""},
+                {"date": "2026-07-12", "shift": "13-21", "hours": "8"},
+            ],
+        },
+    ]
+    compact = main.compact_schedule_entries(entries)
+    assert len(compact) == 1
+    kinga = compact[0]
+    assert kinga["name"] == "Kinga Piotrowska"
+    assert kinga["position"] == "A"
+    days = kinga["days"]
+    assert days["2026-07-06"]["shift"] == "15-21"
+    assert days["2026-07-10"]["shift"] == "9-21"
+    assert days["2026-07-12"]["shift"] == "13-21"
+    assert kinga["total"] == 26.0
+
+
+def test_dedupe_schedule_entries_keeps_best_row_per_name_per_week() -> None:
+    week = "2026-07-06"
+    entries = [
+        {
+            "name": "Kinga Piotrowska",
+            "position": "",
+            "week_start": week,
+            "shifts": [{"date": "2026-07-06", "shift": "15-21", "hours": "6"}],
+            "total_hours": "6",
+            "sheet": "Animatorzy 07.2026",
+            "sheet_month": "2026-07",
+            "primary_month": "2026-07",
+        },
+        {
+            "name": "Kinga Piotrowska",
+            "position": "Animator",
+            "week_start": week,
+            "shifts": [
+                {"date": "2026-07-06", "shift": "-", "hours": ""},
+                {"date": "2026-07-08", "shift": "9-21", "hours": "12"},
+            ],
+            "total_hours": "12",
+            "sheet": "Animatorzy 07.2026",
+            "sheet_month": "2026-07",
+            "primary_month": "2026-07",
+        },
+    ]
+    deduped = main.dedupe_schedule_entries(entries)
+    assert len(deduped) == 1
+    kept = deduped[0]
+    assert kept["position"] in {"", "Animator"}
+    shift_dates = {
+        str(shift.get("date"))
+        for shift in kept.get("shifts", [])
+        if isinstance(shift, dict) and shift.get("date")
+    }
+    assert "2026-07-08" in shift_dates
+
+
+def test_build_grafik_month_model_no_duplicate_employee_rows() -> None:
+    month = "2026-07"
+    entries = sample_entries(month)
+    entries.append(
+        {
+            "name": "Kinga Piotrowska",
+            "position": "",
+            "department": "animatorzy",
+            "week_start": "2026-07-06",
+            "shifts": [
+                {
+                    "day": "Piątek",
+                    "date": "2026-07-10",
+                    "date_label": "10.07",
+                    "month": month,
+                    "shift": "15-21",
+                    "hours": "6",
+                },
+            ],
+            "total_hours": "6",
+        }
+    )
+    entries.append(
+        {
+            "name": "Kinga Piotrowska",
+            "position": "Animator",
+            "department": "animatorzy",
+            "week_start": "2026-07-06",
+            "shifts": [
+                {
+                    "day": "Niedziela",
+                    "date": "2026-07-12",
+                    "date_label": "12.07",
+                    "month": month,
+                    "shift": "9-21",
+                    "hours": "12",
+                },
+            ],
+            "total_hours": "12",
+        }
+    )
+    model = main.build_grafik_month_model(entries, month)
+    kinga_rows = [emp for emp in model["employees"] if emp.get("name") == "Kinga Piotrowska"]
+    assert len(kinga_rows) == 1
+
+
 def test_render_schedule_grafik_grid_contains_table() -> None:
     month = "2026-07"
     model = main.build_grafik_month_model(sample_entries(month), month)
@@ -253,8 +416,9 @@ def test_render_schedule_grafik_grid_contains_table() -> None:
     assert "Karol Pańczyk" in html
     assert "grafiki-roster" in html
     assert "shifts-roster" in html
-    assert "shifts-count" in html
-    assert "Na zmianie" in html
+    assert "shifts-summary" in html
+    assert "staff-summary" in html
+    assert "staff-summary" in html
     assert "shift-prev-day" in html
     assert "shift-report-copy" in html
     assert "Raport zmiany" in html
@@ -266,6 +430,45 @@ def test_render_schedule_grafik_grid_contains_table() -> None:
     assert 'data-employee="' in html
     assert "hours-total-row" in html
     assert "col-summary" in html
+    assert 'data-mobile-month="1"' in html
+    assert "grafiki-mobile-month" in html
+    assert "grafiki-mobile-cal-grid" in html
+    assert "grafik-emp-search" in html
+    assert "grafiki-month-emp-picker" in html
+    assert "grafiki-month-emp-detail" in html
+    assert "grafiki-emp-card" in html
+    assert "grafiki-emp-shift" in html
+    assert 'hidden' in html
+
+
+def test_render_grafik_mobile_month_employee_picker() -> None:
+    month = "2026-07"
+    model = main.build_grafik_month_model(sample_entries(month), month)
+    employee_list = [emp for emp in model["employees"] if isinstance(emp, dict)]
+    date_columns = [row for row in model["schedule_rows"] if isinstance(row, dict) and row.get("date")]
+    hours_by_emp = {str(emp.get("name") or ""): 12.0 for emp in employee_list}
+    html = main.render_grafik_mobile_month_employees(
+        employee_list,
+        date_columns,
+        model["shifts_by_date"],
+        hours_by_emp,
+    )
+    assert "grafik-emp-search" in html
+    assert "grafiki-emp-options" in html
+    assert "Alicja Fitzner" in html
+    assert 'class="grafiki-emp-card is-active"' in html or 'class="grafiki-emp-card"' in html
+
+
+def test_render_schedule_grafik_month_mobile_calendar_padding() -> None:
+    month = "2026-07"
+    model = main.build_grafik_month_model(sample_entries(month), month)
+    date_columns = [row for row in model["schedule_rows"] if isinstance(row, dict) and row.get("date")]
+    people_by_date = {str(row["date"]): 1 for row in date_columns[:3]}
+    html = main.render_grafik_mobile_month_calendar(date_columns, people_by_date)
+    assert "grafiki-mobile-cal-weekdays" in html
+    assert html.count("grafiki-mobile-cal-pad") == 2  # 2026-07-01 is Wednesday
+    assert 'data-date="2026-07-10"' in html
+    assert "cal-day-count" in html
 
 
 def test_render_schedule_grafik_week_grid() -> None:
@@ -290,6 +493,8 @@ def test_render_schedule_grafik_week_grid() -> None:
     assert "15-21" in html
     assert "shifts-roster" in html
     assert "grafiki-period-nav" not in html
+    assert "grafiki-mobile-month" not in html
+    assert 'data-mobile-month="1"' not in html
 
 
 def test_schedule_adjacent_month() -> None:
@@ -377,13 +582,22 @@ def main_cli() -> int:
         test_shift_period_bucket,
         test_normalize_and_nonwork_shifts,
         test_estimate_hours_from_shift,
+        test_schedule_position_modifier_class,
+        test_schedule_grafik_short_name,
         test_report_role_for_mapping,
         test_format_staff_count_half_and_full,
         test_half_shift_boundary,
         test_standing_konservator,
         test_build_shift_report_counts,
         test_format_shift_report_text_layout,
+        test_schedule_person_key_collapses_whitespace,
+        test_compact_schedule_entries_skips_redundant_duplicate_row,
+        test_compact_schedule_entries_merges_same_name_different_position,
+        test_dedupe_schedule_entries_keeps_best_row_per_name_per_week,
+        test_build_grafik_month_model_no_duplicate_employee_rows,
         test_render_schedule_grafik_grid_contains_table,
+        test_render_grafik_mobile_month_employee_picker,
+        test_render_schedule_grafik_month_mobile_calendar_padding,
         test_render_schedule_grafik_week_grid,
         test_schedule_adjacent_month,
         test_schedule_adjacent_week,

@@ -92,6 +92,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").
 GOOGLE_SERVICE_ACCOUNT_JSON_PATH = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "").strip()
 GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "A1:Z250").strip()
 GOOGLE_SHEETS_CACHE_SECONDS = int(os.environ.get("GOOGLE_SHEETS_CACHE_SECONDS", "600"))
+RESERVATIONS_CACHE_SECONDS = int(os.environ.get("RESERVATIONS_CACHE_SECONDS", "120"))
 LOGO_PATH = Path(__file__).with_name("logo.png")
 MENU_LOGO_PATH = Path(__file__).with_name("logox221.png")
 PWA_LOGO_PATH = Path(__file__).with_name("pwalogo.png")
@@ -99,6 +100,9 @@ ROOM_PLAN_SVG_PATH = Path(__file__).with_name("14.svg")
 ROOM_PLAN_PNG_PATH = Path(__file__).with_name("assets") / "room-plan.png"
 SOURCE_PATH = Path(__file__)
 SOURCE_MTIME = SOURCE_PATH.stat().st_mtime
+_RELOAD_LOCK = threading.Lock()
+_RELOAD_TIMER: threading.Timer | None = None
+_DEV_RELOAD_DEBOUNCE_SEC = 1.5
 CA_CERT_PATH = Path(__file__).with_name("ikids-local-ca.crt")
 CA_KEY_PATH = Path(__file__).with_name("ikids-local-ca.key")
 CERT_PATH = Path(__file__).with_name("ikids-local.crt")
@@ -1696,6 +1700,17 @@ def get_reservations_for_days(iso_dates: list[str]) -> dict[str, list[DbRow]]:
     first, last = min(valid_days), max(valid_days)
     range_start, _ = day_bounds(first)
     _, range_end = day_bounds(last)
+    cache_key = f"{range_start}|{range_end}"
+    now = datetime.now().timestamp()
+    cached_key = str(_RESERVATIONS_RANGE_CACHE.get("key") or "")
+    cached_result = _RESERVATIONS_RANGE_CACHE.get("result")
+    if (
+        cached_key == cache_key
+        and isinstance(cached_result, dict)
+        and now - float(_RESERVATIONS_RANGE_CACHE.get("loaded_at", 0.0)) < RESERVATIONS_CACHE_SECONDS
+    ):
+        return {iso: list(cached_result.get(iso, [])) for iso in iso_dates}
+
     rows = db_rows(
         """
         SELECT *
@@ -1712,6 +1727,9 @@ def get_reservations_for_days(iso_dates: list[str]) -> dict[str, list[DbRow]]:
         for iso, (day_start, day_end) in bounds_by_iso.items():
             if start_at < day_end and end_at > day_start:
                 result[iso].append(row)
+    _RESERVATIONS_RANGE_CACHE["key"] = cache_key
+    _RESERVATIONS_RANGE_CACHE["loaded_at"] = now
+    _RESERVATIONS_RANGE_CACHE["result"] = {iso: list(day_rows) for iso, day_rows in result.items()}
     return result
 
 
@@ -1891,7 +1909,10 @@ SCHEDULE_DEPARTMENT_MATCHERS = {
     ),
 }
 _SCHEDULE_CACHE: dict[str, object] = {"loaded_at": 0.0, "result": None}
+_SCHEDULE_LOCK = threading.Lock()
 _GOOGLE_TOKEN_CACHE: dict[str, object] = {"token": "", "expires_at": 0.0}
+_RESERVATIONS_RANGE_CACHE: dict[str, object] = {"loaded_at": 0.0, "key": "", "result": None}
+_SHIFT_REPORT_CACHE: dict[str, object] = {"schedule_loaded_at": 0.0, "reports": {}}
 
 
 def normalize_search_text(value: object) -> str:
@@ -1899,6 +1920,31 @@ def normalize_search_text(value: object) -> str:
     ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     ascii_text = ascii_text.replace("ł", "l").replace("Ł", "L")
     return ascii_text.lower().strip()
+
+
+def schedule_clean_person_name(value: object) -> str:
+    """Jedna spacja, bez NBSP — ten sam format co w arkuszu po ludzkim copy-paste."""
+    raw = str(value or "").replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def schedule_person_key(value: object) -> str:
+    return normalize_search_text(schedule_clean_person_name(value))
+
+
+def schedule_grafik_short_name(value: object) -> str:
+    """Imię + inicjał nazwiska w tabeli grafiku, np. Nikodem B."""
+    name = schedule_clean_person_name(value)
+    if not name:
+        return ""
+    parts = name.split()
+    if len(parts) < 2:
+        return name
+    surname = parts[-1]
+    initial = surname[0].upper()
+    if not initial.isalpha():
+        return name
+    return f"{' '.join(parts[:-1])} {initial}."
 
 
 def schedule_month_from_title(sheet_title: str) -> tuple[int, int] | None:
@@ -2133,7 +2179,6 @@ def parse_schedule_block(
                 }
             )
 
-    entries: list[dict[str, object]] = []
     week_dates = [date.fromisoformat(str(day["date"])) for day in day_columns if day.get("date")]
     if week_dates and not schedule_dates_form_contiguous_week(week_dates):
         return []
@@ -2145,12 +2190,13 @@ def parse_schedule_block(
     # Miesiąc bloku bierzemy z dat nad tabelką (20.07 → lipiec), nie z nazwy zakładki 08.2026.
     block_month = dominant_schedule_month(week_dates) or primary_month
 
+    best_in_block: dict[str, tuple[int, dict[str, object]]] = {}
     for row in rows[header_index + 1 : next_header_index]:
-        name = row_cell(row, name_index)
+        name = schedule_clean_person_name(row_cell(row, name_index))
         position = row_cell(row, position_index)
         if not name and not position:
             continue
-        normalized_name = normalize_search_text(name)
+        normalized_name = schedule_person_key(name)
         normalized_position = normalize_search_text(position)
         if normalized_name in {"razem", "suma", "lp.", "lp"} or "imie" in normalized_name:
             continue
@@ -2175,21 +2221,30 @@ def parse_schedule_block(
             )
         if not name and not has_shift:
             continue
-        entries.append(
-            {
-                "sheet": sheet_title,
-                "sheet_month": block_month,
-                "department": schedule_department_for(sheet_title, position),
-                "week_start": week_start,
-                "week_months": week_months,
-                "primary_month": primary_month,
-                "name": name or "Bez nazwiska",
-                "position": position,
-                "total_hours": row_cell(row, total_index),
-                "shifts": shifts,
-            }
-        )
-    return entries
+        entry: dict[str, object] = {
+            "sheet": sheet_title,
+            "sheet_month": block_month,
+            "department": schedule_department_for(sheet_title, position),
+            "week_start": week_start,
+            "week_months": week_months,
+            "primary_month": primary_month,
+            "name": name or "Bez nazwiska",
+            "position": position,
+            "total_hours": row_cell(row, total_index),
+            "shifts": shifts,
+        }
+        person_key = schedule_person_key(name)
+        score = schedule_entry_row_score(entry)
+        previous = best_in_block.get(person_key)
+        if previous:
+            previous_score, previous_entry = previous
+            if score < previous_score:
+                continue
+            if score == previous_score and not str(entry.get("position") or "").strip():
+                if str(previous_entry.get("position") or "").strip():
+                    continue
+        best_in_block[person_key] = (score, entry)
+    return [item[1] for item in best_in_block.values()]
 
 
 def parse_schedule_sheet(sheet_title: str, rows: list[list[str]]) -> list[dict[str, object]]:
@@ -2222,7 +2277,7 @@ def parse_schedule_sheet(sheet_title: str, rows: list[list[str]]) -> list[dict[s
             score = shift_score + (2 if total_hours else 0)
             person_week_key = (
                 str(entry.get("week_start") or ""),
-                normalize_search_text(str(entry.get("name") or "")) + "|" + normalize_search_text(str(entry.get("position") or "")),
+                schedule_person_key(str(entry.get("name") or "")),
             )
             previous = best_by_person_week.get(person_week_key)
             if not previous or score > previous[0]:
@@ -2243,6 +2298,8 @@ def schedule_entry_score(entry: dict[str, object]) -> int:
                 shift_score += 1
     total_hours = str(entry.get("total_hours") or "").strip()
     score = shift_score + (2 if total_hours else 0)
+    if str(entry.get("position") or "").strip():
+        score += 1
     # Przy skopiowanej tabelce lipiec→sierpień preferuj zakładkę zgodną z datami bloku.
     title_month = schedule_month_from_title(str(entry.get("sheet") or ""))
     block_month = str(entry.get("sheet_month") or entry.get("primary_month") or "")
@@ -2256,7 +2313,7 @@ def dedupe_schedule_entries(entries: list[dict[str, object]]) -> list[dict[str, 
     for entry in entries:
         person_week_key = (
             str(entry.get("week_start") or ""),
-            normalize_search_text(str(entry.get("name") or "")) + "|" + normalize_search_text(str(entry.get("position") or "")),
+            schedule_person_key(str(entry.get("name") or "")),
         )
         score = schedule_entry_score(entry)
         previous = best_by_person_week.get(person_week_key)
@@ -2270,36 +2327,45 @@ def load_live_schedule(force: bool = False) -> dict[str, object]:
         return {"ok": False, "error": "Brak GOOGLE_SHEET_ID w .env.", "entries": [], "loaded_at": None}
 
     now = datetime.now().timestamp()
-    cached_result = _SCHEDULE_CACHE.get("result")
-    if not force and cached_result and now - float(_SCHEDULE_CACHE.get("loaded_at", 0.0)) < GOOGLE_SHEETS_CACHE_SECONDS:
-        return cached_result  # type: ignore[return-value]
+    if not force:
+        cached_result = _SCHEDULE_CACHE.get("result")
+        if cached_result and now - float(_SCHEDULE_CACHE.get("loaded_at", 0.0)) < GOOGLE_SHEETS_CACHE_SECONDS:
+            return cached_result  # type: ignore[return-value]
 
-    try:
-        token = google_sheets_access_token()
-        titles = spreadsheet_sheet_titles(token=token)
-        sheets_by_title = google_sheet_values_batch(titles, token=token)
-        entries: list[dict[str, object]] = []
-        for title in titles:
-            entries.extend(parse_schedule_sheet(title, sheets_by_title.get(title, [])))
-        entries = dedupe_schedule_entries(entries)
-        result = {
-            "ok": True,
-            "error": "",
-            "entries": entries,
-            "sheet_titles": titles,
-            "loaded_at": datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
-        }
-    except Exception as exc:
-        result = {
-            "ok": False,
-            "error": str(exc),
-            "entries": [],
-            "sheet_titles": [],
-            "loaded_at": datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
-        }
-    _SCHEDULE_CACHE["loaded_at"] = now
-    _SCHEDULE_CACHE["result"] = result
-    return result
+    # One Sheets fetch at a time — concurrent /grafiki during cold start used to stampede.
+    with _SCHEDULE_LOCK:
+        now = datetime.now().timestamp()
+        if not force:
+            cached_result = _SCHEDULE_CACHE.get("result")
+            if cached_result and now - float(_SCHEDULE_CACHE.get("loaded_at", 0.0)) < GOOGLE_SHEETS_CACHE_SECONDS:
+                return cached_result  # type: ignore[return-value]
+
+        try:
+            token = google_sheets_access_token()
+            titles = spreadsheet_sheet_titles(token=token)
+            sheets_by_title = google_sheet_values_batch(titles, token=token)
+            entries: list[dict[str, object]] = []
+            for title in titles:
+                entries.extend(parse_schedule_sheet(title, sheets_by_title.get(title, [])))
+            entries = dedupe_schedule_entries(entries)
+            result = {
+                "ok": True,
+                "error": "",
+                "entries": entries,
+                "sheet_titles": titles,
+                "loaded_at": datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
+            }
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "error": str(exc),
+                "entries": [],
+                "sheet_titles": [],
+                "loaded_at": datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
+            }
+        _SCHEDULE_CACHE["loaded_at"] = now
+        _SCHEDULE_CACHE["result"] = result
+        return result
 
 
 def field_time(values: dict[str, object], field: str) -> str:
@@ -2359,7 +2425,6 @@ def boot_wait_page(message: str = "Uruchamianie iKids Park…") -> bytes:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#ffffff">
-  <meta http-equiv="refresh" content="2">
   <title>iKids Park</title>
   <style>
     html, body {{
@@ -2403,6 +2468,24 @@ def boot_wait_page(message: str = "Uruchamianie iKids Park…") -> bytes:
     <img src="{icon_src}" alt="iKids Park" width="512" height="512">
     <p>{safe}</p>
   </div>
+  <script>
+    (() => {{
+      let tries = 0;
+      const poll = async () => {{
+        tries += 1;
+        try {{
+          const response = await fetch("/api/ready", {{ cache: "no-store" }});
+          const data = await response.json();
+          if (data && data.ready) {{
+            window.location.reload();
+            return;
+          }}
+        }} catch (_) {{}}
+        window.setTimeout(poll, tries < 20 ? 700 : 1500);
+      }};
+      window.setTimeout(poll, 400);
+    }})();
+  </script>
 </body>
 </html>""".encode("utf-8")
 
@@ -3178,29 +3261,16 @@ def page_template(
     is_schedules = "page-schedules" in (page_class or "")
     if page_role == "home" and not is_schedules:
         classes.append("page-home")
-        if hub:
-            classes.append("page-home-hub")
-        else:
-            classes.append("page-home-landing")
+        classes.append("page-home-landing")
     if page_class:
         classes.append(page_class)
     body_class = f' class="{" ".join(classes)}"' if classes else ""
     day_q = day_query(selected_day(day))
     home_href = logo_href or hub_home_href(day)
-    urodziny_href = hub_home_href(day, "urodziny")
-    grafiki_href = hub_home_href(day, "grafiki")
     brand_markup = (
         f'<a class="brand-link" href="{escape(home_href)}" aria-label="Strona główna">'
         f'<img class="logo" src="{logo_src}" alt="iKids Park"></a>'
     )
-    on_grafiki = is_schedules or hub == "grafiki"
-    on_urodziny = (not on_grafiki) and (
-        hub == "urodziny" or page_role in ROLE_DEFS
-    )
-    urodziny_current = ' aria-current="page"' if on_urodziny else ""
-    grafiki_current = ' aria-current="page"' if on_grafiki else ""
-    urodziny_link_class = "topbar-link is-active" if on_urodziny else "topbar-link"
-    grafiki_link_class = "topbar-link is-active" if on_grafiki else "topbar-link"
 
     document = f"""<!doctype html>
 <html lang="pl">
@@ -3318,66 +3388,9 @@ def page_template(
       padding: 10px 24px;
       min-height: 58px;
       overflow: visible;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-      align-items: center;
-      gap: 8px;
-    }}
-
-    .topbar-section {{
-      display: inline-flex;
+      display: flex;
       align-items: center;
       justify-content: center;
-      z-index: 2;
-      min-width: 0;
-      width: 100%;
-    }}
-
-    .topbar-section-left {{
-      grid-column: 1;
-      grid-row: 1;
-      justify-self: stretch;
-    }}
-
-    .topbar-section-right {{
-      grid-column: 3;
-      grid-row: 1;
-      justify-self: stretch;
-    }}
-
-    .topbar-link {{
-      box-sizing: border-box;
-      padding: 7px 12px 7px 10px;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-      font-size: 0.92rem;
-      font-weight: 600;
-      line-height: 1;
-      letter-spacing: -0.01em;
-      display: inline-flex;
-      align-items: center;
-      white-space: nowrap;
-      border: 1px solid #000000;
-      border-radius: 7px;
-      gap: 7px;
-      cursor: pointer;
-      text-decoration: none;
-      background: #ffffff;
-      color: #000000;
-    }}
-
-    .topbar-link:hover {{
-      background: #f3f3f3;
-    }}
-
-    .topbar-link.is-active {{
-      background: #000000;
-      border-color: #000000;
-      color: #ffffff;
-    }}
-
-    .topbar-link.is-active:hover {{
-      background: #1a1a1a;
-      border-color: #000000;
     }}
 
     .install-button {{
@@ -3401,34 +3414,18 @@ def page_template(
       background: #1a1a1a;
     }}
 
-    .topbar-link:focus-visible,
     .install-button:focus-visible {{
       outline: 2px solid var(--brand);
       outline-offset: 2px;
     }}
 
-    .topbar-link__icon,
     .install-button__icon {{
       width: 15px;
       height: 15px;
       flex: 0 0 15px;
       display: block;
-      fill: none;
-      stroke: currentColor;
-      stroke-width: 2;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-    }}
-
-    .install-button__icon {{
       fill: currentColor;
       stroke: none;
-    }}
-
-    .topbar-link__label {{
-      font-size: inherit;
-      font-weight: inherit;
-      letter-spacing: inherit;
     }}
 
     .install-button[hidden] {{
@@ -3541,9 +3538,6 @@ def page_template(
     }}
 
     .brand {{
-      grid-column: 2;
-      grid-row: 1;
-      justify-self: center;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -5599,14 +5593,59 @@ def page_template(
       margin-bottom: 0;
     }}
 
-    .home-section-title {{
-      margin: 28px 0 0;
-      text-align: center;
-      font-size: clamp(1.35rem, 4vw, 1.85rem);
-      font-weight: 900;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--ink);
+    .hub-choice {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 22px;
+    }}
+
+    .hub-choice__btn {{
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      min-height: 132px;
+      padding: 28px 18px;
+      border: 2px solid #000000;
+      border-radius: 18px;
+      background: #ffffff;
+      color: #000000;
+      text-decoration: none;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+      transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+    }}
+
+    .hub-choice__btn:hover {{
+      background: #f3f3f3;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+      transform: translateY(-1px);
+    }}
+
+    .hub-choice__btn:focus-visible {{
+      outline: 3px solid #000000;
+      outline-offset: 3px;
+    }}
+
+    .hub-choice__icon {{
+      width: 42px;
+      height: 42px;
+      display: block;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+
+    .hub-choice__label {{
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+      font-size: clamp(1.15rem, 3.6vw, 1.45rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1;
     }}
 
     html:has(body.page-home) {{
@@ -5616,6 +5655,7 @@ def page_template(
 
     html:has(body.page-schedules) {{
       overflow-y: auto;
+      overflow-x: clip;
       height: auto;
     }}
 
@@ -5627,6 +5667,7 @@ def page_template(
 
     body.page-schedules {{
       overflow-y: auto;
+      overflow-x: clip;
       height: auto;
       min-height: 100vh;
       overscroll-behavior: auto;
@@ -5637,7 +5678,10 @@ def page_template(
     }}
 
     body.page-schedules main {{
-      overflow: visible;
+      overflow-x: clip;
+      overflow-y: visible;
+      min-width: 0;
+      max-width: 100%;
     }}
 
     .layout {{
@@ -7030,31 +7074,33 @@ def page_template(
         overflow: visible;
       }}
 
-      .topbar-section {{
-        min-width: 0;
-      }}
-
-      .topbar-link {{
-        padding: 6px 10px 6px 8px;
-        font-size: 0.82rem;
-        gap: 6px;
-      }}
-
       .install-button {{
         top: 4px;
         right: 6px;
         padding: 5px;
       }}
 
-      .topbar-link__icon,
       .install-button__icon {{
         width: 14px;
         height: 14px;
         flex-basis: 14px;
       }}
 
-      .topbar-link__label {{
-        font-size: inherit;
+      .hub-choice {{
+        gap: 12px;
+        margin-top: 18px;
+      }}
+
+      .hub-choice__btn {{
+        min-height: 118px;
+        padding: 22px 14px;
+        gap: 12px;
+        border-radius: 16px;
+      }}
+
+      .hub-choice__icon {{
+        width: 36px;
+        height: 36px;
       }}
 
       .date-month-label {{
@@ -7416,30 +7462,8 @@ def page_template(
   </div>
   <header>
     <div class="topbar">
-      <div class="topbar-section topbar-section-left">
-        <a class="{urodziny_link_class}" href="{escape(urodziny_href)}"{urodziny_current} aria-label="Urodziny">
-          <svg class="topbar-link__icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8"/>
-            <path d="M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1"/>
-            <path d="M2 21h20"/>
-            <path d="M7 8v3M12 8v3M17 8v3"/>
-            <path d="M7 4h.01M12 4h.01M17 4h.01"/>
-          </svg>
-          <span class="topbar-link__label">Urodziny</span>
-        </a>
-      </div>
       <div class="brand">
         {brand_markup}
-      </div>
-      <div class="topbar-section topbar-section-right">
-        <a class="{grafiki_link_class}" href="{escape(grafiki_href)}"{grafiki_current} aria-label="Grafiki">
-          <svg class="topbar-link__icon" viewBox="0 0 24 24" aria-hidden="true">
-            <rect x="3" y="4" width="18" height="18" rx="2"/>
-            <path d="M16 2v4M8 2v4M3 10h18"/>
-            <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>
-          </svg>
-          <span class="topbar-link__label">Grafiki</span>
-        </a>
       </div>
       <button class="install-button" type="button" data-install-app aria-label="Pobierz aplikację" title="Pobierz">
         <svg class="install-button__icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -7807,10 +7831,47 @@ def hub_home_href(day: str, hub: str = "") -> str:
     return "/?" + urlencode(params)
 
 
-def render_home_section_title(title: str) -> str:
-    if not title:
-        return ""
-    return f'<p class="home-section-title">{escape(title)}</p>'
+def default_grafiki_href(day: str, *, role: str = "home") -> str:
+    return schedule_url(
+        role=role if role != "home" else "home",
+        day=normalize_day(day),
+        department="animatorzy",
+        month="",
+        week="",
+        view="week",
+    )
+
+
+def default_urodziny_href(day: str) -> str:
+    day_q = day_query(selected_day(normalize_day(day)))
+    return link_for("manager", day_q)
+
+
+def render_hub_choice(day: str) -> str:
+    urodziny_href = default_urodziny_href(day)
+    grafiki_href = default_grafiki_href(day)
+    return f"""
+<nav class="hub-choice" aria-label="Wybór sekcji">
+  <a class="hub-choice__btn" href="{escape(urodziny_href)}" aria-label="Urodziny">
+    <svg class="hub-choice__icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8"/>
+      <path d="M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1"/>
+      <path d="M2 21h20"/>
+      <path d="M7 8v3M12 8v3M17 8v3"/>
+      <path d="M7 4h.01M12 4h.01M17 4h.01"/>
+    </svg>
+    <span class="hub-choice__label">Urodziny</span>
+  </a>
+  <a class="hub-choice__btn" href="{escape(grafiki_href)}" aria-label="Grafiki">
+    <svg class="hub-choice__icon" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="18" rx="2"/>
+      <path d="M16 2v4M8 2v4M3 10h18"/>
+      <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>
+    </svg>
+    <span class="hub-choice__label">Grafiki</span>
+  </a>
+</nav>
+"""
 
 
 def render_date_toolbar(page_role: str, day: str, *, hub: str = "") -> str:
@@ -7903,8 +7964,8 @@ def render_role_tabs(page_role: str, day: str, *, hub: str = "") -> str:
         )
     home_current = ' aria-current="page"' if page_role == "home" else ""
     home_link = (
-        f'<a class="tab tab-home" href="{escape(hub_home_href(day, hub))}"'
-        f'{home_current} aria-label="Podsumowanie urodzin">'
+        f'<a class="tab tab-home" href="{escape(hub_home_href(day))}"'
+        f'{home_current} aria-label="Strona główna">'
         f'<img class="tab-home-logo" src="{menu_logo_asset_url()}" alt="iKids Park"></a>'
     )
     role_links = [
@@ -7929,7 +7990,7 @@ def render_grafiki_department_tabs(
 ) -> str:
     day = normalize_day(day)
     day_q = day_query(selected_day(day))
-    home_url = home_href or hub_home_href(day, "grafiki")
+    home_url = home_href or hub_home_href(day)
     department_items = [
         ("managerowie", "Menedżerowie", "Menedżerowie", ROLE_NAV_ICONS["manager"]),
         ("animatorzy", "Animatorzy", "Animatorzy", ROLE_NAV_ICONS["animators"]),
@@ -7958,19 +8019,18 @@ def render_grafiki_department_tabs(
     animators_tab = department_tab(*department_items[1])
     kitchen_tab = department_tab(*department_items[2])
     serwis_tab = department_tab(*department_items[3])
-    home_current = ' aria-current="page"' if not selected_department else ""
     home_tab = (
-        f'<a class="tab tab-home" href="{escape(home_url)}"{home_current} '
-        f'aria-label="Podsumowanie grafików" title="Podsumowanie grafików">'
+        f'<a class="tab tab-home" href="{escape(home_url)}" '
+        f'aria-label="Strona główna" title="Strona główna">'
         f'<img class="tab-home-logo" src="{menu_logo_asset_url()}" alt="iKids Park"></a>'
     )
     return f"""
     <div class="tabs">
-      {managers_tab}
+      {serwis_tab}
       {animators_tab}
       {home_tab}
       {kitchen_tab}
-      {serwis_tab}
+      {managers_tab}
     </div>
     """
 
@@ -7982,7 +8042,7 @@ def render_nav(page_role: str, day: str, *, hub: str = "", show_tabs: bool = Tru
     tabs = ""
     if show_tabs:
         if hub == "grafiki":
-            tabs = render_grafiki_department_tabs(role=page_role, day=day, home_href=hub_home_href(day, "grafiki"))
+            tabs = render_grafiki_department_tabs(role=page_role, day=day, home_href=hub_home_href(day))
         else:
             tabs = render_role_tabs(page_role, day, hub=hub or "urodziny")
     return f"""
@@ -10050,34 +10110,149 @@ def schedule_adjacent_week(week: str, weeks: list[str], delta: int) -> str:
     return weeks[index]
 
 
+def schedule_shift_cell_score(shift: dict[str, object]) -> int:
+    score = 0
+    if schedule_shift_is_work(shift.get("shift")):
+        score += 2
+    if str(shift.get("hours") or "").strip():
+        score += 1
+    return score
+
+
+def schedule_entry_row_score(entry: dict[str, object]) -> int:
+    score = 0
+    shifts = entry.get("shifts", [])
+    if isinstance(shifts, list):
+        for shift in shifts:
+            if not isinstance(shift, dict):
+                continue
+            score += schedule_shift_cell_score(shift)
+    if str(entry.get("total_hours") or "").strip():
+        score += 2
+    if str(entry.get("position") or "").strip():
+        score += 1
+    return score
+
+
+def schedule_entry_work_signatures(entry: dict[str, object]) -> dict[str, str]:
+    signatures: dict[str, str] = {}
+    shifts = entry.get("shifts", [])
+    if not isinstance(shifts, list):
+        return signatures
+    for shift in shifts:
+        if not isinstance(shift, dict):
+            continue
+        iso = str(shift.get("date") or "").strip()
+        if not iso or not schedule_shift_is_work(shift.get("shift")):
+            continue
+        signatures[iso] = normalize_schedule_shift(shift.get("shift"))
+    return signatures
+
+
+def schedule_entry_is_redundant_duplicate(
+    existing_days: dict[str, object],
+    entry: dict[str, object],
+) -> bool:
+    """Pomija zdublowany wiersz z arkusza, który nie dodaje nowych zmian."""
+    incoming = schedule_entry_work_signatures(entry)
+    if not incoming:
+        return True
+    if not isinstance(existing_days, dict) or not existing_days:
+        return False
+    for iso, shift in incoming.items():
+        existing = existing_days.get(iso)
+        if not isinstance(existing, dict) or not schedule_shift_is_work(existing.get("shift")):
+            return False
+        if normalize_schedule_shift(existing.get("shift")) != shift:
+            return False
+    return True
+
+
+def schedule_prefer_position(current: str, candidate: str) -> str:
+    current_value = str(current or "").strip()
+    candidate_value = str(candidate or "").strip()
+    if not current_value:
+        return candidate_value
+    if not candidate_value:
+        return current_value
+    if len(candidate_value) > len(current_value):
+        return candidate_value
+    return current_value
+
+
+def schedule_prefer_display_name(current: str, candidate: str) -> str:
+    current_value = str(current or "").strip()
+    candidate_value = str(candidate or "").strip()
+    if not current_value:
+        return candidate_value
+    if not candidate_value:
+        return current_value
+    if len(candidate_value) > len(current_value):
+        return candidate_value
+    return current_value
+
+
+def recalculate_compact_schedule_total(person: dict[str, object]) -> None:
+    days = person.get("days", {})
+    total = 0.0
+    if isinstance(days, dict):
+        for cell in days.values():
+            if not isinstance(cell, dict):
+                continue
+            if schedule_shift_is_work(cell.get("shift")):
+                total += cell_hours_value(cell.get("shift"), cell.get("hours"))
+    person["total"] = total
+
+
 def compact_schedule_entries(entries: list[dict[str, object]]) -> list[dict[str, object]]:
-    merged: dict[tuple[str, str], dict[str, object]] = {}
+    merged: dict[str, dict[str, object]] = {}
     for entry in entries:
-        key = (str(entry.get("name") or ""), str(entry.get("position") or ""))
-        current = merged.setdefault(
-            key,
-            {
-                "name": entry.get("name", ""),
-                "position": entry.get("position", ""),
+        name = schedule_clean_person_name(entry.get("name"))
+        if not name:
+            continue
+        person_key = schedule_person_key(name)
+        current = merged.get(person_key)
+        current_days = current.get("days", {}) if isinstance(current, dict) else {}
+        if not isinstance(current_days, dict):
+            current_days = {}
+        work_signature = schedule_entry_work_signatures(entry)
+        if not current and not work_signature:
+            continue
+        if current and schedule_entry_is_redundant_duplicate(current_days, entry):
+            continue
+        if not current:
+            current = {
+                "name": name,
+                "position": str(entry.get("position") or "").strip(),
                 "total": 0.0,
                 "days": {},
-            },
-        )
+            }
+            merged[person_key] = current
+        else:
+            current["name"] = schedule_prefer_display_name(str(current.get("name") or ""), name)
+            current["position"] = schedule_prefer_position(
+                str(current.get("position") or ""),
+                str(entry.get("position") or ""),
+            )
+        current_days = current["days"]
+        if not isinstance(current_days, dict):
+            current_days = {}
+            current["days"] = current_days
         for shift in entry.get("shifts", []) if isinstance(entry.get("shifts", []), list) else []:
             if not isinstance(shift, dict) or not shift.get("date"):
                 continue
-            current_days = current["days"]
-            if isinstance(current_days, dict):
-                current_days[str(shift["date"])] = {
-                    "shift": str(shift.get("shift") or "").strip(),
-                    "hours": str(shift.get("hours") or "").strip(),
-                }
-            try:
-                hours_value = str(shift.get("hours") or "").replace(",", ".")
-                if hours_value and schedule_shift_is_work(shift.get("shift")):
-                    current["total"] = float(current.get("total", 0.0)) + float(hours_value)
-            except ValueError:
-                pass
+            iso = str(shift["date"])
+            next_cell = {
+                "shift": str(shift.get("shift") or "").strip(),
+                "hours": str(shift.get("hours") or "").strip(),
+            }
+            existing = current_days.get(iso)
+            if isinstance(existing, dict):
+                if schedule_shift_cell_score(existing) > schedule_shift_cell_score(next_cell):
+                    continue
+            current_days[iso] = next_cell
+    for person in merged.values():
+        recalculate_compact_schedule_total(person)
     return list(merged.values())
 
 
@@ -10194,6 +10369,61 @@ SHIFT_REPORT_NAME_OVERRIDES: dict[str, str] = {
     normalize_search_text("Marek Dutkiewicz"): "Administrator",
 }
 
+# Etykieta stanowiska w tabeli grafiku (może różnić się od linii raportu zmiany).
+SCHEDULE_POSITION_DISPLAY_OVERRIDES: dict[str, str] = {
+    schedule_person_key("Maciej Pacholak"): "Szef Kuchni",
+}
+
+# Skróty stanowisk w widoku grafiku (tabela, roster, podsumowanie dnia).
+SCHEDULE_ROLE_ABBREVIATIONS: dict[str, str] = {
+    "Animatorzy": "A",
+    "Organizator urodzin": "OU",
+    "Kelnerzy": "K",
+    "Bar": "B",
+    "Administrator": "ADM",
+    "Kierownik animatorów": "KA",
+    "Kierownik HR": "HR",
+    "Pracownia kreatywna": "PK",
+    "Sprzątaczki + zmywak": "SZ",
+    "Recepcja": "R",
+    "Kuchnia": "KU",
+    "Dyrekcja": "D",
+    "Księgowość": "KŚ",
+    "Konserwator": "KO",
+    "Inne": "?",
+}
+
+SCHEDULE_POSITION_SPECIAL_ABBREVIATIONS: dict[str, str] = {
+    "szef kuchni": "SK",
+    "kierownik zmiany": "ADM",
+    "organizator urodzin": "OU",
+    "pracownia tworcza": "PK",
+    "pracownia kreatywna": "PK",
+}
+
+SCHEDULE_POSITION_MODIFIER_BY_ROLE: dict[str, str] = {
+    "Animatorzy": "emp-position--animator",
+    "Organizator urodzin": "emp-position--organizer",
+    "Kelnerzy": "emp-position--kelner",
+    "Bar": "emp-position--bar",
+    "Administrator": "emp-position--admin",
+    "Kierownik animatorów": "emp-position--kierownik-animatorow",
+    "Kierownik HR": "emp-position--hr",
+    "Pracownia kreatywna": "emp-position--pracownia",
+    "Sprzątaczki + zmywak": "emp-position--sprzatanie",
+    "Recepcja": "emp-position--recepcja",
+    "Kuchnia": "emp-position--kuchnia",
+    "Dyrekcja": "emp-position--dyrekcja",
+    "Księgowość": "emp-position--ksiegowosc",
+    "Konserwator": "emp-position--konserwator",
+    "Inne": "emp-position--other",
+}
+
+SCHEDULE_POSITION_ABBREV_TO_ROLE: dict[str, str] = {
+    abbrev.upper(): role for role, abbrev in SCHEDULE_ROLE_ABBREVIATIONS.items()
+}
+SCHEDULE_POSITION_ABBREV_TO_ROLE["SK"] = "Kuchnia"
+
 
 def shift_has_bar_marker(value: object) -> bool:
     """Dopisek B w komórce (np. 11-21B) = kelner obsługuje bar tego dnia."""
@@ -10203,6 +10433,160 @@ def shift_has_bar_marker(value: object) -> bool:
 
 def report_role_name_override(name: object) -> str | None:
     return SHIFT_REPORT_NAME_OVERRIDES.get(normalize_search_text(name))
+
+
+def schedule_employee_full_position(name: str, position: str) -> str:
+    """Pełna etykieta stanowiska (np. do tooltipa)."""
+    display_override = SCHEDULE_POSITION_DISPLAY_OVERRIDES.get(schedule_person_key(name))
+    if display_override:
+        return display_override
+    position = str(position or "").strip()
+    if position:
+        return position
+    override = report_role_name_override(name)
+    return override or ""
+
+
+def schedule_position_abbreviation(label: str) -> str:
+    """Skraca stanowisko do kodu widocznego w grafiku."""
+    label = str(label or "").strip()
+    if not label:
+        return ""
+    if label in SCHEDULE_ROLE_ABBREVIATIONS:
+        return SCHEDULE_ROLE_ABBREVIATIONS[label]
+    compact = re.sub(r"\s+", "", label)
+    if 1 < len(compact) <= 4 and compact.upper() == compact:
+        return compact
+    hay = normalize_search_text(label)
+    for token, abbrev in SCHEDULE_POSITION_SPECIAL_ABBREVIATIONS.items():
+        if token in hay:
+            return abbrev
+    role = report_role_for(label)
+    return SCHEDULE_ROLE_ABBREVIATIONS.get(role, label)
+
+
+def schedule_employee_display_position(name: str, position: str) -> str:
+    """Skrót stanowiska w tabeli — dla Managerów często z override po nazwisku."""
+    return schedule_position_abbreviation(schedule_employee_full_position(name, position))
+
+
+def schedule_position_modifier_for_label(label: str, *, name: str = "") -> str:
+    full = schedule_employee_full_position(name, label) if name else str(label or "").strip()
+    role = report_role_for(full or label)
+    return SCHEDULE_POSITION_MODIFIER_BY_ROLE.get(role, "emp-position--other")
+
+
+def schedule_position_watermark_label(label: str, *, name: str = "") -> str:
+    full = schedule_employee_full_position(name, label) if name else str(label or "").strip()
+    if full:
+        return full
+    role = report_role_for(label)
+    return role or ""
+
+
+def schedule_position_modifier_class(abbrev: str) -> str:
+    token = str(abbrev or "").strip().upper()
+    role = SCHEDULE_POSITION_ABBREV_TO_ROLE.get(token)
+    if role:
+        return SCHEDULE_POSITION_MODIFIER_BY_ROLE.get(role, "emp-position--other")
+    if token == "A":
+        return "emp-position--animator"
+    if token == "OU":
+        return "emp-position--organizer"
+    return "emp-position--other"
+
+
+def schedule_position_watermark_html(
+    text: str,
+    *,
+    position_full: str = "",
+    name: str = "",
+    class_name: str = "emp-position",
+) -> str:
+    text_value = str(text or "").strip()
+    if not text_value:
+        return ""
+    label = position_full or text_value
+    modifier = schedule_position_modifier_for_label(label, name=name)
+    full_value = schedule_position_watermark_label(label, name=name)
+    title_attr = (
+        f' title="{escape(full_value)}"'
+        if full_value and full_value != text_value
+        else ""
+    )
+    return (
+        f'<span class="{class_name} {modifier}" aria-hidden="true"{title_attr}>'
+        f"{escape(text_value)}"
+        f"</span>"
+    )
+
+
+def schedule_position_span(
+    abbrev: str,
+    full: str = "",
+    *,
+    class_name: str = "emp-position",
+    name: str = "",
+) -> str:
+    abbrev_value = str(abbrev or "").strip()
+    if not abbrev_value:
+        return ""
+    return schedule_position_watermark_html(
+        abbrev_value,
+        position_full=full or abbrev_value,
+        name=name,
+        class_name=class_name,
+    )
+
+
+def schedule_roster_identity_html(
+    name: str,
+    *,
+    position: str = "",
+    position_full: str = "",
+) -> str:
+    watermark = schedule_position_watermark_label(position_full or position, name=name)
+    position_html = schedule_position_watermark_html(
+        watermark,
+        position_full=position_full or position,
+        name=name,
+    )
+    return (
+        f'<div class="roster-identity emp-name-wrap emp-name-wrap--roster" title="{escape(name)}">'
+        f'<span class="emp-name roster-name">{escape(name)}</span>'
+        f"{position_html}"
+        f"</div>"
+    )
+
+
+def schedule_grafik_name_cell_html(
+    short_name: str,
+    *,
+    name_title: str = "",
+    position: str = "",
+    position_full: str = "",
+    employee_name: str = "",
+    wrap_class: str = "emp-name-wrap",
+    watermark_mode: str = "abbrev",
+) -> str:
+    title = name_title or short_name
+    label = position_full or position
+    if watermark_mode == "full":
+        watermark = schedule_position_watermark_label(label, name=employee_name)
+    else:
+        watermark = position
+    position_html = schedule_position_watermark_html(
+        watermark,
+        position_full=label,
+        name=employee_name,
+    )
+    wrap_class = str(wrap_class or "emp-name-wrap").strip() or "emp-name-wrap"
+    return (
+        f'<div class="{wrap_class}" title="{escape(title)}">'
+        f'<span class="emp-name">{escape(short_name)}</span>'
+        f"{position_html}"
+        f"</div>"
+    )
 
 
 def report_role_for_shift(name: object, position: object, shift_raw: object) -> str:
@@ -10239,7 +10623,7 @@ def report_role_for(position: object) -> str:
         return "Recepcja"
     if any(token in hay for token in ("kucharz", "cukiernik", "pizza", "soue", "kuchnia", "szef kuchni")):
         return "Kuchnia"
-    if "dyrektor" in hay or "zastepca" in hay:
+    if any(token in hay for token in ("dyrekcja", "dyrektor", "zastepca")):
         return "Dyrekcja"
     if "ksiegow" in hay:
         return "Księgowość"
@@ -10444,16 +10828,33 @@ def build_shift_reports_for_dates(
     reports: dict[str, str] = {}
     if not iso_dates:
         return reports
-    reservation_cache = get_reservations_for_days(iso_dates)
-    compact = compact_schedule_entries(entries)
+    schedule_loaded_at = float(_SCHEDULE_CACHE.get("loaded_at", 0.0))
+    cached_reports = _SHIFT_REPORT_CACHE.get("reports")
+    if float(_SHIFT_REPORT_CACHE.get("schedule_loaded_at", 0.0)) != schedule_loaded_at:
+        cached_reports = {}
+        _SHIFT_REPORT_CACHE["schedule_loaded_at"] = schedule_loaded_at
+        _SHIFT_REPORT_CACHE["reports"] = cached_reports
+    if not isinstance(cached_reports, dict):
+        cached_reports = {}
+        _SHIFT_REPORT_CACHE["reports"] = cached_reports
+
+    missing_dates = [iso for iso in iso_dates if iso not in cached_reports]
+    if missing_dates:
+        reservation_cache = get_reservations_for_days(missing_dates)
+        compact = compact_schedule_entries(entries)
+        for iso in missing_dates:
+            report = build_shift_report(
+                iso,
+                entries,
+                reservation_rows=reservation_cache.get(iso, []),
+                compact_entries=compact,
+            )
+            cached_reports[iso] = format_shift_report_text(report)
+
     for iso in iso_dates:
-        report = build_shift_report(
-            iso,
-            entries,
-            reservation_rows=reservation_cache.get(iso, []),
-            compact_entries=compact,
-        )
-        reports[iso] = format_shift_report_text(report)
+        text = cached_reports.get(iso)
+        if isinstance(text, str):
+            reports[iso] = text
     return reports
 
 
@@ -10497,7 +10898,14 @@ def build_grafik_day_model(
     employees = [
         {
             "name": str(item.get("name") or "").strip(),
-            "position": str(item.get("position") or "").strip(),
+            "position": schedule_employee_display_position(
+                str(item.get("name") or "").strip(),
+                str(item.get("position") or "").strip(),
+            ),
+            "position_full": schedule_employee_full_position(
+                str(item.get("name") or "").strip(),
+                str(item.get("position") or "").strip(),
+            ),
             "display_name": str(item.get("name") or "").strip(),
             "total": item.get("total", 0.0),
         }
@@ -10526,7 +10934,26 @@ def build_grafik_day_model(
             hours = str(cell.get("hours") or "").strip()
             if not schedule_shift_is_work(shift):
                 continue
-            day_shifts[name] = {"shift": shift, "hours": hours}
+            day_shifts[name] = {
+                "shift": shift,
+                "hours": hours,
+                "position": schedule_employee_display_position(
+                    name,
+                    str(person.get("position") or "").strip(),
+                ),
+                "position_full": schedule_employee_full_position(
+                    name,
+                    str(person.get("position") or "").strip(),
+                ),
+                "position_modifier": schedule_position_modifier_for_label(
+                    str(person.get("position") or "").strip(),
+                    name=name,
+                ),
+                "position_watermark": schedule_position_watermark_label(
+                    str(person.get("position") or "").strip(),
+                    name=name,
+                ),
+            }
             people_count += 1
             hours_sum += parse_hours_number(hours)
         shifts_by_date[iso] = day_shifts
@@ -10618,9 +11045,8 @@ def schedule_day_nav_html(initial_display: str) -> str:
     )
 
 
-def schedule_roster_actions_html(people_count: int) -> str:
+def schedule_shift_report_button_html() -> str:
     return (
-        '<div class="schedule-roster-actions">'
         '<div class="shift-report-panel">'
         '<button type="button" id="shift-report-copy" class="shift-report-copy" aria-label="Kopiuj raport zmiany do WhatsApp">'
         '<span class="shift-report-copy__label">Raport zmiany</span>'
@@ -10632,46 +11058,394 @@ def schedule_roster_actions_html(people_count: int) -> str:
         "</span>"
         "</button>"
         "</div>"
-        f'<h3 class="roster-title">Na zmianie <span id="shifts-count" class="shifts-count">{int(people_count)}</span></h3>'
-        "</div>"
     )
+
+
+def schedule_day_nav_cluster_html(initial_display: str) -> str:
+    """Zachowane dla kompatybilności — używaj assemble_schedule_toolbar."""
+    return schedule_day_nav_html(initial_display)
 
 
 def assemble_schedule_toolbar(
     controls_html: str,
     initial_display: str,
-    people_count: int,
 ) -> str:
-    """Trzy strefy: okres+widok | DZISIAJ na środku | Raport + Na zmianie."""
+    """DZISIAJ na środku paska dnia, raport po prawej (okres jest wyżej)."""
     day_nav = schedule_day_nav_html(initial_display)
-    actions = schedule_roster_actions_html(people_count)
+    report_panel = schedule_shift_report_button_html()
+    center_block = f'<div class="schedule-controls-center">{day_nav}</div>'
+    right_block = f'<div class="schedule-controls-side schedule-controls-right">{report_panel}</div>'
     marker = "<!--schedule-controls-end-->"
     controls_open = '<div class="schedule-controls">'
+    toolbar_tail = f"{center_block}{right_block}</div>"
     if not controls_html.strip():
-        return (
-            f'<div class="schedule-controls">'
-            f'<div class="schedule-controls-side schedule-controls-left"></div>'
-            f'{day_nav}'
-            f'{actions}'
-            f"</div>"
-        )
+        return f'<div class="schedule-controls">{center_block}{right_block}</div>'
     patched = controls_html
     if controls_open in patched:
-        # Lewa strona: istniejący period-cluster; środek: dzień; prawa: akcje.
-        patched = patched.replace(
-            controls_open,
-            controls_open + '<div class="schedule-controls-side schedule-controls-left">',
-            1,
-        )
-        # Zamknij lewą stronę przed markerem i wstaw środek + prawą.
         if marker in patched:
-            return patched.replace(
-                marker,
-                f"</div>{day_nav}{actions}{marker}",
-                1,
+            return patched.replace(marker, f"{toolbar_tail}{marker}", 1)
+        return patched + toolbar_tail
+    return controls_html + day_nav + report_panel
+
+
+def build_staff_summary_by_date(
+    iso_dates: list[str],
+    entries: list[dict[str, object]],
+    *,
+    department: str = "",
+) -> dict[str, list[dict[str, object]]]:
+    """Liczba osób na zmianie wg stanowiska w wybranym dziale."""
+    department = department if department in dict(SCHEDULE_DEPARTMENTS) else ""
+    compact = compact_schedule_entries(entries)
+    dept_by_person: dict[tuple[str, str], str] = {}
+    for entry in entries:
+        person_key = (str(entry.get("name") or ""), str(entry.get("position") or ""))
+        dept_by_person[person_key] = str(entry.get("department") or "serwis")
+
+    result: dict[str, list[dict[str, object]]] = {}
+    for iso in iso_dates:
+        position_counts: dict[str, int] = {}
+        for person in compact:
+            name = str(person.get("name") or "").strip()
+            position = str(person.get("position") or "").strip()
+            if not name:
+                continue
+            days_map = person.get("days", {})
+            if not isinstance(days_map, dict):
+                continue
+            cell = days_map.get(iso, {})
+            if not isinstance(cell, dict):
+                continue
+            shift_raw = str(cell.get("shift") or "").strip()
+            if not schedule_shift_is_work(shift_raw):
+                continue
+            dept = dept_by_person.get((name, position), "serwis")
+            if department and dept != department:
+                continue
+            label = schedule_employee_full_position(name, position) or report_role_for_shift(
+                name, position, shift_raw
             )
-        return patched + f"</div>{day_nav}{actions}"
-    return controls_html + day_nav + actions
+            position_counts[label] = position_counts.get(label, 0) + 1
+
+        items = sorted(
+            [{"name": pos_name, "count": count} for pos_name, count in position_counts.items()],
+            key=lambda item: (-int(item["count"]), normalize_search_text(item["name"])),
+        )
+        result[iso] = items
+    return result
+
+
+def render_staff_summary_html(positions: list[dict[str, object]]) -> str:
+    if not positions:
+        return '<p class="staff-summary-empty muted">brak przypisań</p>'
+    items: list[str] = []
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        name = escape(str(item.get("name") or ""))
+        count = int(item.get("count") or 0)
+        if not name or count <= 0:
+            continue
+        items.append(
+            '<span class="staff-summary-item">'
+            f'<span class="staff-summary-position">{name}</span>'
+            f'<span class="staff-summary-count">{count}</span>'
+            "</span>"
+        )
+    if not items:
+        return '<p class="staff-summary-empty muted">brak przypisań</p>'
+    return f'<div class="staff-summary-grid">{"".join(items)}</div>'
+
+
+def schedule_roster_actions_html(summary_html: str = "") -> str:
+    return (
+        '<div class="grafiki-roster-head">'
+        f'<div id="shifts-summary" class="staff-summary">{summary_html}</div>'
+        "</div>"
+    )
+
+
+def render_grafik_mobile_month_calendar(
+    date_columns: list[dict[str, object]],
+    people_by_date: dict[str, int],
+) -> str:
+    """Kompaktowa siatka kalendarza na telefon (7 kolumn, dni miesiąca)."""
+    if not date_columns:
+        return ""
+
+    weekday_headers = "".join(
+        f'<span class="grafiki-mobile-cal-weekday">{escape(label)}</span>'
+        for label in WEEKDAY_LABELS
+    )
+
+    first_iso = str(date_columns[0].get("date") or "")
+    try:
+        pad_count = date.fromisoformat(first_iso).weekday()
+    except ValueError:
+        pad_count = 0
+    padding = '<span class="grafiki-mobile-cal-pad" aria-hidden="true"></span>' * pad_count
+
+    day_cells: list[str] = []
+    for day in date_columns:
+        iso = str(day.get("date") or "")
+        dd = escape(str(day.get("dd") or ""))
+        abbr = escape(str(day.get("abbr") or ""))
+        people = int(people_by_date.get(iso, 0))
+        classes = ["grafiki-mobile-cal-day"]
+        if day.get("is_off"):
+            classes.append("off-day")
+        if day.get("is_today"):
+            classes.append("today")
+        if people > 0:
+            classes.append("has-shifts")
+        count_html = (
+            f'<span class="cal-day-count">{people}</span>' if people > 0 else ""
+        )
+        day_cells.append(
+            f'<button type="button" class="{" ".join(classes)}" data-date="{escape(iso)}" '
+            f'aria-label="{abbr} {dd}">'
+            f'<span class="cal-day-num">{dd}</span>'
+            f"{count_html}"
+            f"</button>"
+        )
+
+    return (
+        '<div class="grafiki-mobile-month-cal" aria-label="Kalendarz miesiąca">'
+        f'<div class="grafiki-mobile-cal-weekdays">{weekday_headers}</div>'
+        f'<div class="grafiki-mobile-cal-grid">{padding}{"".join(day_cells)}</div>'
+        '<p class="grafiki-mobile-cal-legend muted">Cyfra pod dniem — liczba osób na zmianie</p>'
+        "</div>"
+    )
+
+
+def _employee_has_month_shifts(
+    name: str,
+    date_columns: list[dict[str, object]],
+    shifts_by_date: dict[str, dict[str, dict[str, str]]],
+) -> bool:
+    for day in date_columns:
+        iso = str(day.get("date") or "")
+        row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
+        if not isinstance(row_shifts, dict):
+            continue
+        cell = row_shifts.get(name, {})
+        if not isinstance(cell, dict):
+            continue
+        if schedule_shift_is_work(str(cell.get("shift") or "").strip()):
+            return True
+    return False
+
+
+def render_grafik_employee_month_card(
+    emp: dict[str, object],
+    *,
+    date_columns: list[dict[str, object]],
+    shifts_by_date: dict[str, dict[str, dict[str, str]]],
+    hours_by_emp: dict[str, float],
+    day_meta: dict[str, dict[str, object]],
+    empty_label: str = "brak zmian w tym miesiącu",
+    active: bool = False,
+) -> str:
+    name = str(emp.get("name") or "")
+    display_name = str(emp.get("display_name") or name)
+    position = str(emp.get("position") or "")
+    position_full = str(emp.get("position_full") or "")
+    total_hours = format_schedule_total(hours_by_emp.get(name, 0.0))
+
+    shift_items: list[str] = []
+    for day in date_columns:
+        iso = str(day.get("date") or "")
+        row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
+        if not isinstance(row_shifts, dict):
+            continue
+        cell = row_shifts.get(name, {})
+        if not isinstance(cell, dict):
+            continue
+        shift = str(cell.get("shift") or "").strip()
+        if not schedule_shift_is_work(shift):
+            continue
+        hours = str(cell.get("hours") or "").strip()
+        meta = day_meta.get(iso, {})
+        abbr = escape(str(meta.get("abbr") or ""))
+        dd = escape(str(meta.get("dd") or ""))
+        hours_label = f"{escape(hours)}h" if hours else ""
+        hours_html = f'<span class="shift-hours">{hours_label}</span>' if hours_label else ""
+        shift_items.append(
+            "<li>"
+            f'<button type="button" class="grafiki-emp-shift" data-date="{escape(iso)}" '
+            f'data-employee="{escape(name)}">'
+            f'<span class="shift-day-label">{abbr} {dd}</span>'
+            f'<span class="shift-value">{escape(shift)}</span>'
+            f"{hours_html}"
+            f"</button>"
+            "</li>"
+        )
+
+    shifts_html = (
+        f'<ul class="grafiki-emp-shifts">{"".join(shift_items)}</ul>'
+        if shift_items
+        else f'<p class="grafiki-emp-empty muted">{escape(empty_label)}</p>'
+    )
+    short_name = schedule_grafik_short_name(display_name)
+    name_title = display_name
+    if position_full or position:
+        name_title = f"{display_name} · {position_full or position}"
+    name_cell_html = schedule_grafik_name_cell_html(
+        short_name,
+        name_title=name_title,
+        position=position,
+        position_full=position_full,
+        employee_name=name,
+        wrap_class="emp-name-wrap emp-name-wrap--card",
+        watermark_mode="full",
+    )
+    hidden_attr = "" if active else " hidden"
+    active_class = " is-active" if active else ""
+    return (
+        f'<article class="grafiki-emp-card{active_class}" data-employee="{escape(name)}"{hidden_attr}>'
+        '<header class="grafiki-emp-card-head">'
+        '<div class="grafiki-emp-card-identity">'
+        f"{name_cell_html}"
+        "</div>"
+        f'<span class="grafiki-emp-total">{escape(total_hours)}h</span>'
+        "</header>"
+        f"{shifts_html}"
+        "</article>"
+    )
+
+
+def render_grafik_mobile_month_employee_picker(
+    employee_list: list[dict[str, object]],
+    *,
+    selected_name: str = "",
+) -> str:
+    sorted_employees = sorted(
+        employee_list,
+        key=lambda emp: normalize_search_text(str(emp.get("display_name") or emp.get("name") or "")),
+    )
+    options: list[str] = []
+    selected_display = ""
+    for emp in sorted_employees:
+        name = str(emp.get("name") or "")
+        display_name = str(emp.get("display_name") or name)
+        if name == selected_name:
+            selected_display = display_name
+        options.append(
+            '<li class="grafiki-emp-option" role="option" '
+            f'data-employee="{escape(name)}" data-search="{escape(normalize_search_text(display_name))}" '
+            f'aria-selected="{"true" if name == selected_name else "false"}">'
+            f"{escape(display_name)}"
+            "</li>"
+        )
+    if not options:
+        return ""
+    return (
+        '<div class="grafiki-month-emp-picker">'
+        '<label class="grafiki-emp-picker-label" for="grafik-emp-search">Pracownik</label>'
+        '<div class="grafiki-emp-combobox">'
+        '<input type="search" id="grafik-emp-search" class="grafiki-emp-search" '
+        'placeholder="Szukaj po imieniu i nazwisku…" autocomplete="off" '
+        'role="combobox" aria-expanded="false" aria-controls="grafik-emp-options" '
+        'aria-autocomplete="list" '
+        f'value="{escape(selected_display)}">'
+        '<button type="button" class="grafiki-emp-combobox-toggle" '
+        'aria-label="Rozwiń listę pracowników" aria-expanded="false" aria-controls="grafik-emp-options">'
+        '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">'
+        '<path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" '
+        'stroke-linecap="round" stroke-linejoin="round"></path>'
+        "</svg>"
+        "</button>"
+        f'<ul id="grafik-emp-options" class="grafiki-emp-options" role="listbox" hidden>'
+        f'{"".join(options)}'
+        "</ul>"
+        "</div>"
+        "</div>"
+    )
+
+
+def render_grafik_mobile_month_employees(
+    employee_list: list[dict[str, object]],
+    date_columns: list[dict[str, object]],
+    shifts_by_date: dict[str, dict[str, dict[str, str]]],
+    hours_by_emp: dict[str, float],
+    *,
+    empty_label: str = "brak zmian w tym miesiącu",
+) -> str:
+    """Wybór pracownika + jego rozpiska na miesiąc (zamiast długiej listy kart)."""
+    if not employee_list:
+        return ""
+
+    day_meta = {
+        str(day.get("date") or ""): day
+        for day in date_columns
+        if isinstance(day, dict) and day.get("date")
+    }
+
+    sorted_employees = sorted(
+        employee_list,
+        key=lambda emp: normalize_search_text(str(emp.get("display_name") or emp.get("name") or "")),
+    )
+    default_name = ""
+    for emp in sorted_employees:
+        name = str(emp.get("name") or "")
+        if _employee_has_month_shifts(name, date_columns, shifts_by_date):
+            default_name = name
+            break
+    if not default_name and sorted_employees:
+        default_name = str(sorted_employees[0].get("name") or "")
+
+    cards: list[str] = []
+    for emp in sorted_employees:
+        name = str(emp.get("name") or "")
+        cards.append(
+            render_grafik_employee_month_card(
+                emp,
+                date_columns=date_columns,
+                shifts_by_date=shifts_by_date,
+                hours_by_emp=hours_by_emp,
+                day_meta=day_meta,
+                empty_label=empty_label,
+                active=name == default_name,
+            )
+        )
+
+    picker_html = render_grafik_mobile_month_employee_picker(
+        sorted_employees,
+        selected_name=default_name,
+    )
+    return (
+        '<div class="grafiki-mobile-month-employees" aria-label="Zmiany pracowników">'
+        f"{picker_html}"
+        '<div class="grafiki-month-emp-detail" id="grafik-emp-detail">'
+        f'{"".join(cards)}'
+        "</div>"
+        "</div>"
+    )
+
+
+def render_grafik_mobile_month(
+    *,
+    employee_list: list[dict[str, object]],
+    date_columns: list[dict[str, object]],
+    shifts_by_date: dict[str, dict[str, dict[str, str]]],
+    hours_by_emp: dict[str, float],
+    people_by_date: dict[str, int],
+) -> str:
+    calendar_html = render_grafik_mobile_month_calendar(date_columns, people_by_date)
+    employees_html = render_grafik_mobile_month_employees(
+        employee_list,
+        date_columns,
+        shifts_by_date,
+        hours_by_emp,
+    )
+    if not calendar_html and not employees_html:
+        return ""
+    return (
+        '<section class="grafiki-mobile-month" aria-label="Grafik miesięczny — widok mobilny">'
+        f"{calendar_html}"
+        f"{employees_html}"
+        "</section>"
+    )
 
 
 def render_schedule_grafik_grid(
@@ -10687,9 +11461,11 @@ def render_schedule_grafik_grid(
     week: str = "",
     view: str = "month",
     controls_html: str = "",
+    period_bar_html: str = "",
     home_href: str = "/",
     refresh_href: str = "",
     shift_reports: dict[str, str] | None = None,
+    staff_summary_by_date: dict[str, list[dict[str, object]]] | None = None,
 ) -> str:
     """Widok miesiąc/tydzień grafików w shellu głównej aplikacji."""
     employees = model.get("employees", [])
@@ -10703,6 +11479,7 @@ def render_schedule_grafik_grid(
 
     empty = f"""
 <div class="grafiki-filters">{controls_html}</div>
+<div class="grafiki-layout">{period_bar_html}</div>
 <div class="grafiki-empty">
   <h2>{escape(title)}</h2>
   <p class="muted">{escape(subtitle or "Brak danych dla wybranego zakresu.")}</p>
@@ -10727,23 +11504,46 @@ def render_schedule_grafik_grid(
         row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
         if not isinstance(row_shifts, dict):
             return people
-        for name in sorted(row_shifts.keys(), key=lambda value: normalize_search_text(value)):
-            cell = row_shifts.get(name, {})
+        for name, cell in row_shifts.items():
             if not isinstance(cell, dict):
                 continue
             shift = str(cell.get("shift") or "").strip()
             hours = str(cell.get("hours") or "").strip()
+            position = str(cell.get("position") or "").strip()
             if not schedule_shift_is_work(shift):
                 continue
-            people.append({"name": name, "shift": shift, "hours": hours})
+            people.append(
+                {
+                    "name": str(name),
+                    "position": position,
+                    "position_full": str(cell.get("position_full") or "").strip(),
+                    "position_modifier": str(cell.get("position_modifier") or "").strip(),
+                    "position_watermark": str(cell.get("position_watermark") or "").strip(),
+                    "shift": shift,
+                    "hours": hours,
+                }
+            )
+
+        def sort_key(person: dict[str, str]) -> tuple[float, str]:
+            start = parse_shift_start_hour(person.get("shift"))
+            return (
+                start if start is not None else 99.0,
+                normalize_search_text(person.get("name")),
+            )
+
+        people.sort(key=sort_key)
         return people
 
     initial_people = people_for_date(initial_date)
     shift_reports = shift_reports or {}
+    staff_summary_by_date = staff_summary_by_date or {}
+    initial_summary = staff_summary_by_date.get(initial_date, [])
+    if not isinstance(initial_summary, list):
+        initial_summary = []
 
     def roster_html(people: list[dict[str, str]]) -> str:
         if not people:
-            return '<p class="muted">brak przypisań</p>'
+            return '<p class="muted shifts-roster-empty">brak przypisań</p>'
         items = []
         for person in people:
             label = escape(person.get("name") or "")
@@ -10752,7 +11552,17 @@ def render_schedule_grafik_grid(
             meta = escape(shift)
             if hours:
                 meta += f" · {escape(hours)}h"
-            items.append(f'<li><span class="roster-name">{label}</span><span class="roster-meta">{meta}</span></li>')
+            identity_html = schedule_roster_identity_html(
+                str(person.get("name") or ""),
+                position=str(person.get("position") or ""),
+                position_full=str(person.get("position_full") or ""),
+            )
+            items.append(
+                "<li>"
+                f"{identity_html}"
+                f'<span class="roster-meta">{meta}</span>'
+                "</li>"
+            )
         return "<ul>" + "".join(items) + "</ul>"
 
     date_columns = [row for row in schedule_rows if isinstance(row, dict) and row.get("date")]
@@ -10776,6 +11586,7 @@ def render_schedule_grafik_grid(
         name = str(emp.get("name") or "")
         display_name = str(emp.get("display_name") or name)
         position = str(emp.get("position") or "")
+        position_full = str(emp.get("position_full") or "")
         cells = []
         for day in date_columns:
             iso = str(day.get("date") or "")
@@ -10806,12 +11617,25 @@ def render_schedule_grafik_grid(
                 f'<td class="{cell_class}" data-date="{escape(iso)}" data-employee="{escape(name)}" '
                 f'data-value="{escape(shift)}" data-hours="{escape(hours)}" '
                 f'data-hours-value="{hours_value}" title="{escape(title_attr)}">'
-                f"{display}</td>"
+                f'{"<span class=\"shift-chip\">" + display + "</span>" if display else ""}'
+                f"</td>"
             )
+        short_name = schedule_grafik_short_name(display_name)
+        name_title = display_name
+        if position_full or position:
+            name_title = f"{display_name} · {position_full or position}"
+        name_cell_html = schedule_grafik_name_cell_html(
+            short_name,
+            name_title=name_title,
+            position=position,
+            position_full=position_full,
+            employee_name=name,
+        )
         body_rows.append(
             f'<tr data-employee="{escape(name)}">'
-            f'<th class="col-name" scope="row" title="{escape(position)}">'
-            f'<span class="emp-name">{escape(display_name)}</span></th>'
+            f'<th class="col-name" scope="row">'
+            f"{name_cell_html}"
+            f"</th>"
             f'{"".join(cells)}'
             f'<td class="col-summary hours-total-cell">{escape(format_schedule_total(hours_by_emp.get(name, 0.0)))}</td>'
             "</tr>"
@@ -10832,6 +11656,7 @@ def render_schedule_grafik_grid(
 
     shifts_json = json.dumps(shifts_by_date, ensure_ascii=False)
     shift_reports_json = json.dumps(shift_reports, ensure_ascii=False)
+    staff_summary_json = json.dumps(staff_summary_by_date, ensure_ascii=False)
     dates_json = json.dumps(
         [str(day.get("date")) for day in date_columns if day.get("date")],
         ensure_ascii=False,
@@ -10841,16 +11666,41 @@ def render_schedule_grafik_grid(
     except ValueError:
         initial_display = format_date(initial_date)
 
+    toolbar = assemble_schedule_toolbar(controls_html, initial_display)
+    tabs_html = ""
+    controls_only = toolbar
+    controls_marker = '<div class="schedule-controls">'
+    if controls_marker in toolbar:
+        split_at = toolbar.index(controls_marker)
+        tabs_html = toolbar[:split_at].strip()
+        controls_only = toolbar[split_at:]
+
+    mobile_month_html = ""
+    if view == "month":
+        mobile_month_html = render_grafik_mobile_month(
+            employee_list=employee_list,
+            date_columns=date_columns,
+            shifts_by_date=shifts_by_date if isinstance(shifts_by_date, dict) else {},
+            hours_by_emp=hours_by_emp,
+            people_by_date=people_by_date,
+        )
+    mobile_month_attr = ' data-mobile-month="1"' if view == "month" else ""
+
     return f"""
-<div class="grafiki-filters">{assemble_schedule_toolbar(controls_html, initial_display, len(initial_people))}</div>
+<div class="grafiki-filters">
+  {tabs_html}
+  {controls_only}
+  <section class="grafiki-roster">
+    {schedule_roster_actions_html(render_staff_summary_html(initial_summary))}
+    <div id="shifts-roster" class="shifts-roster">{roster_html(initial_people)}</div>
+  </section>
+</div>
 
 <div class="grafiki-layout">
+  {period_bar_html}
   <div class="grafiki-stack">
-    <section class="grafiki-roster">
-      <div id="shifts-roster" class="shifts-roster">{roster_html(initial_people)}</div>
-    </section>
-
-    <section class="grafiki-table-panel">
+    <section class="grafiki-table-panel"{mobile_month_attr}>
+      {mobile_month_html}
       <div class="table-wrap">
         <table class="grafiki-table" id="grafik"
                data-view="{escape(view)}"
@@ -10881,11 +11731,12 @@ def render_schedule_grafik_grid(
   window.grafikShiftsData = {shifts_json};
   window.grafikMonthDates = {dates_json};
   window.grafikShiftReports = {shift_reports_json};
+  window.grafikStaffSummary = {staff_summary_json};
 </script>
 """
 
 
-def render_schedule_controls(
+def render_schedule_period_bar(
     *,
     role: str,
     day: str,
@@ -10895,21 +11746,8 @@ def render_schedule_controls(
     selected_view: str,
     months: list[str],
     weeks: list[str],
-    home_href: str = "/",
     entries: list[dict[str, object]] | None = None,
 ) -> str:
-    day = normalize_day(day)
-    home_url = home_href or hub_home_href(day, "grafiki")
-    department_tabs = render_grafiki_department_tabs(
-        role=role,
-        day=day,
-        selected_department=selected_department,
-        selected_month=selected_month,
-        selected_week=selected_week,
-        selected_view=selected_view,
-        home_href=home_url,
-    )
-
     chevron_left = SCHEDULE_CHEVRON_LEFT
     chevron_right = SCHEDULE_CHEVRON_RIGHT
 
@@ -11017,18 +11855,47 @@ def render_schedule_controls(
     )
 
     return f"""
+    <div class="schedule-period-bar">
+      <div class="schedule-period-nav-card" aria-label="Nawigacja okresu">
+        {nav_arrow(direction="prev", href=prev_href, aria_label=prev_aria)}
+        <span class="schedule-period-label">{escape(period_label)}</span>
+        {nav_arrow(direction="next", href=next_href, aria_label=next_aria)}
+      </div>
+      <div class="schedule-view-toggle" role="group" aria-label="Widok">
+        {view_links}
+      </div>
+    </div>
+    """
+
+
+def render_schedule_controls(
+    *,
+    role: str,
+    day: str,
+    selected_department: str,
+    selected_month: str,
+    selected_week: str,
+    selected_view: str,
+    months: list[str],
+    weeks: list[str],
+    home_href: str = "/",
+    entries: list[dict[str, object]] | None = None,
+) -> str:
+    day = normalize_day(day)
+    home_url = home_href or hub_home_href(day)
+    department_tabs = render_grafiki_department_tabs(
+        role=role,
+        day=day,
+        selected_department=selected_department,
+        selected_month=selected_month,
+        selected_week=selected_week,
+        selected_view=selected_view,
+        home_href=home_url,
+    )
+
+    return f"""
     {department_tabs}
     <div class="schedule-controls">
-      <div class="schedule-period-cluster">
-        <div class="schedule-period-nav" aria-label="Nawigacja okresu">
-          {nav_arrow(direction="prev", href=prev_href, aria_label=prev_aria)}
-          <span class="schedule-period-label">{escape(period_label)}</span>
-          {nav_arrow(direction="next", href=next_href, aria_label=next_aria)}
-        </div>
-        <div class="schedule-view-toggle" role="group" aria-label="Widok">
-          {view_links}
-        </div>
-      </div>
       <!--schedule-controls-end-->
     </div>
     """
@@ -11039,92 +11906,113 @@ def grafik4600_assets() -> str:
     return r"""
 <style>
   .grafiki-filters {
-    margin-bottom: 10px;
+    margin-bottom: 0;
     display: grid;
     gap: 12px;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .grafiki-layout {
+    display: grid;
+    gap: 12px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    margin-top: 14px;
+  }
+
+  .grafiki-stack {
+    display: grid;
+    gap: 12px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .grafiki-layout .schedule-period-bar {
+    display: grid;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .grafiki-layout .schedule-period-nav-card {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 4px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: #ffffff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
   }
 
   .grafiki-filters .schedule-controls {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-    align-items: center;
-    gap: 10px 12px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
     width: 100%;
+    align-items: stretch;
   }
 
-  .grafiki-filters .schedule-controls-left {
+  .grafiki-filters .schedule-controls-side {
     display: flex;
-    align-items: center;
-    justify-content: flex-start;
-    gap: 8px 12px;
+    align-items: stretch;
     min-width: 0;
-    justify-self: start;
+  }
+
+  .grafiki-filters .schedule-controls-center,
+  .grafiki-filters .schedule-controls-right {
+    display: flex;
+    align-items: stretch;
+    min-width: 0;
   }
 
   .grafiki-filters .schedule-day-nav {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    justify-self: center;
-    grid-column: 2;
-  }
-
-  .grafiki-filters .schedule-roster-actions {
-    display: inline-flex;
-    align-items: center;
-    justify-content: flex-end;
     gap: 10px;
-    justify-self: end;
-    grid-column: 3;
-    min-width: 0;
-  }
-
-  .grafiki-filters .schedule-period-cluster {
-    display: inline-flex;
-    align-items: stretch;
-    flex-wrap: nowrap;
-    gap: 0;
-    min-width: 0;
+    width: 100%;
+    min-height: 44px;
+    padding: 6px 8px;
     border: 1px solid var(--line);
-    background: var(--surface-strong);
-    overflow: hidden;
+    border-radius: 12px;
+    background: #ffffff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
   }
 
-  .grafiki-filters .schedule-period-nav {
-    display: inline-flex;
-    align-items: stretch;
-    gap: 0;
-    min-width: 0;
-    border-right: 1px solid var(--line);
-  }
-
-  .grafiki-filters .schedule-period-label {
-    display: inline-flex;
+  .grafiki-layout .schedule-period-label {
+    display: flex;
     align-items: center;
     justify-content: center;
-    min-width: 7.5rem;
-    padding: 0 12px;
+    min-width: 0;
+    padding: 10px 8px;
     text-align: center;
-    font-size: 0.88rem;
+    font-size: 0.96rem;
     font-weight: 900;
     color: var(--ink);
     letter-spacing: -0.01em;
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
 
-  .grafiki-filters .schedule-period-arrow {
+  .grafiki-layout .schedule-period-arrow {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     box-sizing: border-box;
-    min-width: 34px;
-    min-height: 34px;
-    padding: 0 10px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
     margin: 0;
     border: 0;
-    border-radius: 0;
-    background: transparent;
+    border-radius: 10px;
+    background: #f5f5f5;
     color: var(--ink);
     text-decoration: none;
     flex: 0 0 auto;
@@ -11137,20 +12025,58 @@ def grafik4600_assets() -> str:
     -webkit-tap-highlight-color: transparent;
   }
 
-  .grafiki-filters .schedule-period-arrow svg {
+  .grafiki-layout .schedule-period-arrow svg {
     width: 16px;
     height: 16px;
     display: block;
   }
 
-  .grafiki-filters a.schedule-period-arrow:hover {
-    background: #eeeeee;
+  .grafiki-layout a.schedule-period-arrow:hover {
+    background: #ececec;
   }
 
-  .grafiki-filters .schedule-period-arrow.is-disabled {
+  .grafiki-layout .schedule-period-arrow.is-disabled {
     opacity: 0.32;
     pointer-events: none;
     cursor: default;
+  }
+
+  .grafiki-layout .schedule-view-toggle {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+  }
+
+  .grafiki-layout .schedule-view-toggle .schedule-control {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #ffffff;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 0.88rem;
+    font-weight: 800;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  }
+
+  .grafiki-layout .schedule-view-toggle .schedule-control:first-child {
+    border-left: 1px solid var(--line);
+  }
+
+  .grafiki-layout .schedule-view-toggle .schedule-control:hover {
+    background: #f5f5f5;
+  }
+
+  .grafiki-layout .schedule-view-toggle .schedule-control.is-active {
+    background: #000000;
+    border-color: #000000;
+    color: #ffffff;
+    box-shadow: none;
   }
 
   .grafiki-filters .schedule-nav-arrow,
@@ -11159,18 +12085,18 @@ def grafik4600_assets() -> str:
     align-items: center;
     justify-content: center;
     box-sizing: border-box;
-    width: 36px;
-    height: 36px;
-    min-width: 36px;
-    min-height: 36px;
-    max-width: 36px;
-    max-height: 36px;
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    min-height: 34px;
+    max-width: 34px;
+    max-height: 34px;
     border: 0;
     border-radius: 50%;
     background: #000;
     color: #fff;
     text-decoration: none;
-    flex: 0 0 36px;
+    flex: 0 0 34px;
     padding: 0;
     margin: 0;
     line-height: 0;
@@ -11185,8 +12111,8 @@ def grafik4600_assets() -> str:
   }
 
   .grafiki-filters .schedule-nav-arrow svg {
-    width: 18px;
-    height: 18px;
+    width: 17px;
+    height: 17px;
     display: block;
     flex: 0 0 auto;
   }
@@ -11209,76 +12135,38 @@ def grafik4600_assets() -> str:
     transform: none;
   }
 
-  .grafiki-filters .schedule-view-toggle {
-    display: inline-flex;
-    flex-wrap: nowrap;
-    align-items: stretch;
-    gap: 0;
-  }
-
-  .grafiki-filters .schedule-view-toggle .schedule-control {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 34px;
-    padding: 0 14px;
-    border: 0;
-    border-left: 1px solid var(--line);
-    border-radius: 0;
-    background: transparent;
-    color: var(--ink);
-    text-decoration: none;
-    font-size: 0.82rem;
-    font-weight: 800;
-  }
-
-  .grafiki-filters .schedule-view-toggle .schedule-control:first-child {
-    border-left: 0;
-  }
-
-  .grafiki-filters .schedule-view-toggle .schedule-control:hover {
-    background: #eeeeee;
-  }
-
-  .grafiki-filters .schedule-view-toggle .schedule-control.is-active {
-    background: var(--brand);
-    border-color: var(--brand);
-    color: #fff;
-  }
-
-  .grafiki-layout {
-    display: grid;
-    gap: 12px;
-    width: 100%;
-  }
-
-  .grafiki-stack {
-    display: grid;
-    gap: 12px;
-    width: 100%;
-  }
-
   .page-schedules .grafiki-roster {
     border: 0;
     background: transparent;
     padding: 0;
     overflow: visible;
     width: 100%;
+    display: grid;
+    gap: 10px;
+    margin-bottom: 2px;
   }
 
   .page-schedules .grafiki-table-panel {
     border: 0;
+    border-radius: 0;
     background: transparent;
     padding: 0;
     overflow: visible;
-    width: 100vw;
-    max-width: 100vw;
-    margin-left: calc(50% - 50vw);
-    margin-right: calc(50% - 50vw);
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    margin-left: 0;
+    margin-right: 0;
   }
 
   .roster-head {
     display: none;
+  }
+
+  .grafiki-roster-head {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
   }
 
   .shift-date-info {
@@ -11287,60 +12175,114 @@ def grafik4600_assets() -> str:
     align-items: center;
     justify-content: center;
     line-height: 1.15;
-    width: 5.8rem;
-    min-width: 5.8rem;
+    width: 6.4rem;
+    min-width: 6.4rem;
     text-align: center;
   }
 
   .shift-date-info strong {
     display: block;
     width: 100%;
-    font-size: 0.72rem;
-    letter-spacing: 0.04em;
+    font-size: 0.74rem;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     text-align: center;
+    font-weight: 900;
+    color: var(--ink);
   }
 
   .shift-date-info span {
     display: block;
     width: 100%;
-    font-size: 0.82rem;
-    color: var(--muted);
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--ink);
     text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   .roster-title {
     margin: 0;
-    font-size: 0.92rem;
+    font-size: 0.84rem;
     font-weight: 900;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
-    white-space: nowrap;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #64748b;
   }
 
-  .shifts-count {
+  .staff-summary-wrap {
+    flex: 1 1 240px;
+    min-width: 0;
+    display: grid;
+    gap: 6px;
+  }
+
+  .staff-summary {
+    display: grid;
+    gap: 8px;
+  }
+
+  .staff-summary-empty {
+    margin: 0;
+    font-size: 0.84rem;
+  }
+
+  .staff-summary-dept {
+    display: grid;
+    gap: 5px;
+  }
+
+  .staff-summary-dept-label {
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: color-mix(in srgb, var(--ink) 58%, white);
+  }
+
+  .staff-summary-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .staff-summary-item {
     display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 1.8rem;
-    height: 1.6rem;
-    padding: 0 8px;
-    background: var(--orange);
-    color: #fff;
-    font-size: 0.82rem;
-    font-weight: 900;
+    align-items: baseline;
+    gap: 0.35em;
+    padding: 5px 10px;
+    border-radius: 10px;
+    background: #ffffff;
+    border: 1px solid color-mix(in srgb, var(--line) 90%, transparent);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    font-size: 0.84rem;
+    line-height: 1.2;
+  }
+
+  .staff-summary-position {
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .staff-summary-count {
+    font-weight: 800;
+    color: var(--ink);
+    font-size: inherit;
+    font-variant-numeric: tabular-nums;
   }
 
   .shifts-roster {
-    margin-top: 4px;
+    margin: 0;
+  }
+
+  .shifts-roster-empty {
+    margin: 0;
+    padding: 8px 2px;
+    font-size: 0.88rem;
   }
 
   .shifts-roster ul {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: stretch;
+    display: grid;
     gap: 6px;
     list-style: none;
     margin: 0;
@@ -11348,55 +12290,78 @@ def grafik4600_assets() -> str:
   }
 
   .shifts-roster li {
-    display: inline-flex;
-    align-items: baseline;
-    justify-content: flex-start;
-    gap: 6px;
-    width: max-content;
-    max-width: 100%;
-    padding: 7px 10px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px 14px;
+    width: 100%;
+    padding: 10px 12px;
     border: 1px solid var(--line);
-    background: var(--soft);
-    font-size: 0.82rem;
+    border-radius: 12px;
+    background: #ffffff;
+    font-size: 0.84rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  }
+
+  .shifts-roster .roster-identity {
+    display: block;
+    min-width: 0;
+    position: relative;
+    overflow: hidden;
   }
 
   .shifts-roster .roster-name {
+    position: relative;
+    z-index: 2;
+    display: block;
     font-weight: 800;
-    white-space: nowrap;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+  }
+
+  .emp-name-wrap--roster .emp-position {
+    font-size: clamp(0.95em, 4.5vw, 1.45em);
+    letter-spacing: -0.03em;
   }
 
   .shifts-roster .roster-meta {
-    color: var(--muted);
+    color: var(--brand-dark);
     white-space: nowrap;
     flex: 0 0 auto;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    justify-self: end;
   }
 
   .shift-report-panel {
     margin: 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
+    display: flex;
+    align-items: stretch;
+    width: 100%;
+    min-width: 0;
   }
 
   .shift-report-copy {
     appearance: none;
-    border: 1px solid var(--line);
-    background: var(--surface-strong);
+    border: 1px solid #000000;
+    border-radius: 12px;
+    background: #ffffff;
     color: var(--ink);
     font: inherit;
     font-weight: 800;
-    font-size: 0.82rem;
-    min-height: 36px;
+    font-size: 0.84rem;
+    min-height: 44px;
+    width: 100%;
     padding: 0 10px 0 12px;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 8px;
     cursor: pointer;
   }
 
   .shift-report-copy:hover {
-    background: #eeeeee;
+    background: #f3f3f3;
   }
 
   .shift-report-copy:focus-visible {
@@ -11413,6 +12378,16 @@ def grafik4600_assets() -> str:
   .shift-report-copy.is-copied .shift-report-copy__icon {
     border-left-color: var(--ok);
     color: #3f6212;
+  }
+
+  .shift-report-copy.is-loading {
+    opacity: 0.72;
+    cursor: wait;
+  }
+
+  .shift-report-copy:disabled {
+    opacity: 0.55;
+    cursor: wait;
   }
 
   .shift-report-copy__icon {
@@ -11435,23 +12410,40 @@ def grafik4600_assets() -> str:
 
   .grafiki-table-panel {
     padding: 0;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .grafiki-table-panel .table-wrap {
     width: 100%;
-    overflow: auto;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: visible;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    border: 1px solid var(--line);
+    border-radius: 0;
+    background: #ffffff;
+    box-shadow: none;
   }
 
   .grafiki-table {
-    width: 100%;
-    border-collapse: collapse;
+    width: max-content;
+    min-width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    border-top: 1px solid var(--line);
+    border-left: 1px solid var(--line);
     font-size: 0.78rem;
     background: #fff;
   }
 
   .grafiki-table th,
   .grafiki-table td {
-    border: 1px solid var(--line);
+    border: 0;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
     padding: 6px 4px;
     text-align: center;
     vertical-align: middle;
@@ -11479,16 +12471,131 @@ def grafik4600_assets() -> str:
     position: sticky;
     left: 0;
     z-index: 3;
+    overflow: hidden;
   }
 
   .grafiki-table thead .col-name {
     z-index: 4;
   }
 
+  .emp-name-wrap {
+    position: relative;
+    display: block;
+    width: 100%;
+    isolation: isolate;
+  }
+
+  .emp-name-wrap .emp-name {
+    position: relative;
+    z-index: 2;
+    display: block;
+    white-space: normal;
+    line-height: 1.2;
+  }
+
+  .emp-name-wrap .emp-position {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    z-index: 0;
+    transform: translateY(-50%);
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font-size: 1.75em;
+    font-weight: 900;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .emp-name-wrap .emp-position--animator {
+    color: #22c55e;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--organizer {
+    color: #3b82f6;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--kelner {
+    color: #14b8a6;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--bar {
+    color: #f59e0b;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--admin {
+    color: #6366f1;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--kierownik-animatorow {
+    color: #eab308;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--hr {
+    color: #a855f7;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--pracownia {
+    color: #ec4899;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--sprzatanie {
+    color: #06b6d4;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--recepcja {
+    color: #8b5cf6;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--kuchnia {
+    color: #ef4444;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--dyrekcja {
+    color: #1d4ed8;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--ksiegowosc {
+    color: #d946ef;
+    opacity: 0.34;
+  }
+
+  .emp-name-wrap .emp-position--konserwator {
+    color: #78716c;
+    opacity: 0.3;
+  }
+
+  .emp-name-wrap .emp-position--other {
+    color: color-mix(in srgb, var(--muted) 80%, var(--ink));
+    opacity: 0.22;
+    font-size: 1.35em;
+  }
+
   .grafiki-table .col-name .emp-name {
     display: block;
     white-space: normal;
     line-height: 1.2;
+  }
+
+  .grafiki-table .col-name .emp-position {
+    margin-top: 0;
+    white-space: nowrap;
   }
 
   .grafiki-table thead .col-date {
@@ -11515,6 +12622,18 @@ def grafik4600_assets() -> str:
     min-width: 48px;
     font-weight: 800;
     background: #fafafa;
+    position: sticky;
+    right: 0;
+    z-index: 2;
+    box-shadow: -4px 0 8px rgba(15, 23, 42, 0.06);
+  }
+
+  .grafiki-table thead .col-summary {
+    z-index: 5;
+  }
+
+  .grafiki-table tbody .col-summary {
+    z-index: 1;
   }
 
   .grafiki-table td.slot {
@@ -11524,13 +12643,53 @@ def grafik4600_assets() -> str:
     cursor: pointer;
   }
 
-  .grafiki-table td.slot.custom-shift {
-    background: color-mix(in srgb, var(--brand) 10%, white);
-    color: var(--brand-dark);
+  #grafik[data-view="month"] thead .col-date {
+    min-width: 38px;
   }
 
-  .grafiki-table .today {
-    box-shadow: inset 0 0 0 2px var(--brand);
+  #grafik[data-view="month"] td.slot {
+    min-width: 40px;
+    max-width: 54px;
+    white-space: normal;
+    line-height: 1.15;
+    word-break: break-word;
+    hyphens: auto;
+  }
+
+  #grafik[data-view="month"] .col-name {
+    min-width: 132px;
+    max-width: 180px;
+  }
+
+  .grafiki-table td.slot.custom-shift {
+    position: relative;
+    background: transparent;
+    color: #000000;
+    font-weight: 800;
+    box-shadow: none;
+    padding: 3px 2px;
+    border-radius: 0 !important;
+  }
+
+  .grafiki-table td.slot.custom-shift .shift-chip {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 100%;
+    padding: 5px 6px 5px 10px;
+    border-radius: 8px;
+    background: #e8f0fe;
+    color: #000000;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    box-shadow: inset 2px 0 0 0 #1a73e8;
+    line-height: 1.15;
+  }
+
+  .grafiki-table td.slot.custom-shift::before {
+    display: none;
   }
 
   .grafiki-table .off-day {
@@ -11538,12 +12697,274 @@ def grafik4600_assets() -> str:
   }
 
   .grafiki-table td.slot.off-day.custom-shift {
-    background: color-mix(in srgb, var(--brand) 8%, #f6f6f6);
+    background: transparent;
+    color: #000000;
   }
 
-  .grafiki-table .is-selected-day {
-    outline: 2px solid var(--orange);
-    outline-offset: -2px;
+  .grafiki-table td.slot.off-day.custom-shift .shift-chip {
+    background: #e8f0fe;
+  }
+
+  .grafiki-table td.slot.custom-shift.today .shift-chip {
+    background: #ceead6;
+    box-shadow: inset 2px 0 0 0 #34a853;
+  }
+
+  .grafiki-table td.slot.custom-shift.is-selected-day {
+    background: transparent;
+    color: #000000;
+  }
+
+  .grafiki-table td.slot.custom-shift.is-selected-day .shift-chip {
+    background: #feefc3;
+    box-shadow: inset 2px 0 0 0 #f9ab00;
+  }
+
+  .grafiki-table td.slot.custom-shift.is-selected-day.today {
+    background: transparent;
+    color: #000000;
+  }
+
+  .grafiki-table td.slot.custom-shift.is-selected-day.today .shift-chip {
+    background: #feefc3;
+    box-shadow: inset 2px 0 0 0 #f9ab00;
+  }
+
+  /* Lekkie podświetlenie kolumny — bez ramki */
+  .grafiki-table th.today,
+  .grafiki-table td.today {
+    background: #e6f4ea;
+    box-shadow: none;
+    outline: none;
+  }
+
+  .grafiki-table th.is-selected-day,
+  .grafiki-table td.is-selected-day {
+    background: #fef7e0;
+    box-shadow: none;
+    outline: none;
+  }
+
+  .grafiki-table th.today::after,
+  .grafiki-table td.today::after,
+  .grafiki-table th.is-selected-day::after,
+  .grafiki-table td.is-selected-day::after {
+    content: none;
+    display: none;
+  }
+
+  .grafiki-table td.slot.custom-shift.today,
+  .grafiki-table td.slot.custom-shift.is-selected-day {
+    background: transparent;
+  }
+
+  /* Tydzień: siatka Excel + pełna szerokość
+     border-collapse:separate — żeby komórki miały stabilny układ */
+  #grafik[data-view="week"] {
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
+    width: 100%;
+    font-size: 0.8rem;
+    border-top: 1px solid var(--line);
+    border-left: 1px solid var(--line);
+  }
+
+  #grafik[data-view="week"] th,
+  #grafik[data-view="week"] td {
+    border: 0;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    border-radius: 0 !important;
+    padding: 7px 4px;
+  }
+
+  #grafik[data-view="week"] thead th,
+  #grafik[data-view="week"] tfoot th,
+  #grafik[data-view="week"] tfoot td {
+    border-radius: 0 !important;
+  }
+
+  #grafik[data-view="week"] thead th {
+    background: var(--soft);
+    padding: 8px 3px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 800;
+  }
+
+  #grafik[data-view="week"] thead .col-name {
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 800;
+    background: var(--soft);
+    text-align: left;
+    padding-left: 10px;
+  }
+
+  #grafik[data-view="week"] thead .col-date {
+    border-radius: 0;
+    background: var(--soft);
+    padding: 8px 3px;
+    cursor: pointer;
+  }
+
+  #grafik[data-view="week"] thead .col-date .date-dd {
+    font-size: 0.92rem;
+    font-weight: 900;
+    line-height: 1.1;
+    color: var(--ink);
+  }
+
+  #grafik[data-view="week"] thead .col-date .date-abbr {
+    font-size: 0.64rem;
+    font-weight: 700;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  #grafik[data-view="week"] tbody .col-name {
+    background: #fafafa;
+    text-align: left;
+    padding: 8px 8px 8px 10px;
+    font-weight: 800;
+  }
+
+  #grafik[data-view="week"] tbody td.slot {
+    padding: 5px 4px;
+    vertical-align: middle;
+    background: #ffffff;
+    min-height: 40px;
+    height: auto;
+    white-space: normal;
+    line-height: 1.2;
+    word-break: break-word;
+    border-radius: 0;
+  }
+
+  #grafik[data-view="week"] tbody td.slot:not(.custom-shift) {
+    color: transparent;
+  }
+
+  #grafik[data-view="week"] tbody td.slot.custom-shift {
+    background: transparent;
+    color: #000000;
+    border-radius: 0 !important;
+    font-weight: 800;
+    font-size: 0.78rem;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+    box-shadow: none;
+    padding: 3px 2px;
+  }
+
+  #grafik[data-view="week"] tbody td.slot.custom-shift .shift-chip {
+    min-height: 28px;
+    font-size: inherit;
+  }
+
+  #grafik[data-view="week"] tbody td.slot.off-day {
+    background: #fafafa;
+  }
+
+  #grafik[data-view="week"] tbody td.slot.off-day.custom-shift {
+    background: transparent;
+    color: #000000;
+  }
+
+  #grafik[data-view="week"] tbody tr:hover td.slot.custom-shift:not(.today):not(.is-selected-day) .shift-chip {
+    background: #d2e3fc;
+  }
+
+  #grafik[data-view="week"] th.today,
+  #grafik[data-view="week"] td.today:not(.custom-shift) {
+    background: #e6f4ea;
+  }
+
+  #grafik[data-view="week"] thead th.today {
+    background: #ceead6;
+    color: #000000;
+  }
+
+  #grafik[data-view="week"] tfoot th.today,
+  #grafik[data-view="week"] tfoot td.today {
+    background: #e6f4ea;
+  }
+
+  #grafik[data-view="week"] tbody td.slot.today.custom-shift,
+  #grafik[data-view="week"] tbody td.slot.today.off-day.custom-shift {
+    background: transparent;
+    color: #000000;
+  }
+
+  #grafik[data-view="week"] th.is-selected-day,
+  #grafik[data-view="week"] td.is-selected-day:not(.custom-shift) {
+    background: #fef7e0;
+  }
+
+  #grafik[data-view="week"] thead th.is-selected-day {
+    background: #feefc3;
+    color: #000000;
+  }
+
+  #grafik[data-view="week"] tfoot th.is-selected-day,
+  #grafik[data-view="week"] tfoot td.is-selected-day {
+    background: #fef7e0;
+  }
+
+  #grafik[data-view="week"] tbody td.slot.is-selected-day.custom-shift,
+  #grafik[data-view="week"] tbody td.slot.is-selected-day.off-day.custom-shift {
+    background: transparent;
+    color: #000000;
+  }
+
+  #grafik[data-view="week"] tfoot tr.hours-total-row th,
+  #grafik[data-view="week"] tfoot tr.hours-total-row td {
+    background: var(--soft);
+    border-top: 2px solid var(--brand);
+    padding: 10px 5px;
+    font-weight: 800;
+    color: var(--ink);
+  }
+
+  #grafik[data-view="week"] tfoot .col-name {
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+    line-height: 1.2;
+    white-space: normal;
+    text-align: left;
+    padding-left: 10px;
+  }
+
+  #grafik[data-view="week"] tfoot .col-date {
+    font-size: 0.78rem;
+    font-weight: 900;
+    color: var(--brand-dark);
+    font-variant-numeric: tabular-nums;
+  }
+
+  #grafik[data-view="week"] .col-name {
+    min-width: 0;
+    max-width: none;
+  }
+
+  #grafik[data-view="week"] .col-summary {
+    display: none;
+  }
+
+  .grafiki-table-panel:has(#grafik[data-view="week"]) .table-wrap {
+    border-radius: 0 !important;
+    overflow: visible;
+    background: #ffffff;
+    box-shadow: none;
+    border-left: 0;
+    border-right: 0;
+  }
+
+  .grafiki-table th,
+  .grafiki-table td {
+    border-radius: 0;
   }
 
   .grafiki-table tfoot tr.hours-total-row th,
@@ -11563,10 +12984,6 @@ def grafik4600_assets() -> str:
   .grafiki-table tfoot .hours-total-cell,
   .grafiki-table tfoot .col-summary {
     color: var(--brand-dark);
-  }
-
-  #grafik[data-view="week"] tbody td.slot {
-    height: clamp(42px, 7vh, 68px);
   }
 
   .grafiki-empty {
@@ -11591,73 +13008,729 @@ def grafik4600_assets() -> str:
     transition: opacity 0.15s ease;
   }
 
+  .grafiki-mobile-month {
+    display: none;
+  }
+
+  .grafiki-mobile-month-cal {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: #ffffff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+  }
+
+  .grafiki-mobile-cal-weekdays {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  .grafiki-mobile-cal-weekday {
+    text-align: center;
+    font-size: 0.62rem;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 2px 0;
+  }
+
+  .grafiki-mobile-cal-grid {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  .grafiki-mobile-cal-pad {
+    display: block;
+    aspect-ratio: 1;
+  }
+
+  .grafiki-mobile-cal-day {
+    appearance: none;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+    aspect-ratio: 1;
+    min-height: 0;
+    padding: 2px;
+    margin: 0;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background: #fafafa;
+    color: var(--ink);
+    font: inherit;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+
+  .grafiki-mobile-cal-day.off-day {
+    background: #f3f3f3;
+    color: color-mix(in srgb, var(--ink) 72%, white);
+  }
+
+  .grafiki-mobile-cal-day.has-shifts {
+    background: color-mix(in srgb, var(--brand) 12%, white);
+    border-color: color-mix(in srgb, var(--brand) 28%, transparent);
+  }
+
+  .grafiki-mobile-cal-day.off-day.has-shifts {
+    background: color-mix(in srgb, var(--brand) 10%, #f3f3f3);
+  }
+
+  .grafiki-mobile-cal-day.today {
+    background: #e6f4ea;
+    box-shadow: none;
+  }
+
+  .grafiki-mobile-cal-day.is-selected-day {
+    outline: none;
+    background: #fef7e0;
+  }
+
+  .grafiki-mobile-cal-day .cal-day-num {
+    font-size: 0.82rem;
+    font-weight: 900;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .grafiki-mobile-cal-day .cal-day-count {
+    font-size: 0.58rem;
+    font-weight: 800;
+    line-height: 1;
+    color: var(--brand-dark);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .grafiki-mobile-cal-legend {
+    margin: 2px 0 0;
+    font-size: 0.72rem;
+    text-align: center;
+    line-height: 1.3;
+  }
+
+  .grafiki-mobile-month-employees {
+    display: grid;
+    gap: 10px;
+  }
+
+  .grafiki-month-emp-picker {
+    display: grid;
+    gap: 6px;
+  }
+
+  .grafiki-emp-picker-label {
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .grafiki-emp-combobox {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  }
+
+  .grafiki-emp-search {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 12px 0 0 12px;
+    background: transparent;
+    font: inherit;
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .grafiki-emp-search::placeholder {
+    color: color-mix(in srgb, var(--muted) 88%, white);
+    font-weight: 600;
+  }
+
+  .grafiki-emp-search:focus {
+    outline: none;
+  }
+
+  .grafiki-emp-combobox:focus-within {
+    outline: 2px solid var(--brand);
+    outline-offset: 1px;
+  }
+
+  .grafiki-emp-combobox-toggle {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-left: 1px solid var(--line);
+    border-radius: 0 12px 12px 0;
+    background: #fafafa;
+    color: var(--ink);
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .grafiki-emp-combobox-toggle:hover {
+    background: #f3f3f3;
+  }
+
+  .grafiki-emp-options {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    z-index: 30;
+    max-height: min(260px, 42vh);
+    overflow-y: auto;
+    margin: 0;
+    padding: 4px;
+    list-style: none;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #ffffff;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.12);
+  }
+
+  .grafiki-emp-options[hidden] {
+    display: none;
+  }
+
+  .grafiki-emp-option {
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 0.86rem;
+    font-weight: 700;
+    line-height: 1.2;
+    color: var(--ink);
+    cursor: pointer;
+  }
+
+  .grafiki-emp-option[hidden] {
+    display: none;
+  }
+
+  .grafiki-emp-option:hover,
+  .grafiki-emp-option.is-highlighted {
+    background: color-mix(in srgb, var(--brand) 10%, white);
+  }
+
+  .grafiki-emp-option[aria-selected="true"] {
+    background: color-mix(in srgb, var(--brand) 14%, white);
+    color: var(--brand-dark);
+  }
+
+  .grafiki-month-emp-detail {
+    display: grid;
+    gap: 10px;
+  }
+
+  .grafiki-emp-card[hidden] {
+    display: none !important;
+  }
+
+  .grafiki-emp-card {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: #ffffff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+    overflow: hidden;
+  }
+
+  .grafiki-emp-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    background: #fafafa;
+  }
+
+  .grafiki-emp-card-identity {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .emp-name-wrap--card .emp-name {
+    font-size: 0.9rem;
+    font-weight: 900;
+  }
+
+  .emp-name-wrap--card .emp-position {
+    font-size: clamp(0.95em, 5vw, 1.35em);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .grafiki-emp-card .emp-name {
+    font-size: 0.9rem;
+    font-weight: 900;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+  }
+
+  .grafiki-emp-card .emp-position {
+    margin-top: 0;
+  }
+
+  .grafiki-emp-total {
+    flex: 0 0 auto;
+    font-size: 0.84rem;
+    font-weight: 900;
+    color: var(--brand-dark);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .grafiki-emp-shifts {
+    display: grid;
+    gap: 6px;
+    list-style: none;
+    margin: 0;
+    padding: 8px 10px 10px;
+  }
+
+  .grafiki-emp-shift {
+    appearance: none;
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px 10px;
+    width: 100%;
+    padding: 9px 10px;
+    margin: 0;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #ffffff;
+    color: var(--ink);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+
+  .grafiki-emp-shift:hover {
+    background: #f8f8f8;
+  }
+
+  .grafiki-emp-shift.is-selected-day {
+    outline: 2px solid var(--orange);
+    outline-offset: -1px;
+    background: color-mix(in srgb, var(--orange) 10%, white);
+    border-color: color-mix(in srgb, var(--orange) 45%, var(--line));
+  }
+
+  .grafiki-emp-shift .shift-day-label {
+    font-size: 0.76rem;
+    font-weight: 800;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+
+  .grafiki-emp-shift .shift-value {
+    font-size: 0.88rem;
+    font-weight: 900;
+    color: var(--brand-dark);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .grafiki-emp-shift .shift-hours {
+    font-size: 0.76rem;
+    font-weight: 800;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    justify-self: end;
+  }
+
+  .grafiki-emp-empty {
+    margin: 0;
+    padding: 8px 12px 12px;
+    font-size: 0.84rem;
+  }
+
   @media (max-width: 900px) {
-    .grafiki-filters .schedule-controls {
-      justify-content: center;
+    .grafiki-filters .schedule-day-nav {
+      gap: 8px;
+      padding: 6px;
     }
   }
 
   @media (max-width: 860px) {
+    .grafiki-layout {
+      margin-top: 12px;
+    }
+
+    body.page-schedules main {
+      padding-left: 0;
+      padding-right: 0;
+      overflow-x: clip;
+    }
+
+    body.page-schedules .grafiki-filters,
+    body.page-schedules .grafiki-layout > .schedule-period-bar {
+      padding-left: max(24px, env(safe-area-inset-left, 0px));
+      padding-right: max(24px, env(safe-area-inset-right, 0px));
+      box-sizing: border-box;
+    }
+
+    body.page-schedules .grafiki-table-panel {
+      width: 100%;
+      max-width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow-x: clip;
+    }
+
+    body.page-schedules .grafiki-table-panel:has(#grafik[data-view="week"]) {
+      padding-left: 0;
+      padding-right: 0;
+      overflow-x: clip;
+    }
+
+    body.page-schedules .grafiki-table-panel .table-wrap {
+      width: 100%;
+      max-width: 100%;
+      margin: 0;
+      border-left: 0;
+      border-right: 0;
+      border-radius: 0;
+      box-shadow: none;
+    }
+
+    body.page-schedules .grafiki-table-panel:has(#grafik[data-view="week"]) .table-wrap {
+      width: 100%;
+      margin: 0;
+      border: 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      box-shadow: none;
+      overflow: hidden;
+    }
+
+    body.page-schedules .grafiki-table .col-name {
+      position: static;
+      left: auto;
+    }
+
+    .grafiki-table-panel[data-mobile-month="1"] .grafiki-mobile-month {
+      display: grid;
+      gap: 12px;
+      width: 100%;
+      padding-left: max(14px, env(safe-area-inset-left, 0px));
+      padding-right: max(14px, env(safe-area-inset-right, 0px));
+      box-sizing: border-box;
+    }
+
+    .page-schedules .grafiki-roster {
+      margin-bottom: 0;
+    }
+
+    .grafiki-table-panel[data-mobile-month="1"] .table-wrap {
+      display: none;
+    }
+
     .grafiki-filters .schedule-controls {
-      grid-template-columns: 1fr;
-      justify-items: stretch;
+      gap: 8px;
     }
 
-    .grafiki-filters .schedule-controls-left,
-    .grafiki-filters .schedule-day-nav,
-    .grafiki-filters .schedule-roster-actions {
-      grid-column: 1;
-      justify-self: stretch;
-      width: 100%;
+    .grafiki-layout .schedule-period-nav-card {
+      padding: 3px;
     }
 
-    .grafiki-filters .schedule-controls-left {
-      justify-content: space-between;
+    .grafiki-layout .schedule-period-label {
+      font-size: 0.9rem;
+      padding: 8px 6px;
     }
 
-    .grafiki-filters .schedule-day-nav {
-      justify-content: center;
-      order: -1;
+    .grafiki-layout .schedule-period-arrow {
+      min-width: 40px;
+      min-height: 40px;
     }
 
-    .grafiki-filters .schedule-roster-actions {
-      justify-content: space-between;
-    }
-
-    .grafiki-filters .schedule-period-cluster {
-      width: 100%;
-      justify-content: space-between;
-    }
-
-    .grafiki-filters .schedule-period-label {
-      min-width: 0;
-      flex: 1;
-      font-size: 0.86rem;
+    .grafiki-layout .schedule-view-toggle .schedule-control {
+      min-height: 40px;
+      font-size: 0.84rem;
     }
 
     .shift-date-info {
-      width: 5.2rem;
-      min-width: 5.2rem;
+      width: 6rem;
+      min-width: 6rem;
     }
 
     .shift-date-info strong {
-      font-size: 0.66rem;
+      font-size: 0.7rem;
     }
 
     .shift-date-info span {
-      font-size: 0.74rem;
+      font-size: 0.88rem;
+    }
+
+    .grafiki-roster-head {
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .staff-summary-wrap {
+      flex-basis: 100%;
+    }
+
+    .staff-summary-item {
+      font-size: 0.76rem;
+      padding: 4px 7px 4px 9px;
+    }
+
+    .shift-report-copy {
+      min-height: 36px;
+      font-size: 0.8rem;
+      padding: 0 8px 0 10px;
+    }
+
+    .shifts-roster ul {
+      gap: 6px;
+    }
+
+    .shifts-roster li {
+      padding: 9px 10px;
+      font-size: 0.8rem;
+      border-radius: 10px;
+    }
+
+    .emp-name-wrap--roster .emp-position {
+      font-size: clamp(0.85em, 4vw, 1.2em);
+    }
+
+    .grafiki-table-panel .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior-x: contain;
+      margin: 0;
+      padding-bottom: 4px;
+    }
+
+    .grafiki-table-panel .table-wrap:has(#grafik[data-view="week"]) {
+      overflow-x: clip;
+      max-width: 100%;
+    }
+
+    .grafiki-table {
+      font-size: 0.68rem;
+      min-width: 100%;
+    }
+
+    #grafik[data-view="week"].grafiki-table {
+      min-width: 0;
+    }
+
+    .grafiki-table th,
+    .grafiki-table td {
+      padding: 4px 2px;
     }
 
     .grafiki-table .col-name {
-      min-width: 112px;
-      max-width: 140px;
-      font-size: 0.72rem;
+      min-width: 78px;
+      max-width: 92px;
+      padding: 5px 6px;
+      font-size: 0.66rem;
+    }
+
+    .grafiki-table .col-name .emp-name {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.15;
+    }
+
+    .grafiki-table .col-name .emp-position {
+      font-size: 1.45em;
     }
 
     .grafiki-table thead .col-date {
+      min-width: 34px;
+    }
+
+    .grafiki-table thead .col-date .date-dd {
+      font-size: 0.76rem;
+    }
+
+    .grafiki-table thead .col-date .date-abbr {
+      font-size: 0.56rem;
+    }
+
+    .grafiki-table td.slot {
+      min-width: 34px;
+      font-size: 0.66rem;
+    }
+
+    .grafiki-table .col-summary {
       min-width: 36px;
+      font-size: 0.66rem;
+    }
+
+    #grafik[data-view="week"] {
+      width: 100%;
+      min-width: 0;
+      max-width: 100%;
+      font-size: 0.72rem;
+    }
+
+    #grafik[data-view="week"] .col-name {
+      width: 18%;
+      min-width: 0;
+      max-width: 18%;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      box-sizing: border-box;
+    }
+
+    #grafik[data-view="week"] thead .col-name {
+      font-size: 0.58rem;
+      padding-left: max(8px, env(safe-area-inset-left, 0px));
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    #grafik[data-view="week"] tbody .col-name {
+      padding: 8px 6px 8px max(8px, env(safe-area-inset-left, 0px));
+      font-size: 0.66rem;
+    }
+
+    #grafik[data-view="week"] thead .col-date {
+      padding: 6px 2px;
+      border-radius: 10px;
+    }
+
+    #grafik[data-view="week"] thead .col-date .date-dd {
+      font-size: 0.78rem;
+    }
+
+    #grafik[data-view="week"] thead .col-date .date-abbr {
+      font-size: 0.54rem;
+    }
+
+    #grafik[data-view="week"] tbody td.slot {
+      padding: 4px 2px;
+      min-height: 38px;
+    }
+
+    #grafik[data-view="week"] tbody td.slot.custom-shift {
+      font-size: 0.66rem;
+      border-radius: 0 !important;
+      padding: 2px;
+    }
+
+    #grafik[data-view="week"] tbody td.slot.custom-shift .shift-chip {
+      min-height: 24px;
+      padding: 4px 4px 4px 8px;
+      border-radius: 6px;
+    }
+
+    #grafik[data-view="week"] tfoot .col-name {
+      font-size: 0.56rem;
+      padding-left: max(8px, env(safe-area-inset-left, 0px));
+    }
+
+    #grafik[data-view="week"] tfoot .col-date {
+      font-size: 0.7rem;
+    }
+
+    #grafik[data-view="week"] .col-name .emp-position {
+      font-size: 1.2em;
     }
   }
+
+  @media (max-width: 640px) {
+    body.page-schedules .grafiki-filters,
+    body.page-schedules .grafiki-layout > .schedule-period-bar {
+      padding-left: max(14px, env(safe-area-inset-left, 0px));
+      padding-right: max(14px, env(safe-area-inset-right, 0px));
+    }
+
+    .grafiki-layout .schedule-period-label {
+      font-size: 0.78rem;
+      padding: 0 8px;
+    }
+
+    .grafiki-layout .schedule-period-arrow {
+      min-width: 32px;
+      min-height: 32px;
+      padding: 0 8px;
+    }
+
+    .grafiki-roster-head {
+      gap: 8px;
+    }
+
+    .shift-report-copy {
+      min-height: 36px;
+      font-size: 0.8rem;
+      padding: 0 8px 0 10px;
+    }
+
+    .grafiki-table .col-name {
+      min-width: 72px;
+      max-width: 84px;
+      font-size: 0.62rem;
+      padding: 4px 5px;
+    }
+
+    #grafik[data-view="week"] .col-name {
+      width: 18%;
+      max-width: 18%;
+      font-size: 0.62rem;
+    }
+
+    #grafik[data-view="week"] thead .col-name {
+      font-size: 0.52rem;
+    }
+
+    #grafik[data-view="week"] tfoot .col-name {
+      font-size: 0.52rem;
+    }
+
+    #grafik[data-view="week"] tbody td.slot.custom-shift {
+      font-size: 0.62rem;
+    }
+
+    .shifts-roster .roster-meta {
+      font-size: 0.72rem;
+    }
+  }
+}
 </style>
 """
 
@@ -11667,7 +13740,7 @@ def grafik4600_script() -> str:
     return r"""
 <script>
 (() => {
-  const emptyHtml = '<p class="muted">brak przypisań</p>';
+  const emptyHtml = '<p class="muted shifts-roster-empty">brak przypisań</p>';
 
   function escapeHtml(text) {
     return String(text)
@@ -11702,19 +13775,63 @@ def grafik4600_script() -> str:
     return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
   }
 
+  function parseShiftStartHour(shift) {
+    const match = String(shift || "").trim().match(/^(\d{1,2})(?::(\d{2}))?/);
+    if (!match) return 99;
+    const hour = Number(match[1]);
+    const minute = Number(match[2] || 0);
+    if (!Number.isFinite(hour) || hour > 23) return 99;
+    return hour + (minute / 60);
+  }
+
+  function rosterModifierClass(value) {
+    const modifier = String(value || "").trim();
+    return /^emp-position--[\w-]+$/.test(modifier) ? modifier : "emp-position--other";
+  }
+
+  function rosterIdentityHtml(person) {
+    const watermark = String(
+      person.position_watermark || person.position_full || person.position || "",
+    ).trim();
+    const modifier = rosterModifierClass(person.position_modifier);
+    const positionHtml = watermark
+      ? `<span class="emp-position ${modifier}" aria-hidden="true">${escapeHtml(watermark)}</span>`
+      : "";
+    return `<div class="roster-identity emp-name-wrap emp-name-wrap--roster" title="${escapeHtml(person.name)}"><span class="emp-name roster-name">${escapeHtml(person.name)}</span>${positionHtml}</div>`;
+  }
+
   function rosterHtml(people) {
     if (!people.length) return emptyHtml;
     return `<ul>${people.map((person) => {
       const meta = person.hours ? `${escapeHtml(person.shift)} · ${escapeHtml(person.hours)}h` : escapeHtml(person.shift);
-      return `<li><span class="roster-name">${escapeHtml(person.name)}</span><span class="roster-meta">${meta}</span></li>`;
+      return `<li>${rosterIdentityHtml(person)}<span class="roster-meta">${meta}</span></li>`;
     }).join("")}</ul>`;
+  }
+
+  function staffSummaryHtml(positions) {
+    if (!Array.isArray(positions) || !positions.length) {
+      return '<p class="staff-summary-empty muted">brak przypisań</p>';
+    }
+    const items = positions
+      .filter((item) => item && item.name && Number(item.count) > 0)
+      .map((item) => (
+        `<span class="staff-summary-item">`
+        + `<span class="staff-summary-position">${escapeHtml(String(item.name))}</span>`
+        + `<span class="staff-summary-count">${Number(item.count)}</span>`
+        + `</span>`
+      ))
+      .join("");
+    if (!items) {
+      return '<p class="staff-summary-empty muted">brak przypisań</p>';
+    }
+    return `<div class="staff-summary-grid">${items}</div>`;
   }
 
   function applyGrafikDataScripts(root) {
     if (!root) return;
     root.querySelectorAll("script").forEach((script) => {
       const code = script.textContent || "";
-      if (!code.includes("grafikShiftsData") && !code.includes("grafikMonthDates") && !code.includes("grafikShiftReports")) {
+      if (!code.includes("grafikShiftsData") && !code.includes("grafikMonthDates") && !code.includes("grafikShiftReports") && !code.includes("grafikStaffSummary")) {
         return;
       }
       try {
@@ -11742,9 +13859,137 @@ def grafik4600_script() -> str:
     return imported;
   }
 
+  function initMobileMonthEmployeePicker() {
+    const section = document.querySelector(".grafiki-mobile-month");
+    if (!section) return;
+
+    const input = section.querySelector("#grafik-emp-search");
+    const list = section.querySelector("#grafik-emp-options");
+    const toggle = section.querySelector(".grafiki-emp-combobox-toggle");
+    const cards = section.querySelectorAll(".grafiki-emp-card[data-employee]");
+    if (!input || !list || !cards.length) return;
+
+    const options = Array.from(list.querySelectorAll(".grafiki-emp-option"));
+    let highlightIndex = -1;
+
+    function normalizeSearch(value) {
+      return String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/ł/g, "l")
+        .replace(/Ł/g, "L")
+        .toLowerCase()
+        .trim();
+    }
+
+    function visibleOptions() {
+      return options.filter((opt) => !opt.hidden);
+    }
+
+    function openList() {
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+      toggle?.setAttribute("aria-expanded", "true");
+    }
+
+    function closeList() {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      toggle?.setAttribute("aria-expanded", "false");
+      options.forEach((opt) => opt.classList.remove("is-highlighted"));
+      highlightIndex = -1;
+    }
+
+    function showEmployee(employeeId) {
+      if (!employeeId) return;
+      cards.forEach((card) => {
+        const match = card.getAttribute("data-employee") === employeeId;
+        card.hidden = !match;
+        card.classList.toggle("is-active", match);
+      });
+      options.forEach((opt) => {
+        const selected = opt.getAttribute("data-employee") === employeeId;
+        opt.setAttribute("aria-selected", selected ? "true" : "false");
+        if (selected) input.value = opt.textContent.trim();
+      });
+      closeList();
+    }
+
+    function filterOptions() {
+      const query = normalizeSearch(input.value);
+      options.forEach((opt) => {
+        const hay = opt.getAttribute("data-search") || normalizeSearch(opt.textContent);
+        opt.hidden = Boolean(query) && !hay.includes(query);
+        opt.classList.remove("is-highlighted");
+      });
+      highlightIndex = -1;
+    }
+
+    function selectHighlighted() {
+      const visible = visibleOptions();
+      if (highlightIndex < 0 || highlightIndex >= visible.length) return false;
+      showEmployee(visible[highlightIndex].getAttribute("data-employee"));
+      return true;
+    }
+
+    input.addEventListener("input", () => {
+      filterOptions();
+      openList();
+    });
+    input.addEventListener("focus", () => {
+      filterOptions();
+      openList();
+    });
+    input.addEventListener("keydown", (event) => {
+      const visible = visibleOptions();
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        if (list.hidden) openList();
+        highlightIndex = Math.min(highlightIndex + 1, Math.max(visible.length - 1, 0));
+        visible.forEach((opt, idx) => opt.classList.toggle("is-highlighted", idx === highlightIndex));
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        highlightIndex = Math.max(highlightIndex - 1, 0);
+        visible.forEach((opt, idx) => opt.classList.toggle("is-highlighted", idx === highlightIndex));
+      } else if (event.key === "Enter") {
+        if (!list.hidden && selectHighlighted()) event.preventDefault();
+      } else if (event.key === "Escape") {
+        closeList();
+      }
+    });
+
+    toggle?.addEventListener("click", () => {
+      if (list.hidden) {
+        filterOptions();
+        openList();
+        input.focus();
+      } else {
+        closeList();
+      }
+    });
+
+    list.addEventListener("click", (event) => {
+      const opt = event.target.closest(".grafiki-emp-option");
+      if (!opt || opt.hidden) return;
+      showEmployee(opt.getAttribute("data-employee"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!section.contains(event.target)) closeList();
+    });
+
+    const activeCard = section.querySelector(".grafiki-emp-card.is-active");
+    if (activeCard) {
+      const activeId = activeCard.getAttribute("data-employee");
+      const activeOpt = options.find((opt) => opt.getAttribute("data-employee") === activeId);
+      if (activeOpt) input.value = activeOpt.textContent.trim();
+    }
+  }
+
   function initPanel() {
     const shiftsByDate = window.grafikShiftsData || {};
     const shiftReports = window.grafikShiftReports || {};
+    const staffSummary = window.grafikStaffSummary || {};
     const dates = Array.isArray(window.grafikMonthDates) ? window.grafikMonthDates.slice() : [];
     const table = document.getElementById("grafik");
     if (!table || !dates.length) return;
@@ -11753,8 +13998,82 @@ def grafik4600_script() -> str:
     if (!dates.includes(current)) current = dates[0];
     let currentReport = shiftReports[current] || "";
     let copyFeedbackTimer = 0;
+    let reportRequestToken = 0;
 
     const copyButton = document.getElementById("shift-report-copy");
+
+    function setCopyButtonLoading(isLoading) {
+      if (!copyButton) return;
+      copyButton.classList.toggle("is-loading", isLoading);
+      copyButton.toggleAttribute("disabled", isLoading);
+      copyButton.setAttribute("aria-busy", isLoading ? "true" : "false");
+    }
+
+    async function copyTextToClipboard(text) {
+      if (!text) return false;
+      try {
+        if (navigator.clipboard && window.isSecureContext && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (_err) {
+        // fall through to legacy copy for HTTP / iOS
+      }
+
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.setAttribute("readonly", "");
+      helper.style.position = "fixed";
+      helper.style.top = "0";
+      helper.style.left = "0";
+      helper.style.width = "2em";
+      helper.style.height = "2em";
+      helper.style.padding = "0";
+      helper.style.border = "none";
+      helper.style.outline = "none";
+      helper.style.boxShadow = "none";
+      helper.style.background = "transparent";
+      helper.style.opacity = "0";
+      document.body.appendChild(helper);
+      helper.focus();
+      helper.select();
+      helper.setSelectionRange(0, helper.value.length);
+      let copied = false;
+      try {
+        copied = document.execCommand("copy");
+      } catch (_err) {
+        copied = false;
+      } finally {
+        helper.remove();
+      }
+      return copied;
+    }
+
+    async function ensureShiftReport(iso) {
+      if (shiftReports[iso]) {
+        currentReport = shiftReports[iso];
+        return shiftReports[iso];
+      }
+      const token = ++reportRequestToken;
+      setCopyButtonLoading(true);
+      try {
+        const response = await fetch(`/api/shift-report?date=${encodeURIComponent(iso)}`, {
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        if (!response.ok) return "";
+        const data = await response.json();
+        if (token !== reportRequestToken) return "";
+        const text = data && typeof data.text === "string" ? data.text : "";
+        shiftReports[iso] = text;
+        if (current === iso) currentReport = text;
+        return text;
+      } catch (_err) {
+        return "";
+      } finally {
+        if (token === reportRequestToken) setCopyButtonLoading(false);
+      }
+    }
 
     function showCopyFeedback() {
       if (!copyButton) return;
@@ -11766,26 +14085,22 @@ def grafik4600_script() -> str:
     }
 
     async function copyCurrentReport() {
-      if (!currentReport) return;
-      try {
-        await navigator.clipboard.writeText(currentReport);
-        showCopyFeedback();
-        return;
-      } catch (_err) {
-        const helper = document.createElement("textarea");
-        helper.value = currentReport;
-        helper.setAttribute("readonly", "");
-        helper.style.position = "fixed";
-        helper.style.left = "-9999px";
-        document.body.appendChild(helper);
-        helper.select();
+      let text = currentReport || shiftReports[current] || "";
+      if (!text) {
+        text = await ensureShiftReport(current);
+      }
+      if (!text) return;
+
+      let copied = await copyTextToClipboard(text);
+      if (!copied && navigator.share) {
         try {
-          document.execCommand("copy");
-          showCopyFeedback();
-        } finally {
-          helper.remove();
+          await navigator.share({ text });
+          copied = true;
+        } catch (shareErr) {
+          if (shareErr && shareErr.name === "AbortError") return;
         }
       }
+      if (copied) showCopyFeedback();
     }
 
     function syncDayNavButtons() {
@@ -11812,31 +14127,52 @@ def grafik4600_script() -> str:
       const rowShifts = shiftsByDate[iso] || {};
       const people = [];
       Object.keys(rowShifts)
-        .sort((a, b) => a.localeCompare(b, "pl"))
         .forEach((name) => {
           const cell = rowShifts[name] || {};
           const shift = String(cell.shift || "").trim();
           if (!shift || /^(?:-|\.|x|w|wolne|u|urlop|\?)$/i.test(shift)) return;
           people.push({
             name,
+            position: String(cell.position || "").trim(),
+            position_full: String(cell.position_full || "").trim(),
+            position_modifier: String(cell.position_modifier || "").trim(),
+            position_watermark: String(cell.position_watermark || "").trim(),
             shift,
             hours: String(cell.hours || "").trim(),
           });
         });
+      people.sort((a, b) => {
+        const startDiff = parseShiftStartHour(a.shift) - parseShiftStartHour(b.shift);
+        if (startDiff !== 0) return startDiff;
+        return a.name.localeCompare(b.name, "pl");
+      });
 
       const label = document.getElementById("shift-date-label");
       const display = document.getElementById("shift-date-display");
-      const count = document.getElementById("shifts-count");
+      const summary = document.getElementById("shifts-summary");
       const roster = document.getElementById("shifts-roster");
       if (label) label.textContent = formatDayLabel(iso);
       if (display) display.textContent = formatDayDisplay(iso);
-      if (count) count.textContent = String(people.length);
+      if (summary) summary.innerHTML = staffSummaryHtml(staffSummary[iso]);
       if (roster) roster.innerHTML = rosterHtml(people);
 
       table.querySelectorAll("[data-date]").forEach((node) => {
         node.classList.toggle("is-selected-day", node.getAttribute("data-date") === iso);
       });
+      document.querySelectorAll(".grafiki-mobile-cal-day, .grafiki-emp-shift").forEach((node) => {
+        node.classList.toggle("is-selected-day", node.getAttribute("data-date") === iso);
+      });
+      const selectedCalDay = document.querySelector(`.grafiki-mobile-cal-day[data-date="${iso}"]`);
+      if (selectedCalDay && typeof selectedCalDay.scrollIntoView === "function") {
+        selectedCalDay.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+      }
       syncDayNavButtons();
+      ensureShiftReport(iso);
+      const index = dates.indexOf(iso);
+      if (index >= 0) {
+        ensureShiftReport(dates[index - 1]);
+        ensureShiftReport(dates[index + 1]);
+      }
     }
 
     function move(delta) {
@@ -11850,7 +14186,7 @@ def grafik4600_script() -> str:
     document.getElementById("shift-prev-day")?.addEventListener("click", () => move(-1));
     document.getElementById("shift-next-day")?.addEventListener("click", () => move(1));
     copyButton?.addEventListener("click", () => {
-      copyCurrentReport();
+      void copyCurrentReport();
     });
     table.addEventListener("click", (event) => {
       const target = event.target.closest("[data-date]");
@@ -11858,7 +14194,15 @@ def grafik4600_script() -> str:
       const iso = target.getAttribute("data-date");
       if (iso) updateDayPanel(iso);
     });
+    document.querySelector(".grafiki-mobile-month")?.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-date]");
+      if (!target) return;
+      const iso = target.getAttribute("data-date");
+      if (iso) updateDayPanel(iso);
+    });
+    initMobileMonthEmployeePicker();
     updateDayPanel(current);
+    if (!currentReport) void ensureShiftReport(current);
   }
 
   window.__ikidsGrafikiInitPanel = initPanel;
@@ -11968,6 +14312,8 @@ def render_schedules_page(
     role: str = "manager",
     day: str = "today",
     query: dict[str, list[str]] | None = None,
+    *,
+    navigation: bool = False,
 ) -> bytes:
     query = query or {}
     schedule = load_live_schedule()
@@ -11992,7 +14338,7 @@ def render_schedules_page(
     if not schedule.get("ok"):
         status_markup = f'<div class="alert error">Nie udało się pobrać grafików: {escape(error)}</div>'
     day = normalize_day(day)
-    home_href = hub_home_href(day, "grafiki")
+    home_href = hub_home_href(day)
     controls = render_schedule_controls(
         role=role,
         day=day,
@@ -12003,6 +14349,17 @@ def render_schedules_page(
         months=months,
         weeks=weeks,
         home_href=home_href,
+        entries=entries_list,
+    )
+    period_bar = render_schedule_period_bar(
+        role=role,
+        day=day,
+        selected_department=selected_department,
+        selected_month=selected_month,
+        selected_week=selected_week,
+        selected_view=selected_view,
+        months=months,
+        weeks=weeks,
         entries=entries_list,
     )
     selected_department_label = dict(SCHEDULE_DEPARTMENTS).get(selected_department, selected_department)
@@ -12033,12 +14390,30 @@ def render_schedules_page(
         model = build_grafik_month_model(month_entries, selected_month)
         title = schedule_month_label(selected_month)
 
+    shift_reports: dict[str, str] = {}
+    initial_date = ""
+    schedule_rows = model.get("schedule_rows", [])
+    if isinstance(schedule_rows, list):
+        today_iso = current_app_date().isoformat()
+        if any(isinstance(row, dict) and row.get("date") == today_iso for row in schedule_rows):
+            initial_date = today_iso
+        elif schedule_rows:
+            first_row = schedule_rows[0]
+            if isinstance(first_row, dict):
+                initial_date = str(first_row.get("date") or "")
+    if initial_date:
+        shift_reports = build_shift_reports_for_dates([initial_date], entries_list)
+
     report_dates = [
         str(row.get("date"))
         for row in model.get("schedule_rows", [])
         if isinstance(row, dict) and row.get("date")
     ]
-    shift_reports = build_shift_reports_for_dates(report_dates, entries_list)
+    staff_summary_by_date = build_staff_summary_by_date(
+        report_dates,
+        entries_list,
+        department=selected_department,
+    )
 
     grid = render_schedule_grafik_grid(
         model,
@@ -12052,11 +14427,16 @@ def render_schedules_page(
         week=selected_week,
         view=selected_view,
         controls_html=controls,
+        period_bar_html=period_bar,
         home_href=home_href,
         refresh_href=refresh_href,
         shift_reports=shift_reports,
+        staff_summary_by_date=staff_summary_by_date,
     )
-    content = grafik4600_assets() + status_markup + grid + grafik4600_script()
+    content = ("" if navigation else grafik4600_assets()) + status_markup + grid + grafik4600_script()
+    if navigation:
+        document = f"<!doctype html><html lang=\"pl\"><body><main>{content}</main></body></html>"
+        return document.encode("utf-8")
     return page_template(
         content,
         role=role,
@@ -12125,22 +14505,9 @@ def render_home(
     rows = get_reservations_for_day(target_day)
 
     if page_role == "home":
-        section_title = ""
-        tabs = ""
-        if hub == "urodziny":
-            section_title = render_home_section_title("URODZINY")
-            tabs = render_role_tabs("home", day, hub="urodziny")
-        elif hub == "grafiki":
-            section_title = render_home_section_title("GRAFIKI")
-            tabs = render_grafiki_department_tabs(
-                role="home",
-                day=day,
-                home_href=hub_home_href(day, "grafiki"),
-            )
         content = (
-            f'<div class="toolbar">{render_date_toolbar("home", day, hub=hub)}</div>'
-            f'<div class="home-summary">{render_metrics(rows, day)}{section_title}</div>'
-            f"{tabs}"
+            f'<div class="toolbar">{render_date_toolbar("home", day)}</div>'
+            f'<div class="home-summary">{render_metrics(rows, day)}{render_hub_choice(day)}</div>'
         )
         return page_template(
             content,
@@ -12148,7 +14515,6 @@ def render_home(
             errors=errors,
             role=page_role,
             day=day,
-            hub=hub,
         )
 
     if role != "organizer":
@@ -13192,6 +15558,18 @@ class ReservationHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path in {"/sw.js", "/static/sw.js", "/manifest.webmanifest", "/static/manifest.json", "/offline"}:
             pass
+        elif parsed.path == "/api/ready":
+            ready = _BOOT_READY.is_set()
+            payload = json.dumps(
+                {"ready": ready and not _BOOT_ERROR, "error": _BOOT_ERROR or ""},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_bytes(
+                payload,
+                content_type="application/json; charset=utf-8",
+                extra_headers={"Cache-Control": "no-store"},
+            )
+            return
         elif parsed.path.startswith("/app-icon-") or parsed.path in {"/favicon.ico", "/logo.png", "/menu-logo.png"}:
             pass
         elif not _BOOT_READY.is_set():
@@ -13209,6 +15587,12 @@ class ReservationHandler(BaseHTTPRequestHandler):
             edit_values = query.get("edit", [""])[0]
             edit_id = int(edit_values) if edit_values.isdigit() else None
             hub = normalize_hub(query.get("hub", [""])[0])
+            if hub == "grafiki":
+                self.redirect(default_grafiki_href(day, role=role))
+                return
+            if hub == "urodziny" and role == "home":
+                self.redirect(hub_home_href(day))
+                return
             self.send_bytes(
                 render_home(role=role, day=day, message=message, edit_id=edit_id, hub=hub)
             )
@@ -13321,7 +15705,34 @@ class ReservationHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/grafiki":
-            self.send_bytes(render_schedules_page(role=role, day=day, query=query))
+            navigation = self.headers.get("X-IKids-Navigation") == "1"
+            self.send_bytes(render_schedules_page(role=role, day=day, query=query, navigation=navigation))
+            return
+
+        if parsed.path == "/api/shift-report":
+            iso_date = query.get("date", [""])[0]
+            try:
+                date.fromisoformat(iso_date)
+            except ValueError:
+                self.send_bytes(
+                    json.dumps({"ok": False, "error": "Nieprawidłowa data."}, ensure_ascii=False).encode("utf-8"),
+                    status=HTTPStatus.BAD_REQUEST,
+                    content_type="application/json; charset=utf-8",
+                )
+                return
+            schedule = load_live_schedule()
+            entries = schedule.get("entries", [])
+            entries_list = entries if isinstance(entries, list) else []
+            reports = build_shift_reports_for_dates([iso_date], entries_list)
+            payload = json.dumps(
+                {"ok": True, "date": iso_date, "text": reports.get(iso_date, "")},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_bytes(
+                payload,
+                content_type="application/json; charset=utf-8",
+                extra_headers={"Cache-Control": "no-store"},
+            )
             return
 
         if parsed.path == "/history":
@@ -13557,16 +15968,56 @@ class ThreadingHTTPSServer(ThreadingHTTPServer):
 
 
 def maybe_reload_dev_server() -> None:
+    """Local-only auto-reload with debounce — avoids restart storms during boot/grafiki cold start."""
     if os.environ.get("FLY_APP_NAME") or os.environ.get("IKIDS_HTTP", "").strip() == "1":
         return
-    global SOURCE_MTIME
-    current_mtime = SOURCE_PATH.stat().st_mtime
+    if os.environ.get("IKIDS_DEV_RELOAD", "1").strip() == "0":
+        return
+    # Never kill the process while init_db / Sheets warm-up is still running.
+    if not _BOOT_READY.is_set():
+        return
+
+    global SOURCE_MTIME, _RELOAD_TIMER
+    try:
+        current_mtime = SOURCE_PATH.stat().st_mtime
+    except OSError:
+        return
     if current_mtime == SOURCE_MTIME:
         return
-    SOURCE_MTIME = current_mtime
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"\n[{timestamp}] Wykryto zmiany w {SOURCE_PATH.name}, przeładowuję serwer...")
-    os.execv(sys.executable, [sys.executable, str(SOURCE_PATH), *sys.argv[1:]])
+
+    def _do_reload(expected_mtime: float) -> None:
+        global SOURCE_MTIME, _RELOAD_TIMER
+        with _RELOAD_LOCK:
+            _RELOAD_TIMER = None
+            try:
+                latest = SOURCE_PATH.stat().st_mtime
+            except OSError:
+                return
+            if latest != expected_mtime:
+                # Editor still writing — wait for the next settle.
+                _schedule_reload(latest)
+                return
+            if latest == SOURCE_MTIME:
+                return
+            SOURCE_MTIME = latest
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(
+                f"\n[{timestamp}] Wykryto zmiany w {SOURCE_PATH.name}, przeładowuję serwer...",
+                flush=True,
+            )
+            os.execv(sys.executable, [sys.executable, str(SOURCE_PATH), *sys.argv[1:]])
+
+    def _schedule_reload(mtime: float) -> None:
+        global _RELOAD_TIMER
+        if _RELOAD_TIMER is not None:
+            _RELOAD_TIMER.cancel()
+        timer = threading.Timer(_DEV_RELOAD_DEBOUNCE_SEC, _do_reload, args=(mtime,))
+        timer.daemon = True
+        _RELOAD_TIMER = timer
+        timer.start()
+
+    with _RELOAD_LOCK:
+        _schedule_reload(current_mtime)
 
 
 def local_ipv4_addresses() -> list[str]:
@@ -13909,6 +16360,15 @@ def run() -> None:
             print("Inicjalizacja bazy...", flush=True)
             init_db()
             print("Baza gotowa.", flush=True)
+            # Warm Sheets cache before serving — otherwise first /grafiki after local
+            # reload is a multi-second cold start and boot-page polls pile up on it.
+            if GOOGLE_SHEET_ID:
+                print("Ładowanie grafików (Google Sheets)...", flush=True)
+                schedule = load_live_schedule(force=True)
+                if schedule.get("ok"):
+                    print("Grafiki gotowe.", flush=True)
+                else:
+                    print(f"Grafiki niedostępne: {schedule.get('error') or 'nieznany błąd'}", flush=True)
             _BOOT_ERROR = None
             _BOOT_READY.set()
             app_icon_png(192, solid=False)
