@@ -21,6 +21,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from email.parser import BytesParser
+from email.policy import HTTP
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
@@ -82,7 +84,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 APP_TITLE = "iKids Park - Rezerwacje urodzin"
 APP_SHORT_TITLE = "iKids Park"
 # Bump only when service-worker logic changes. Icon URLs use logo mtime separately.
-PWA_CACHE_NAME = "ikidspark-pwa-v18"
+PWA_CACHE_NAME = "ikidspark-pwa-v19"
 PWA_ICON_SIZES = (48, 72, 96, 144, 192, 512)
 PWA_MANIFEST_ID = "/"
 APP_TIMEZONE = ZoneInfo(os.environ.get("IKIDS_TIMEZONE", "Europe/Warsaw"))
@@ -17268,10 +17270,34 @@ def render_history_page(reservation_id: int, role: str, day: str) -> bytes:
     return page_template(content, role=role, day=day)
 
 
+def parse_multipart_form(content_type: str, body: bytes) -> dict[str, list[str]]:
+    """Parse multipart/form-data into the same shape as urllib.parse.parse_qs."""
+    message = BytesParser(policy=HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode("utf-8", "replace") + b"\r\n\r\n" + body
+    )
+    parsed: dict[str, list[str]] = {}
+    if not message.is_multipart():
+        return parsed
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            text = str(part.get_payload() or "")
+        elif isinstance(payload, bytes):
+            text = payload.decode("utf-8", errors="replace")
+        else:
+            text = str(payload)
+        parsed.setdefault(str(name), []).append(text)
+    return parsed
+
+
 def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
     length = int(handler.headers.get("Content-Length", "0"))
-    raw = handler.rfile.read(length).decode("utf-8")
-    parsed = parse_qs(raw, keep_blank_values=True)
+    raw = handler.rfile.read(length)
+    content_type = handler.headers.get("Content-Type") or ""
+    content_type_lower = content_type.lower()
     multi_keys = {
         "adult_location",
         "birthday_child_name",
@@ -17284,7 +17310,29 @@ def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
         "inventory_qty",
         "inventory_description",
     }
+
+    if "multipart/form-data" in content_type_lower:
+        parsed = parse_multipart_form(content_type, raw)
+    elif "application/json" in content_type_lower:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+        parsed = {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if isinstance(value, list):
+                    parsed[str(key)] = ["" if item is None else str(item) for item in value]
+                else:
+                    parsed[str(key)] = ["" if value is None else str(value)]
+    else:
+        parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+
     return {key: values if key in multi_keys else values[-1] for key, values in parsed.items()}
+
+
+def post_field(data: dict[str, object], key: str, default: str = "") -> str:
+    return str(data.get(key, default) or default)
 
 
 def wants_json(handler: BaseHTTPRequestHandler) -> bool:
@@ -17648,7 +17696,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             if not can_modify_reservations(work_role):
                 self.redirect(link_for(page_role, day, message="Brak uprawnień do zapisu rezerwacji."))
                 return
-            raw_id = data.get("id", "")
+            raw_id = post_field(data, "id")
             reservation_id = int(raw_id) if raw_id.isdigit() else None
             values, errors = validate_reservation(data, reservation_id=reservation_id)
             if errors:
@@ -17666,7 +17714,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             if not can_modify_reservations(work_role):
                 self.redirect(link_for(page_role, day, message="Brak uprawnień do usuwania rezerwacji."))
                 return
-            raw_id = data.get("id", "")
+            raw_id = post_field(data, "id")
             if raw_id.isdigit() and delete_reservation(int(raw_id)):
                 self.redirect(link_for(work_role, day, message="Rezerwacja została usunięta."))
             else:
@@ -17699,13 +17747,13 @@ class ReservationHandler(BaseHTTPRequestHandler):
             if not can_assign_waiter(work_role):
                 respond_waiter("Brak uprawnień do przypisania kelnera.", ok=False)
                 return
-            raw_id = data.get("id", "")
+            raw_id = post_field(data, "id")
             if not raw_id.isdigit():
                 respond_waiter("Nie znaleziono rezerwacji.", ok=False)
                 return
             reservation_id = int(raw_id)
-            waiter = str(data.get("waiter", "") or "")
-            remove_waiter = str(data.get("remove_waiter", "") or "")
+            waiter = post_field(data, "waiter")
+            remove_waiter = post_field(data, "remove_waiter")
             if assign_waiter(
                 reservation_id,
                 waiter or None,
@@ -17755,14 +17803,14 @@ class ReservationHandler(BaseHTTPRequestHandler):
             if not can_assign_animator(work_role):
                 respond_animator("Brak uprawnień do przypisania animatora.", ok=False)
                 return
-            raw_id = data.get("id", "")
+            raw_id = post_field(data, "id")
             if not raw_id.isdigit():
                 respond_animator("Nie znaleziono rezerwacji.", ok=False)
                 return
             reservation_id = int(raw_id)
-            animator = str(data.get("animator", "") or "")
-            remove_animator = str(data.get("remove_animator", "") or "")
-            slot = str(data.get("slot", "anim:0") or "anim:0")
+            animator = post_field(data, "animator")
+            remove_animator = post_field(data, "remove_animator")
+            slot = post_field(data, "slot", "anim:0") or "anim:0"
             if assign_animator(
                 reservation_id,
                 animator or None,
