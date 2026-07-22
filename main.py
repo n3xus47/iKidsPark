@@ -11648,7 +11648,7 @@ def render_schedule_grafik_grid(
     )
     hours_total_row = (
         '<tr class="hours-total-row people-total-row">'
-        '<th class="col-name" scope="row">liczba osób na zmianie</th>'
+        '<th class="col-name" scope="row">Razem</th>'
         f"{people_total_cells}"
         f'<td class="col-summary">{escape(format_schedule_total(hours_grand_total))}</td>'
         "</tr>"
@@ -12422,7 +12422,7 @@ def grafik4600_assets() -> str:
     overflow-y: visible;
     overscroll-behavior-x: contain;
     -webkit-overflow-scrolling: touch;
-    border: 1px solid var(--line);
+    border: 1px solid #000000;
     border-radius: 0;
     background: #ffffff;
     box-shadow: none;
@@ -12433,8 +12433,7 @@ def grafik4600_assets() -> str:
     min-width: 100%;
     border-collapse: separate;
     border-spacing: 0;
-    border-top: 1px solid var(--line);
-    border-left: 1px solid var(--line);
+    border: 0;
     font-size: 0.78rem;
     background: #fff;
   }
@@ -12448,6 +12447,15 @@ def grafik4600_assets() -> str:
     text-align: center;
     vertical-align: middle;
     white-space: nowrap;
+  }
+
+  /* Bez podwójnej krawędzi: zewnętrzną ramkę daje tylko .table-wrap */
+  .grafiki-table tr > *:last-child {
+    border-right: 0;
+  }
+
+  .grafiki-table tr:last-child > * {
+    border-bottom: 0;
   }
 
   .grafiki-table thead th {
@@ -12766,8 +12774,7 @@ def grafik4600_assets() -> str:
     table-layout: fixed;
     width: 100%;
     font-size: 0.8rem;
-    border-top: 1px solid var(--line);
-    border-left: 1px solid var(--line);
+    border: 0;
   }
 
   #grafik[data-view="week"] th,
@@ -12777,6 +12784,19 @@ def grafik4600_assets() -> str:
     border-bottom: 1px solid var(--line);
     border-radius: 0 !important;
     padding: 7px 4px;
+  }
+
+  #grafik[data-view="week"] tr > *:last-child {
+    border-right: 0;
+  }
+
+  /* col-summary jest ukryty — ostatnia widoczna kolumna to przedostatnia komórka */
+  #grafik[data-view="week"] tr > *:nth-last-child(2) {
+    border-right: 0;
+  }
+
+  #grafik[data-view="week"] tr:last-child > * {
+    border-bottom: 0;
   }
 
   #grafik[data-view="week"] thead th,
@@ -12921,7 +12941,7 @@ def grafik4600_assets() -> str:
   #grafik[data-view="week"] tfoot tr.hours-total-row th,
   #grafik[data-view="week"] tfoot tr.hours-total-row td {
     background: var(--soft);
-    border-top: 2px solid var(--brand);
+    border-top: 1px solid #000000;
     padding: 10px 5px;
     font-weight: 800;
     color: var(--ink);
@@ -12958,8 +12978,7 @@ def grafik4600_assets() -> str:
     overflow: visible;
     background: #ffffff;
     box-shadow: none;
-    border-left: 0;
-    border-right: 0;
+    border: 1px solid #000000;
   }
 
   .grafiki-table th,
@@ -12971,7 +12990,7 @@ def grafik4600_assets() -> str:
   .grafiki-table tfoot tr.hours-total-row td {
     background: var(--soft);
     font-weight: 900;
-    border-top: 2px solid var(--brand);
+    border-top: 1px solid #000000;
   }
 
   .grafiki-table tfoot .people-total-row .col-name {
@@ -13432,9 +13451,7 @@ def grafik4600_assets() -> str:
     body.page-schedules .grafiki-table-panel:has(#grafik[data-view="week"]) .table-wrap {
       width: 100%;
       margin: 0;
-      border: 0;
-      border-top: 1px solid var(--line);
-      border-bottom: 1px solid var(--line);
+      border: 1px solid #000000;
       border-radius: 0;
       box-shadow: none;
       overflow: hidden;
