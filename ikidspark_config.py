@@ -331,6 +331,12 @@ ANIMATORS = (
     "Julia Juszczak",
 )
 
+RESERVATION_AUTHORS = (
+    "Zuzanna Kmieciak",
+    "Nikodem Boniecki",
+    "Adam Tur",
+)
+
 SERVICE_OVERLAP_MESSAGE = "Godziny dodatków w tej rezerwacji nie mogą się nakładać."
 
 STATUS_LABELS = {

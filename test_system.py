@@ -93,6 +93,8 @@ def base_reservation(
         "children_count": str(children_count),
         "adults_count": str(adults_count),
         "parent_name": parent,
+        "parent_phone": "500 100 200",
+        "created_by": "Nikodem Boniecki",
         "birthday_child_name": child_name,
         "birthday_child_age": str(age),
         "child_location": room,

@@ -55,6 +55,7 @@ from ikidspark_config import (
     ROLE_DEFS,
     ROLE_NAV_ICONS,
     ROOM_CAPACITY,
+    RESERVATION_AUTHORS,
     SERVICE_DURATIONS,
     SERVICE_OVERLAP_MESSAGE,
     STAGE_BLOCK_END,
@@ -241,6 +242,7 @@ def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
             notes TEXT NOT NULL DEFAULT '',
             assigned_waiter TEXT,
             assigned_animator TEXT,
+            created_by TEXT,
             cooperation_enabled INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
             cancellation_reason TEXT,
@@ -296,6 +298,7 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
         "parent_phone": "TEXT",
         "assigned_waiter": "TEXT",
         "assigned_animator": "TEXT",
+        "created_by": "TEXT",
         "cooperation_enabled": "INTEGER NOT NULL DEFAULT 0",
     }
     for column, definition in schema_columns.items():
@@ -599,7 +602,7 @@ def is_table_reservation(row: DbRow | dict[str, object]) -> bool:
     return reservation_type(row) == "table"
 
 
-def cake_detail_parts(row: DbRow | dict[str, object]) -> list[str]:
+def cake_detail_pairs(row: DbRow | dict[str, object]) -> list[tuple[str, str]]:
     labels = (
         ("Waga", "cake_weight"),
         ("Biszkopt", "cake_sponge"),
@@ -607,14 +610,18 @@ def cake_detail_parts(row: DbRow | dict[str, object]) -> list[str]:
         ("Krem", "cake_cream"),
         ("\u015awieczka", "cake_candle"),
     )
-    parts: list[str] = []
+    pairs: list[tuple[str, str]] = []
     for label, field in labels:
         value_text = str(row.get(field) or "").strip()
         if field == "cake_candle":
             value_text = CAKE_CANDLE_LABELS.get(value_text, value_text)
         if value_text:
-            parts.append(f"{label}: {value_text}")
-    return parts
+            pairs.append((label, value_text))
+    return pairs
+
+
+def cake_detail_parts(row: DbRow | dict[str, object]) -> list[str]:
+    return [f"{label}: {value}" for label, value in cake_detail_pairs(row)]
 
 
 def cake_details_label(row: DbRow | dict[str, object]) -> str:
@@ -626,6 +633,34 @@ def cake_image_markup(row: DbRow | dict[str, object]) -> str:
     if not image_data.startswith(("data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,")):
         return ""
     return f'<img class="kitchen-cake-photo" src="{escape(image_data)}" alt="Zdjęcie tortu">'
+
+
+def cake_kitchen_panel(row: DbRow | dict[str, object]) -> str:
+    """50/50 kitchen layout: category/value list left, cake photo right."""
+    specs: list[tuple[str, str]] = [
+        ("Motyw", str(row.get("cake_theme") or "").strip() or "(brak)"),
+    ]
+    specs.extend(cake_detail_pairs(row))
+    serving = format_service_window(row.get("cake_at"), SERVICE_DURATIONS["cake_at"])
+    if serving:
+        specs.append(("Podanie", serving))
+
+    specs_markup = "".join(
+        f'<div class="kitchen-cake-spec"><dt>{escape(label)}</dt><dd>{escape(value)}</dd></div>'
+        for label, value in specs
+    )
+    photo = cake_image_markup(row)
+    photo_markup = (
+        photo
+        if photo
+        else '<div class="kitchen-cake-photo-empty" aria-hidden="true">Brak zdjęcia</div>'
+    )
+    return f"""
+      <div class="kitchen-cake-layout">
+        <dl class="kitchen-cake-specs">{specs_markup}</dl>
+        <div class="kitchen-cake-photo-col">{photo_markup}</div>
+      </div>
+    """
 
 
 def reservation_plan_tip(row: DbRow | dict[str, object]) -> str:
@@ -837,6 +872,108 @@ def parse_text_field(data: dict[str, object], errors: dict[str, str], field: str
     if not value:
         errors[field] = f"Pole \"{label}\" jest wymagane."
     return value
+
+
+_PERSON_NAME_RE = re.compile(r"^[^\W\d_]+(?:[ '\-][^\W\d_]+)*$", re.UNICODE)
+_PHONE_DIGITS_RE = re.compile(r"^\d{9}$")
+
+
+def normalize_person_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    return cleaned
+
+
+def is_valid_person_name(value: str) -> bool:
+    cleaned = normalize_person_name(value)
+    if len(cleaned) < 2 or len(cleaned) > 80:
+        return False
+    return bool(_PERSON_NAME_RE.fullmatch(cleaned))
+
+
+def parse_person_name_field(
+    data: dict[str, object],
+    errors: dict[str, str],
+    field: str,
+    label: str,
+    *,
+    required: bool = True,
+) -> str:
+    cleaned = normalize_person_name(str(data.get(field, "") or ""))
+    if not cleaned:
+        if required:
+            errors[field] = f"Pole \"{label}\" jest wymagane."
+        return ""
+    if not is_valid_person_name(cleaned):
+        errors[field] = (
+            f"Pole \"{label}\" ma niepoprawny format "
+            "(tylko litery, spacje, myślnik lub apostrof)."
+        )
+        return cleaned
+    return cleaned
+
+
+def normalize_phone_number(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("0048"):
+        digits = digits[4:]
+    elif digits.startswith("48") and len(digits) >= 11:
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 10:
+        digits = digits[1:]
+    if not _PHONE_DIGITS_RE.fullmatch(digits):
+        return None
+    if digits[0] == "0":
+        return None
+    return f"{digits[0:3]} {digits[3:6]} {digits[6:9]}"
+
+
+def parse_phone_field(
+    data: dict[str, object],
+    errors: dict[str, str],
+    field: str,
+    label: str,
+    *,
+    required: bool = True,
+) -> str:
+    raw = str(data.get(field, "") or "").strip()
+    if not raw:
+        if required:
+            errors[field] = f"Pole \"{label}\" jest wymagane."
+        return ""
+    normalized = normalize_phone_number(raw)
+    if normalized is None:
+        errors[field] = (
+            f"Pole \"{label}\" ma niepoprawny format "
+            "(9 cyfr, np. 500 000 000 lub +48 500 000 000)."
+        )
+        return raw
+    return normalized
+
+
+def parse_optional_free_text(
+    data: dict[str, object],
+    errors: dict[str, str],
+    field: str,
+    label: str,
+    *,
+    maximum: int = 120,
+) -> str:
+    cleaned = re.sub(r"\s+", " ", str(data.get(field, "") or "").strip())
+    if not cleaned:
+        return ""
+    if any(ord(char) < 32 and char not in "\t\n\r" for char in cleaned):
+        errors[field] = f"Pole \"{label}\" zawiera niedozwolone znaki."
+        return cleaned
+    if "<" in cleaned or ">" in cleaned:
+        errors[field] = f"Pole \"{label}\" nie może zawierać znaków < ani >."
+        return cleaned
+    if len(cleaned) > maximum:
+        errors[field] = f"Pole \"{label}\" może mieć maksymalnie {maximum} znaków."
+        return cleaned[:maximum]
+    return cleaned
 
 
 def checked_bool(data: dict[str, object], field: str) -> int:
@@ -1072,11 +1209,11 @@ def validate_reservation(
     if fruit_enabled:
         fruit_plates = parse_int_field(data, errors, "fruit_plates", "Liczba talerzy owoców", 1, 200)
 
-    cake_theme = data.get("cake_theme", "").strip()
-    cake_weight = data.get("cake_weight", "").strip()
-    cake_sponge = data.get("cake_sponge", "").strip()
-    cake_filling = data.get("cake_filling", "").strip()
-    cake_cream = data.get("cake_cream", "").strip()
+    cake_theme = parse_optional_free_text(data, errors, "cake_theme", "Motyw tortu", maximum=80)
+    cake_weight = parse_optional_free_text(data, errors, "cake_weight", "Waga tortu", maximum=40)
+    cake_sponge = parse_optional_free_text(data, errors, "cake_sponge", "Biszkopt", maximum=60)
+    cake_filling = parse_optional_free_text(data, errors, "cake_filling", "Nadzienie", maximum=60)
+    cake_cream = parse_optional_free_text(data, errors, "cake_cream", "Krem", maximum=60)
     cake_image_data = data.get("cake_image_data", "").strip()
     cake_candle = data.get("cake_candle", "").strip()
     if cake_enabled and not cake_theme:
@@ -1103,7 +1240,7 @@ def validate_reservation(
     if not culinary_workshops_enabled:
         workshops_type = ""
 
-    pinata_theme = data.get("pinata_theme", "").strip()
+    pinata_theme = parse_optional_free_text(data, errors, "pinata_theme", "Motyw piniaty", maximum=80)
     if pinata_enabled and not pinata_theme:
         pinata_theme = "(brak)"
     if not pinata_enabled:
@@ -1115,7 +1252,9 @@ def validate_reservation(
     if not mascot_enabled:
         mascot_type = ""
 
-    balloons_description = data.get("balloons_description", "").strip()
+    balloons_description = parse_optional_free_text(
+        data, errors, "balloons_description", "Opis balonów", maximum=120
+    )
     if balloons_enabled and not balloons_description:
         balloons_description = "(brak)"
     if not balloons_enabled:
@@ -1148,8 +1287,12 @@ def validate_reservation(
         for field in dict.fromkeys(stage_block_fields):
             errors[field] = STAGE_BLOCK_MESSAGE
 
-    parent_name = parse_text_field(data, errors, "parent_name", "Rodzic / osoba rezerwująca")
-    parent_phone = data.get("parent_phone", "").strip()
+    parent_name = parse_person_name_field(data, errors, "parent_name", "Rodzic / osoba rezerwująca")
+    parent_phone = parse_phone_field(data, errors, "parent_phone", "Telefon")
+    created_by = str(data.get("created_by", "") or "").strip()
+    if created_by not in RESERVATION_AUTHORS:
+        errors["created_by"] = "Wybierz osobę, która dodała rezerwację."
+        created_by = ""
     if is_table:
         guest_total = parse_int_field(data, errors, "guest_total", "Liczba gości", 1, 240)
         birthday_children = []
@@ -1160,8 +1303,15 @@ def validate_reservation(
         if not birthday_children:
             errors["birthday_child_name"] = "Dodaj co najmniej jednego solenizanta."
         for index, child in enumerate(birthday_children):
-            if not child["name"]:
+            name = normalize_person_name(str(child.get("name") or ""))
+            child["name"] = name
+            if not name:
                 errors["birthday_child_name"] = "Każdy solenizant musi mieć imię."
+            elif not is_valid_person_name(name):
+                errors["birthday_child_name"] = (
+                    "Imię solenizanta ma niepoprawny format "
+                    "(tylko litery, spacje, myślnik lub apostrof)."
+                )
             age = child.get("age")
             if age is None:
                 errors["birthday_child_age"] = "Podaj wiek każdego solenizanta (1-18 lat)."
@@ -1191,11 +1341,15 @@ def validate_reservation(
     if status not in STATUS_LABELS:
         errors["status"] = "Wybierz poprawny status rezerwacji."
 
-    cancellation_reason = data.get("cancellation_reason", "").strip()
+    cancellation_reason = parse_optional_free_text(
+        data, errors, "cancellation_reason", "Powód anulowania", maximum=300
+    )
     if status == "cancelled" and not cancellation_reason:
         errors["cancellation_reason"] = "Powód anulowania jest wymagany przy statusie Anulowana."
     if status == "active":
         cancellation_reason = ""
+
+    notes = parse_optional_free_text(data, errors, "notes", "Uwagi", maximum=1000)
 
     form_animations = [{"type": item["type"], "at": item["at"]} for item in animations]
     if animation_enabled and not form_animations and parsed_animations:
@@ -1216,6 +1370,7 @@ def validate_reservation(
         "reservation_type": form_reservation_type,
         "parent_name": parent_name,
         "parent_phone": parent_phone,
+        "created_by": created_by or None,
         "birthday_child_name": str(primary_child["name"]),
         "birthday_child_age": int(primary_child["age"] or 1),
         "birthday_children_json": birthday_children_json_value(birthday_children) if birthday_children else "[]",
@@ -1260,7 +1415,7 @@ def validate_reservation(
         "balloons_description": balloons_description or None,
         "balloons_at": combine_day_time(reservation_day, balloons_time) if balloons_enabled else None,
         "attraction_at": None,
-        "notes": data.get("notes", "").strip(),
+        "notes": notes,
         "cooperation_enabled": 1 if cooperation_enabled else 0,
         "status": status,
         "cancellation_reason": cancellation_reason,
@@ -1321,6 +1476,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         values["reservation_type"],
         values["parent_name"],
         values["parent_phone"],
+        values.get("created_by") or None,
         values["birthday_child_name"],
         values["birthday_child_age"],
         values["birthday_children_json"],
@@ -1370,7 +1526,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             UPDATE reservations
             SET start_at = ?, end_at = ?, children_count = ?, adults_count = ?,
                 guest_total = ?, reservation_type = ?,
-                parent_name = ?, parent_phone = ?, birthday_child_name = ?, birthday_child_age = ?,
+                parent_name = ?, parent_phone = ?, created_by = ?, birthday_child_name = ?, birthday_child_age = ?,
                 birthday_children_json = ?,
                 child_location = ?, adult_location = ?, animation_enabled = ?, animation_type = ?,
                 animation_at = ?, animations_json = ?,
@@ -1399,7 +1555,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         """
         INSERT INTO reservations (
             start_at, end_at, children_count, adults_count, guest_total, reservation_type, parent_name,
-            parent_phone, birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
+            parent_phone, created_by, birthday_child_name, birthday_child_age, birthday_children_json, child_location, adult_location,
             animation_enabled, animation_type, animation_at, animations_json, cake_enabled, cake_theme,
             cake_weight, cake_sponge, cake_filling, cake_cream, cake_image_data, cake_candle, cake_at,
             fruit_enabled, fruit_plates, fruit_at, drinks_enabled, drinks_at,
@@ -1411,7 +1567,7 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
             notes, cooperation_enabled, status, cancellation_reason,
             created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         params + (timestamp, timestamp),
     )
@@ -4266,6 +4422,7 @@ def page_template(
       display: grid;
       grid-template-rows: 0fr;
       transition: grid-template-rows 0.28s ease;
+      overflow: hidden;
     }}
 
     .location-accordion.is-open .location-accordion-panel {{
@@ -4275,6 +4432,7 @@ def page_template(
     .location-accordion-body {{
       overflow: hidden;
       min-height: 0;
+      padding: 0;
     }}
 
     .location-accordion.is-open .location-accordion-body {{
@@ -4471,7 +4629,23 @@ def page_template(
     }}
 
     .plan-accordion .location-accordion-body {{
+      padding: 0;
+    }}
+
+    .plan-accordion.is-open .location-accordion-body {{
       padding: 0 10px 10px;
+    }}
+
+    .plan-accordion .plan-wrap {{
+      padding: 0;
+    }}
+
+    .plan-accordion.is-open .plan-wrap {{
+      padding: 0 4px 4px;
+    }}
+
+    .plan-accordion:not(.is-open) .room-plan {{
+      visibility: hidden;
     }}
 
     .location-picker .plan-wrap {{
@@ -5434,6 +5608,22 @@ def page_template(
       padding-top: 2px;
     }}
 
+    .reservation-author {{
+      margin-top: 2px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      background: rgba(19, 155, 215, 0.06);
+      color: var(--brand-dark);
+      font-size: 0.88rem;
+      font-weight: 700;
+      line-height: 1.35;
+    }}
+
+    .reservation-author strong {{
+      font-weight: 900;
+      color: var(--ink);
+    }}
+
     .reservation-block {{
       display: grid;
       gap: 4px;
@@ -6348,6 +6538,10 @@ def page_template(
       overflow: hidden;
     }}
 
+    .kitchen-card {{
+      overflow: visible;
+    }}
+
     .role-card.animator-card {{
       position: relative;
       overflow: visible;
@@ -6522,14 +6716,86 @@ def page_template(
       word-break: break-word;
     }}
 
+    .kitchen-task--cake .task-detail {{
+      width: 100%;
+    }}
+
+    .kitchen-cake-layout {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) max-content;
+      gap: 12px 14px;
+      margin-top: 8px;
+      align-items: start;
+    }}
+
+    .kitchen-cake-specs {{
+      margin: 0;
+      display: grid;
+      gap: 7px;
+      align-content: start;
+    }}
+
+    .kitchen-cake-spec {{
+      display: grid;
+      grid-template-columns: minmax(5.5rem, auto) minmax(0, 1fr);
+      gap: 4px 10px;
+      align-items: baseline;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #ffffff;
+    }}
+
+    .kitchen-cake-spec dt {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      line-height: 1.25;
+    }}
+
+    .kitchen-cake-spec dd {{
+      margin: 0;
+      color: var(--ink);
+      font-size: 0.92rem;
+      font-weight: 800;
+      line-height: 1.3;
+      word-break: break-word;
+    }}
+
+    .kitchen-cake-photo-col {{
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      overflow: visible;
+      line-height: 0;
+    }}
+
     .kitchen-cake-photo {{
       display: block;
-      width: min(260px, 100%);
+      width: auto;
       height: auto;
-      object-fit: contain;
-      margin-top: 8px;
-      border: 1px solid var(--line);
-      background: #ffffff;
+      max-width: none;
+      max-height: none;
+      object-fit: unset;
+      border: 0;
+      background: transparent;
+    }}
+
+    .kitchen-cake-photo-empty {{
+      color: var(--muted);
+      font-size: 0.84rem;
+      font-weight: 800;
+      text-align: left;
+      padding: 0;
+      line-height: 1.3;
+    }}
+
+    .role-card .kitchen-task--cake {{
+      align-items: start;
     }}
 
     .role-extra {{
@@ -6688,10 +6954,6 @@ def page_template(
     .plan-wrap {{
       padding: 0;
       width: 100%;
-    }}
-
-    .plan-accordion .plan-wrap {{
-      padding: 0 4px 4px;
     }}
 
     .plan-legend {{
@@ -8103,6 +8365,7 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "balloons_at": "",
         "attraction_at": "",
         "notes": "",
+        "created_by": "",
         "cooperation_enabled": 0,
         "status": "active",
         "cancellation_reason": "",
@@ -8322,11 +8585,11 @@ def render_birthday_children_fields(values: dict[str, object], errors: dict[str,
           <div class="birthday-child-row">
             <label>
               Imię solenizanta
-              <input name="birthday_child_name" value="{escape(child.get("name", ""))}" required>
+              <input name="birthday_child_name" value="{escape(child.get("name", ""))}" required minlength="2" maxlength="80" pattern="[A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+([ '\\-][A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+)*" title="Tylko litery, spacje, myślnik lub apostrof" autocomplete="off">
             </label>
             <label>
               Wiek
-              <input type="number" name="birthday_child_age" min="1" max="18" value="{escape(child.get("age", ""))}" required>
+              <input type="number" name="birthday_child_age" min="1" max="18" step="1" value="{escape(child.get("age", ""))}" required title="Wiek od 1 do 18 lat">
             </label>
             {remove_button}
           </div>
@@ -8800,8 +9063,8 @@ def staff_assignment_script() -> str:
     return """
 <script>
 (() => {
-  const assigns = Array.from(document.querySelectorAll("[data-staff-assign]"));
-  if (!assigns.length) return;
+  if (window.__IKIDS_STAFF_ASSIGN_BOUND) return;
+  window.__IKIDS_STAFF_ASSIGN_BOUND = true;
 
   function normalize(value) {
     return String(value || "")
@@ -8810,11 +9073,18 @@ def staff_assignment_script() -> str:
       .replace(/[\\u0300-\\u036f]/g, "");
   }
 
+  function ownerRoot(sheet) {
+    return sheet?._ownerRoot || null;
+  }
+
   function placeSheet(picker) {
     const sheet = picker.querySelector(".animator-assign__sheet") || picker._portedSheet;
     const trigger = picker.querySelector(".animator-assign__icon-btn");
+    const root = picker.closest("[data-staff-assign]");
     if (!sheet || !trigger) return;
     picker._portedSheet = sheet;
+    sheet._ownerRoot = root;
+    sheet._ownerPicker = picker;
     if (sheet.parentElement !== document.body) {
       document.body.appendChild(sheet);
     }
@@ -8852,18 +9122,41 @@ def staff_assignment_script() -> str:
     }
   }
 
-  function closeOtherPickers(active) {
-    assigns.forEach((other) => {
-      if (other === active) return;
+  function discardPortedSheet(root) {
+    if (!root) return;
+    const picker = root.querySelector("[data-staff-picker]");
+    const sheet = picker?._portedSheet;
+    if (sheet && sheet.parentElement === document.body) {
+      sheet.remove();
+    }
+    document.querySelectorAll(".animator-assign__sheet.is-ported").forEach((node) => {
+      if (ownerRoot(node) === root) node.remove();
+    });
+  }
+
+  function closeOtherPickers(activeRoot) {
+    document.querySelectorAll("[data-staff-assign]").forEach((other) => {
+      if (other === activeRoot) return;
       other.querySelectorAll("[data-staff-picker][open]").forEach((node) => {
         node.open = false;
       });
     });
   }
 
-  assigns.forEach((root) => {
-    const picker = root.querySelector("[data-staff-picker]");
-    if (!picker) return;
+  function replaceAssignRoot(root, html) {
+    discardPortedSheet(root);
+    const wrap = document.createElement("div");
+    wrap.innerHTML = String(html || "").trim();
+    const next = wrap.firstElementChild;
+    if (!next) return null;
+    root.replaceWith(next);
+    return next;
+  }
+
+  document.addEventListener("toggle", (event) => {
+    const picker = event.target;
+    if (!(picker instanceof HTMLDetailsElement) || !picker.matches("[data-staff-picker]")) return;
+    const root = picker.closest("[data-staff-assign]");
     const filter = () =>
       (picker._portedSheet || picker).querySelector("[data-staff-filter]");
     const listRoot = () =>
@@ -8871,53 +9164,51 @@ def staff_assignment_script() -> str:
     const options = () =>
       Array.from((picker._portedSheet || picker).querySelectorAll("[data-staff-option]"));
 
-    picker.addEventListener("toggle", () => {
-      if (!picker.open) {
-        const input = filter();
-        if (input) input.value = "";
+    if (!picker.open) {
+      const input = filter();
+      if (input) input.value = "";
+      options().forEach((btn) => {
+        const form = btn.closest(".animator-assign__option-form");
+        if (form) form.hidden = false;
+      });
+      listRoot()?.querySelector("[data-staff-empty-filter]")?.remove();
+      restoreSheet(picker);
+      return;
+    }
+    closeOtherPickers(root);
+    placeSheet(picker);
+    const sheet = picker._portedSheet;
+    if (sheet && !sheet.dataset.filterBound) {
+      sheet.dataset.filterBound = "1";
+      sheet.addEventListener("input", (inputEvent) => {
+        const target = inputEvent.target;
+        if (!(target instanceof Element) || !target.matches("[data-staff-filter]")) return;
+        const query = normalize(target.value.trim());
+        let visible = 0;
         options().forEach((btn) => {
           const form = btn.closest(".animator-assign__option-form");
-          if (form) form.hidden = false;
+          const name = normalize(btn.textContent);
+          const show = !query || name.includes(query);
+          if (form) form.hidden = !show;
+          if (show) visible += 1;
         });
-        listRoot()?.querySelector("[data-staff-empty-filter]")?.remove();
-        restoreSheet(picker);
-        return;
-      }
-      closeOtherPickers(root);
-      placeSheet(picker);
-      const sheet = picker._portedSheet;
-      if (sheet && !sheet.dataset.filterBound) {
-        sheet.dataset.filterBound = "1";
-        sheet.addEventListener("input", (event) => {
-          const target = event.target;
-          if (!(target instanceof Element) || !target.matches("[data-staff-filter]")) return;
-          const query = normalize(target.value.trim());
-          let visible = 0;
-          options().forEach((btn) => {
-            const form = btn.closest(".animator-assign__option-form");
-            const name = normalize(btn.textContent);
-            const show = !query || name.includes(query);
-            if (form) form.hidden = !show;
-            if (show) visible += 1;
-          });
-          const list = listRoot();
-          let empty = list?.querySelector("[data-staff-empty-filter]");
-          if (visible === 0) {
-            if (!empty && list) {
-              empty = document.createElement("p");
-              empty.className = "animator-assign__empty";
-              empty.setAttribute("data-staff-empty-filter", "");
-              empty.textContent = "Brak wyników";
-              list.appendChild(empty);
-            }
-          } else {
-            empty?.remove();
+        const list = listRoot();
+        let empty = list?.querySelector("[data-staff-empty-filter]");
+        if (visible === 0) {
+          if (!empty && list) {
+            empty = document.createElement("p");
+            empty.className = "animator-assign__empty";
+            empty.setAttribute("data-staff-empty-filter", "");
+            empty.textContent = "Brak wyników";
+            list.appendChild(empty);
           }
-        });
-      }
-      window.requestAnimationFrame(() => filter()?.focus());
-    });
-  });
+        } else {
+          empty?.remove();
+        }
+      });
+    }
+    window.requestAnimationFrame(() => filter()?.focus());
+  }, true);
 
   function repositionOpenSheets() {
     document.querySelectorAll("[data-staff-picker][open]").forEach((picker) => {
@@ -8935,6 +9226,46 @@ def staff_assignment_script() -> str:
     document.querySelectorAll("[data-staff-picker][open]").forEach((node) => {
       node.open = false;
     });
+  });
+
+  document.addEventListener("submit", async (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (!form.matches(".animator-assign__option-form, .animator-assign__chip-remove-form")) return;
+
+    const sheet = form.closest(".animator-assign__sheet");
+    const root = form.closest("[data-staff-assign]") || ownerRoot(sheet);
+    if (!root) return;
+
+    event.preventDefault();
+    if (form.dataset.busy === "1") return;
+    form.dataset.busy = "1";
+
+    const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
+    if (submitter) submitter.disabled = true;
+
+    try {
+      const response = await fetch(form.action, {
+        method: "POST",
+        body: new FormData(form),
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "X-Requested-With": "ikids-assign",
+        },
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload || !payload.ok || !payload.html) {
+        window.alert((payload && payload.message) || "Nie udało się zaktualizować przypisania.");
+        return;
+      }
+      replaceAssignRoot(root, payload.html);
+    } catch {
+      window.alert("Nie udało się zaktualizować przypisania.");
+    } finally {
+      form.dataset.busy = "0";
+      if (submitter) submitter.disabled = false;
+    }
   });
 })();
 </script>
@@ -9085,6 +9416,12 @@ def render_reservation_details(
     animator_markup = render_animator_assignment(row, role, day) if assign_animator else ""
     color_attr = f' style="--reservation-color: {escape(color)}"' if color else ""
     color_class = " has-color" if color else ""
+    created_by = str(row.get("created_by") or "").strip()
+    author_markup = (
+        f'<div class="reservation-author">Dodał(a): <strong>{escape(created_by)}</strong></div>'
+        if created_by
+        else ""
+    )
 
     return f"""
       <article class="timeline-card{cancelled_class}">
@@ -9098,6 +9435,7 @@ def render_reservation_details(
         </header>
         {logistics_markup}
         {notes_markup}
+        {author_markup}
         {footer}
       </article>
     """
@@ -9548,12 +9886,21 @@ def render_form(
           </div>
           <label>
             Rodzic / osoba rezerwująca
-            <input name="parent_name" autocomplete="name" value="{escape(values.get("parent_name", ""))}" required>
+            <input name="parent_name" autocomplete="name" value="{escape(values.get("parent_name", ""))}" required minlength="2" maxlength="80" pattern="[A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+([ '\\-][A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+)*" title="Tylko litery, spacje, myślnik lub apostrof">
             {error_for(errors, "parent_name")}
           </label>
           <label>
             Telefon
-            <input name="parent_phone" autocomplete="tel" inputmode="tel" value="{escape(values.get("parent_phone", ""))}" placeholder="np. 500 000 000">
+            <input name="parent_phone" id="parent_phone" autocomplete="tel" inputmode="tel" value="{escape(values.get("parent_phone", ""))}" placeholder="np. 500 000 000" required maxlength="20" data-phone-input title="9 cyfr, np. 500 000 000 lub +48 500 000 000">
+            {error_for(errors, "parent_phone")}
+          </label>
+          <label>
+            Kto dodał rezerwację
+            <select name="created_by" required>
+              <option value="">Wybierz osobę</option>
+              {render_options(list(RESERVATION_AUTHORS), values.get("created_by", ""))}
+            </select>
+            {error_for(errors, "created_by")}
           </label>
           <div class="banquet-only full">
             {render_birthday_children_fields(values, errors)}
@@ -9615,11 +9962,12 @@ def render_form(
         <div class="category-fields">
           <label class="full">
             Notatki
-            <textarea name="notes" placeholder="Alergie, ustalenia z rodzicem, szczegóły organizacyjne...">{escape(values.get("notes", ""))}</textarea>
+            <textarea name="notes" maxlength="1000" placeholder="Alergie, ustalenia z rodzicem, szczegóły organizacyjne...">{escape(values.get("notes", ""))}</textarea>
+            {error_for(errors, "notes")}
           </label>
           <label class="{cancellation_class}" id="cancellation_reason_field">
             Powód anulowania
-            <textarea name="cancellation_reason" id="cancellation_reason" placeholder="Wymagane tylko przy zmianie statusu na Anulowana.">{escape(values.get("cancellation_reason", ""))}</textarea>
+            <textarea name="cancellation_reason" id="cancellation_reason" maxlength="300" placeholder="Wymagane tylko przy zmianie statusu na Anulowana.">{escape(values.get("cancellation_reason", ""))}</textarea>
             {error_for(errors, "cancellation_reason")}
           </label>
         </div>
@@ -9822,12 +10170,16 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
             task_items.append((format_time(row["start_at"]), "Owoce", plates))
 
         if has_cake:
-            cake_window = format_service_window(row["cake_at"], SERVICE_DURATIONS["cake_at"])
-            cake_meta = row["cake_theme"] or "(brak)"
-            cake_details = cake_details_label(row)
-            if cake_details:
-                cake_meta = f"{cake_meta} · {cake_details}"
-            task_items.append((format_time(row["cake_at"]), "Tort", cake_meta, cake_window, cake_image_markup(row)))
+            task_items.append(
+                (
+                    format_time(row["cake_at"]),
+                    "Tort",
+                    "",
+                    "",
+                    cake_kitchen_panel(row),
+                    "cake",
+                )
+            )
 
         if has_workshops:
             workshop_name = row["culinary_workshops_type"] or "Warsztaty"
@@ -9844,6 +10196,20 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
         task_items.sort(key=lambda item: (item[0], item[1]))
         task_blocks = []
         for item in task_items:
+            kind = item[5] if len(item) > 5 else ""
+            if kind == "cake":
+                task_blocks.append(
+                    f"""
+              <div class="banquet-task kitchen-task kitchen-task--cake">
+                <div class="task-time">{escape(item[0])}</div>
+                <div class="task-detail">
+                  <div class="task-label">{escape(item[1])}</div>
+                  {item[4]}
+                </div>
+              </div>
+            """
+                )
+                continue
             meta = escape(item[2])
             if len(item) > 3 and item[3]:
                 meta = f"{meta} · {escape(item[3])}"
@@ -14909,6 +15275,76 @@ def room_plan_script() -> str:
     if (normalized !== input.value) input.value = normalized;
   }
 
+  function normalizePhoneText(value) {
+    let digits = String(value || "").replace(/\\D/g, "");
+    if (digits.startsWith("0048")) digits = digits.slice(4);
+    else if (digits.startsWith("48") && digits.length >= 11) digits = digits.slice(2);
+    if (digits.startsWith("0") && digits.length === 10) digits = digits.slice(1);
+    if (!/^\\d{9}$/.test(digits) || digits[0] === "0") return null;
+    return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6, 9)}`;
+  }
+
+  function normalizePhoneInput(input) {
+    if (!input) return false;
+    const raw = input.value.trim();
+    if (!raw) {
+      input.setCustomValidity("Podaj numer telefonu.");
+      return false;
+    }
+    const normalized = normalizePhoneText(raw);
+    if (!normalized) {
+      input.setCustomValidity("Niepoprawny telefon (9 cyfr, np. 500 000 000).");
+      return false;
+    }
+    input.value = normalized;
+    input.setCustomValidity("");
+    return true;
+  }
+
+  function normalizePersonNameInput(input) {
+    if (!input || input.disabled) return true;
+    const cleaned = String(input.value || "").trim().replace(/\\s+/g, " ");
+    input.value = cleaned;
+    if (!input.required && !cleaned) {
+      input.setCustomValidity("");
+      return true;
+    }
+    if (cleaned.length < 2) {
+      input.setCustomValidity("Imię i nazwisko musi mieć co najmniej 2 znaki.");
+      return false;
+    }
+    if (!/^[A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+([ '\\-][A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+)*$/.test(cleaned)) {
+      input.setCustomValidity("Użyj tylko liter, spacji, myślnika lub apostrofu.");
+      return false;
+    }
+    input.setCustomValidity("");
+    return true;
+  }
+
+  function bindPhoneInput() {
+    const phoneInput = document.getElementById("parent_phone") || form.querySelector("[data-phone-input]");
+    if (!phoneInput) return;
+    phoneInput.addEventListener("blur", () => {
+      normalizePhoneInput(phoneInput);
+      phoneInput.reportValidity();
+    });
+    phoneInput.addEventListener("input", () => {
+      phoneInput.setCustomValidity("");
+    });
+  }
+
+  function bindPersonNameInputs() {
+    form.querySelectorAll('input[name="parent_name"], input[name="birthday_child_name"]').forEach((input) => {
+      if (input.dataset.bound === "1") return;
+      input.dataset.bound = "1";
+      input.addEventListener("blur", () => {
+        normalizePersonNameInput(input);
+        input.reportValidity();
+      });
+      input.addEventListener("input", () => input.setCustomValidity(""));
+    });
+  }
+
   function toMinutes(value) {
     const normalized = normalizeClockText(value);
     if (!normalized) return null;
@@ -15076,9 +15512,20 @@ def room_plan_script() -> str:
   function bindBirthdayChildren() {
     if (!birthdayList) return;
     birthdayList.querySelectorAll(".remove-birthday-child").forEach((button) => {
+      if (button.dataset.bound === "1") return;
+      button.dataset.bound = "1";
       button.addEventListener("click", () => {
         button.closest(".birthday-child-row")?.remove();
       });
+    });
+    birthdayList.querySelectorAll('input[name="birthday_child_name"]').forEach((input) => {
+      if (input.dataset.bound === "1") return;
+      input.dataset.bound = "1";
+      input.addEventListener("blur", () => {
+        normalizePersonNameInput(input);
+        input.reportValidity();
+      });
+      input.addEventListener("input", () => input.setCustomValidity(""));
     });
   }
 
@@ -15208,12 +15655,13 @@ def room_plan_script() -> str:
       const row = document.createElement("div");
       row.className = "birthday-child-row";
       row.innerHTML = `
-        <label>Imię solenizanta<input name="birthday_child_name" required></label>
-        <label>Wiek<input type="number" name="birthday_child_age" min="1" max="18" required></label>
+        <label>Imię solenizanta<input name="birthday_child_name" required minlength="2" maxlength="80" pattern="[A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+([ '\\-][A-Za-zÀ-žĄąĆćĘęŁłŃńÓóŚśŹźŻż]+)*" title="Tylko litery, spacje, myślnik lub apostrof" autocomplete="off"></label>
+        <label>Wiek<input type="number" name="birthday_child_age" min="1" max="18" step="1" required title="Wiek od 1 do 18 lat"></label>
         <button type="button" class="button secondary remove-birthday-child" aria-label="Usuń solenizanta">Usuń</button>
       `;
       birthdayList.appendChild(row);
       bindBirthdayChildren();
+      bindPersonNameInputs();
     });
     bindBirthdayChildren();
   }
@@ -15329,6 +15777,23 @@ def room_plan_script() -> str:
 
   form.addEventListener("submit", (event) => {
     allTimeInputs().forEach(normalizeTimeInput);
+    const phoneInput = document.getElementById("parent_phone") || form.querySelector("[data-phone-input]");
+    if (phoneInput && !normalizePhoneInput(phoneInput)) {
+      event.preventDefault();
+      phoneInput.reportValidity();
+      phoneInput.focus();
+      return;
+    }
+    let nameInvalid = null;
+    form.querySelectorAll('input[name="parent_name"], input[name="birthday_child_name"]').forEach((input) => {
+      if (!normalizePersonNameInput(input) && !nameInvalid) nameInvalid = input;
+    });
+    if (nameInvalid) {
+      event.preventDefault();
+      nameInvalid.reportValidity();
+      nameInvalid.focus();
+      return;
+    }
     finalizeLocations();
     if (stageBlockAck) stageBlockAck.value = "";
     if (!validateServiceOverlaps()) {
@@ -15348,6 +15813,8 @@ def room_plan_script() -> str:
     }
   });
 
+  bindPhoneInput();
+  bindPersonNameInputs();
   paintSelectedLocations();
   syncReservationType();
   dateInput?.addEventListener("input", scheduleRefresh);
@@ -15515,6 +15982,12 @@ def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
     raw = handler.rfile.read(length).decode("utf-8")
     parsed = parse_qs(raw, keep_blank_values=True)
     return {key: values if key in {"adult_location", "birthday_child_name", "birthday_child_age", "animation_type", "animation_at"} else values[-1] for key, values in parsed.items()}
+
+
+def wants_json(handler: BaseHTTPRequestHandler) -> bool:
+    accept = (handler.headers.get("Accept") or "").lower()
+    requested = (handler.headers.get("X-Requested-With") or "").lower()
+    return "application/json" in accept or requested == "ikids-assign"
 
 
 def csv_response() -> bytes:
@@ -15890,17 +16363,40 @@ class ReservationHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/assign-waiter":
+            as_json = wants_json(self)
+
+            def respond_waiter(message: str, *, ok: bool, reservation_id: int | None = None) -> None:
+                if not as_json:
+                    self.redirect(link_for(work_role if ok else page_role, day, message=message))
+                    return
+                html = ""
+                if ok and reservation_id is not None:
+                    updated = get_reservation(reservation_id)
+                    if updated is not None:
+                        html = render_waiter_assignment(updated, work_role, day)
+                payload = json.dumps(
+                    {"ok": ok, "message": message, "html": html},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_bytes(
+                    payload,
+                    status=HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST,
+                    content_type="application/json; charset=utf-8",
+                    extra_headers={"Cache-Control": "no-store"},
+                )
+
             if not can_assign_waiter(work_role):
-                self.redirect(link_for(page_role, day, message="Brak uprawnień do przypisania kelnera."))
+                respond_waiter("Brak uprawnień do przypisania kelnera.", ok=False)
                 return
             raw_id = data.get("id", "")
             if not raw_id.isdigit():
-                self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji."))
+                respond_waiter("Nie znaleziono rezerwacji.", ok=False)
                 return
-            waiter = data.get("waiter", "")
-            remove_waiter = data.get("remove_waiter", "")
+            reservation_id = int(raw_id)
+            waiter = str(data.get("waiter", "") or "")
+            remove_waiter = str(data.get("remove_waiter", "") or "")
             if assign_waiter(
-                int(raw_id),
+                reservation_id,
                 waiter or None,
                 work_role,
                 remove_waiter=remove_waiter or None,
@@ -15911,28 +16407,57 @@ class ReservationHandler(BaseHTTPRequestHandler):
                     message = "Kelner został przypisany."
                 else:
                     message = "Przypisanie kelnerów zostało usunięte."
-                self.redirect(link_for(work_role, day, message=message))
+                respond_waiter(message, ok=True, reservation_id=reservation_id)
             else:
-                self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować kelnera."))
+                respond_waiter("Nie udało się zaktualizować kelnera.", ok=False)
             return
 
         if parsed.path == "/assign-animator":
+            as_json = wants_json(self)
+
+            def respond_animator(
+                message: str,
+                *,
+                ok: bool,
+                reservation_id: int | None = None,
+                slot: str = "anim:0",
+            ) -> None:
+                if not as_json:
+                    self.redirect(link_for(work_role if ok else page_role, day, message=message))
+                    return
+                html = ""
+                if ok and reservation_id is not None:
+                    updated = get_reservation(reservation_id)
+                    if updated is not None:
+                        html = render_animator_assignment(updated, work_role, day, slot=slot)
+                payload = json.dumps(
+                    {"ok": ok, "message": message, "html": html},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_bytes(
+                    payload,
+                    status=HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST,
+                    content_type="application/json; charset=utf-8",
+                    extra_headers={"Cache-Control": "no-store"},
+                )
+
             if not can_assign_animator(work_role):
-                self.redirect(link_for(page_role, day, message="Brak uprawnień do przypisania animatora."))
+                respond_animator("Brak uprawnień do przypisania animatora.", ok=False)
                 return
             raw_id = data.get("id", "")
             if not raw_id.isdigit():
-                self.redirect(link_for(work_role, day, message="Nie znaleziono rezerwacji."))
+                respond_animator("Nie znaleziono rezerwacji.", ok=False)
                 return
-            animator = data.get("animator", "")
-            remove_animator = data.get("remove_animator", "")
-            slot = data.get("slot", "anim:0")
+            reservation_id = int(raw_id)
+            animator = str(data.get("animator", "") or "")
+            remove_animator = str(data.get("remove_animator", "") or "")
+            slot = str(data.get("slot", "anim:0") or "anim:0")
             if assign_animator(
-                int(raw_id),
+                reservation_id,
                 animator or None,
                 work_role,
                 remove_animator=remove_animator or None,
-                slot=slot or "anim:0",
+                slot=slot,
             ):
                 if remove_animator.strip():
                     message = "Przypisanie animatora zostało usunięte."
@@ -15940,9 +16465,9 @@ class ReservationHandler(BaseHTTPRequestHandler):
                     message = "Animator został przypisany."
                 else:
                     message = "Przypisanie animatorów zostało usunięte."
-                self.redirect(link_for(work_role, day, message=message))
+                respond_animator(message, ok=True, reservation_id=reservation_id, slot=slot)
             else:
-                self.redirect(link_for(work_role, day, message="Nie udało się zaktualizować animatora."))
+                respond_animator("Nie udało się zaktualizować animatora.", ok=False, slot=slot)
             return
 
         payload = json.dumps({"error": "Unsupported route"}, ensure_ascii=False).encode("utf-8")

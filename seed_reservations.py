@@ -138,6 +138,8 @@ def build_reservation(
         "children_count": str(random.randint(8, 18)),
         "adults_count": str(random.randint(4, 12)),
         "parent_name": parent_name,
+        "parent_phone": "500 100 200",
+        "created_by": random.choice(["Zuzanna Kmieciak", "Nikodem Boniecki", "Adam Tur"]),
         "birthday_child_name": child_name,
         "birthday_child_age": str(child_age),
         "child_location": room,
