@@ -78,7 +78,7 @@ def inventory_schema_sql(*, use_sqlite: bool) -> list[str]:
         f"""
         CREATE TABLE IF NOT EXISTS inventory_lines (
             id {line_id},
-            reservation_id BIGINT NOT NULL REFERENCES reservations(id) {refs},
+            reservation_id BIGINT REFERENCES reservations(id) {refs},
             item_id BIGINT REFERENCES inventory_items(id) {item_ref},
             category TEXT NOT NULL,
             name TEXT NOT NULL,
@@ -120,6 +120,74 @@ def inventory_schema_sql(*, use_sqlite: bool) -> list[str]:
     ]
 
 
+def migrate_inventory_schema(conn: Any, *, use_sqlite: bool) -> None:
+    """Allow manual shopping lines without a reservation (nullable reservation_id)."""
+    if use_sqlite:
+        try:
+            columns = list(conn.execute("PRAGMA table_info(inventory_lines)"))
+        except Exception:
+            return
+        if not columns:
+            return
+        reservation_col = next((col for col in columns if col["name"] == "reservation_id"), None)
+        if reservation_col is None or int(reservation_col["notnull"] or 0) == 0:
+            return
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            """
+            CREATE TABLE inventory_lines_migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reservation_id BIGINT REFERENCES reservations(id) ON DELETE CASCADE,
+                item_id BIGINT REFERENCES inventory_items(id) ON DELETE SET NULL,
+                category TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                qty INTEGER NOT NULL,
+                qty_reserved INTEGER NOT NULL DEFAULT 0,
+                qty_to_order INTEGER NOT NULL DEFAULT 0,
+                purchased INTEGER NOT NULL DEFAULT 0,
+                issued INTEGER NOT NULL DEFAULT 0,
+                cancelled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO inventory_lines_migrated (
+                id, reservation_id, item_id, category, name, description, qty,
+                qty_reserved, qty_to_order, purchased, issued, cancelled, created_at, updated_at
+            )
+            SELECT
+                id, reservation_id, item_id, category, name, description, qty,
+                qty_reserved, qty_to_order, purchased, issued, cancelled, created_at, updated_at
+            FROM inventory_lines
+            """
+        )
+        conn.execute("DROP TABLE inventory_lines")
+        conn.execute("ALTER TABLE inventory_lines_migrated RENAME TO inventory_lines")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_inventory_lines_reservation
+            ON inventory_lines(reservation_id, cancelled)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_inventory_lines_shopping
+            ON inventory_lines(cancelled, purchased, qty_to_order)
+            """
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
+        return
+
+    try:
+        conn.execute("ALTER TABLE inventory_lines ALTER COLUMN reservation_id DROP NOT NULL")
+    except Exception:
+        pass
+
+
 def normalize_ean(value: object) -> str:
     """Keep digits from barcode / EAN / UPC (8–14 typowo)."""
     digits = "".join(ch for ch in str(value or "") if ch.isdigit())
@@ -158,6 +226,264 @@ def list_inventory_items() -> list[DbRow]:
 
 def get_inventory_item(item_id: int) -> DbRow | None:
     return _one("SELECT * FROM inventory_items WHERE id = ?", (item_id,))
+
+
+def update_inventory_item(
+    item_id: int,
+    *,
+    category: str,
+    name: str,
+    description: str = "",
+    ean: str = "",
+    qty_available: int,
+    role: str = "",
+) -> bool:
+    item = get_inventory_item(item_id)
+    if item is None:
+        return False
+    category = normalize_category(category)
+    name = str(name or "").strip()
+    description = str(description or "").strip()[:300]
+    code = normalize_ean(ean)
+    if not category or not name or len(name) > 120:
+        return False
+    if qty_available < 0 or qty_available > 5000:
+        return False
+    if code:
+        other = find_inventory_item_by_ean(code)
+        if other is not None and int(other["id"]) != item_id:
+            return False
+    old_qty = int(item.get("qty_available") or 0)
+    _exec(
+        """
+        UPDATE inventory_items
+        SET category = ?, name = ?, description = ?, ean = ?, qty_available = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (category, name, description, code, qty_available, _ts(), item_id),
+    )
+    delta = qty_available - old_qty
+    if delta:
+        record_movement(
+            "manual_add" if delta > 0 else "manual_adjust",
+            item_id=item_id,
+            qty=abs(delta),
+            role=role,
+            note="Ręczna edycja stanu",
+        )
+    else:
+        record_movement(
+            "manual_edit",
+            item_id=item_id,
+            qty=0,
+            role=role,
+            note="Ręczna edycja pozycji katalogu",
+        )
+    return True
+
+
+def add_manual_shopping_item(
+    *,
+    category: str,
+    name: str,
+    description: str = "",
+    qty: int,
+    role: str = "",
+) -> int | None:
+    category = normalize_category(category)
+    name = str(name or "").strip()
+    description = str(description or "").strip()[:300]
+    if not category or not name or qty < 1 or qty > 500 or len(name) > 120:
+        return None
+    timestamp = _ts()
+    existing = find_inventory_item(category, name)
+    if existing:
+        item_id = int(existing["id"])
+    else:
+        item_id = _exec(
+            """
+            INSERT INTO inventory_items (category, name, description, ean, qty_available, created_at, updated_at)
+            VALUES (?, ?, ?, '', 0, ?, ?)
+            """,
+            (category, name, description, timestamp, timestamp),
+        )
+        record_movement(
+            "manual_add",
+            item_id=item_id,
+            qty=0,
+            role=role,
+            note="Pozycja z ręcznej listy zakupów",
+        )
+    line_id = _exec(
+        """
+        INSERT INTO inventory_lines (
+            reservation_id, item_id, category, name, description, qty,
+            qty_reserved, qty_to_order, purchased, issued, cancelled, created_at, updated_at
+        )
+        VALUES (NULL, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0, ?, ?)
+        """,
+        (item_id, category, name, description, qty, qty, timestamp, timestamp),
+    )
+    record_movement(
+        "manual_shopping",
+        item_id=item_id,
+        line_id=line_id,
+        qty=qty,
+        role=role,
+        note="Ręcznie dodano do listy zakupów",
+    )
+    return line_id
+
+
+def add_manual_issue_item(
+    *,
+    category: str,
+    name: str,
+    description: str = "",
+    qty: int,
+    role: str = "",
+) -> int | None:
+    category = normalize_category(category)
+    name = str(name or "").strip()
+    description = str(description or "").strip()[:300]
+    if not category or not name or qty < 1 or qty > 500 or len(name) > 120:
+        return None
+    timestamp = _ts()
+    existing = find_inventory_item(category, name)
+    if existing:
+        item_id = int(existing["id"])
+    else:
+        item_id = _exec(
+            """
+            INSERT INTO inventory_items (category, name, description, ean, qty_available, created_at, updated_at)
+            VALUES (?, ?, ?, '', 0, ?, ?)
+            """,
+            (category, name, description, timestamp, timestamp),
+        )
+        record_movement(
+            "manual_add",
+            item_id=item_id,
+            qty=0,
+            role=role,
+            note="Pozycja z ręcznej listy wydań",
+        )
+    line_id = _exec(
+        """
+        INSERT INTO inventory_lines (
+            reservation_id, item_id, category, name, description, qty,
+            qty_reserved, qty_to_order, purchased, issued, cancelled, created_at, updated_at
+        )
+        VALUES (NULL, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)
+        """,
+        (item_id, category, name, description, qty, timestamp, timestamp),
+    )
+    record_movement(
+        "manual_issue",
+        item_id=item_id,
+        line_id=line_id,
+        qty=qty,
+        role=role,
+        note="Ręcznie dodano do wydań",
+    )
+    return line_id
+
+
+def list_manual_issue_lines() -> list[DbRow]:
+    return _rows(
+        """
+        SELECT
+            l.*,
+            NULL AS reservation_start_at,
+            NULL AS birthday_child_name,
+            NULL AS parent_name,
+            NULL AS reservation_status
+        FROM inventory_lines l
+        WHERE l.cancelled = 0
+          AND l.reservation_id IS NULL
+          AND l.qty_to_order = 0
+        ORDER BY l.issued ASC, l.created_at DESC, l.id ASC
+        """
+    )
+
+
+def update_inventory_line(
+    line_id: int,
+    *,
+    category: str,
+    name: str,
+    description: str = "",
+    qty: int | None = None,
+    qty_to_order: int | None = None,
+    role: str = "",
+) -> bool:
+    line = get_line(line_id)
+    if line is None or int(line.get("cancelled") or 0):
+        return False
+    category = normalize_category(category)
+    name = str(name or "").strip()
+    description = str(description or "").strip()[:300]
+    if not category or not name or len(name) > 120:
+        return False
+    next_qty = int(line.get("qty") or 0) if qty is None else int(qty)
+    next_to_order = int(line.get("qty_to_order") or 0) if qty_to_order is None else int(qty_to_order)
+    if next_qty < 1 or next_qty > 500:
+        return False
+    if next_to_order < 0 or next_to_order > 500:
+        return False
+    if line.get("reservation_id") is None:
+        # Ręczna pozycja zakupów — qty i qty_to_order trzymamy zsynchronizowane.
+        if qty_to_order is not None:
+            next_qty = next_to_order
+        elif qty is not None:
+            next_to_order = next_qty
+        if next_to_order < 1:
+            return False
+    _exec(
+        """
+        UPDATE inventory_lines
+        SET category = ?, name = ?, description = ?, qty = ?, qty_to_order = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (category, name, description, next_qty, next_to_order, _ts(), line_id),
+    )
+    record_movement(
+        "manual_edit",
+        item_id=int(line["item_id"]) if line.get("item_id") else None,
+        line_id=line_id,
+        qty=next_qty,
+        role=role,
+        note="Ręczna edycja pozycji inwentury",
+    )
+    return True
+
+
+def delete_manual_line(line_id: int, *, role: str = "") -> bool:
+    line = get_line(line_id)
+    if line is None or line.get("reservation_id") is not None:
+        return False
+    if int(line.get("cancelled") or 0):
+        return False
+    _exec(
+        """
+        UPDATE inventory_lines
+        SET cancelled = 1, qty_to_order = 0, updated_at = ?
+        WHERE id = ?
+        """,
+        (_ts(), line_id),
+    )
+    record_movement(
+        "manual_remove",
+        item_id=int(line["item_id"]) if line.get("item_id") else None,
+        line_id=line_id,
+        qty=int(line.get("qty_to_order") or line.get("qty") or 0),
+        role=role,
+        note="Usunięto ręczną pozycję inwentury",
+    )
+    return True
+
+
+def delete_manual_shopping_line(line_id: int, *, role: str = "") -> bool:
+    return delete_manual_line(line_id, role=role)
 
 
 def find_inventory_item(category: str, name: str) -> DbRow | None:
@@ -327,9 +653,10 @@ def list_shopping_lines() -> list[DbRow]:
         """
         SELECT l.*, r.start_at AS reservation_start_at, r.birthday_child_name, r.parent_name, r.status AS reservation_status
         FROM inventory_lines l
-        JOIN reservations r ON r.id = l.reservation_id
-        WHERE l.cancelled = 0 AND l.qty_to_order > 0 AND r.status = 'active'
-        ORDER BY l.purchased ASC, r.start_at ASC, l.id ASC
+        LEFT JOIN reservations r ON r.id = l.reservation_id
+        WHERE l.cancelled = 0 AND l.qty_to_order > 0
+          AND (l.reservation_id IS NULL OR r.status = 'active')
+        ORDER BY l.purchased ASC, COALESCE(r.start_at, l.created_at) ASC, l.id ASC
         """
     )
 

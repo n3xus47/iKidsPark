@@ -330,6 +330,7 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
             ON inventory_items(ean) WHERE ean != ''
             """
         )
+    inventory.migrate_inventory_schema(conn, use_sqlite=USE_LOCAL_SQLITE)
 
 def migrate_location_names(conn: psycopg.Connection | sqlite3.Connection) -> None:
     for old_name, new_name in LEGACY_CHILD_LOCATION_RENAMES.items():
@@ -6123,6 +6124,146 @@ def page_template(
       min-width: 0;
     }}
 
+    .inventory-section-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+    }}
+
+    .inventory-section-actions .count {{
+      margin: 0;
+    }}
+
+    .inventory-empty-actions {{
+      display: grid;
+      gap: 12px;
+      justify-items: center;
+      padding: 8px 0 4px;
+    }}
+
+    .inventory-empty-actions .inventory-empty {{
+      margin: 0;
+      width: 100%;
+    }}
+
+    .inventory-add-block.is-collapsed:not([open]) > *:not(summary) {{
+      display: none;
+    }}
+
+    .inventory-add-block > summary {{
+      cursor: pointer;
+      list-style: none;
+      font-weight: 900;
+      font-size: 0.76rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+    }}
+
+    .inventory-add-block > summary::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .inventory-filters {{
+      display: grid;
+      gap: 10px;
+      padding: 12px 14px 14px;
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+    }}
+
+    .inventory-filters__search {{
+      width: 100%;
+      min-height: 44px;
+      margin: 0;
+    }}
+
+    .inventory-filter-chips {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+
+    .inventory-filter-chips button {{
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      min-height: 36px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-weight: 800;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }}
+
+    .inventory-filter-chips button.is-active {{
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #fff;
+    }}
+
+    .inventory-card[hidden],
+    .inventory-empty[hidden] {{
+      display: none !important;
+    }}
+
+    .inventory-edit {{
+      margin-top: 8px;
+      border-top: 1px dashed var(--line);
+      padding-top: 8px;
+    }}
+
+    .inventory-edit > summary {{
+      cursor: pointer;
+      font-weight: 800;
+      font-size: 0.86rem;
+      color: var(--brand);
+      list-style: none;
+      min-height: 36px;
+      display: inline-flex;
+      align-items: center;
+    }}
+
+    .inventory-edit > summary::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .inventory-edit-form {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }}
+
+    .inventory-edit-form .full {{
+      grid-column: 1 / -1;
+    }}
+
+    .inventory-edit-form label {{
+      display: grid;
+      gap: 4px;
+      font-size: 0.78rem;
+      font-weight: 800;
+      color: var(--muted);
+    }}
+
+    .inventory-edit-form input,
+    .inventory-edit-form select {{
+      min-height: 40px;
+    }}
+
+    .inventory-edit-form .inventory-edit-actions {{
+      grid-column: 1 / -1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+
     .inventory-add-block {{
       display: grid;
       gap: 10px;
@@ -7961,6 +8102,15 @@ def page_template(
         width: 100%;
       }}
 
+      .inventory-section-actions {{
+        width: 100%;
+        justify-content: stretch;
+      }}
+
+      .inventory-section-actions .button {{
+        flex: 1 1 auto;
+      }}
+
       .inventory-board[id] {{
         scroll-margin-top: 12px;
       }}
@@ -8007,6 +8157,10 @@ def page_template(
         display: grid;
         grid-template-columns: 1fr;
         gap: 8px;
+      }}
+
+      .inventory-edit-form {{
+        grid-template-columns: 1fr;
       }}
 
       .hub-choice__btn {{
@@ -10531,15 +10685,15 @@ def render_inventory_line_row(line: dict[str, object] | None = None) -> str:
   </label>
   <label>
     Nazwa
-    <input type="text" name="inventory_name" class="inventory-name" maxlength="120" value="{escape(name)}" placeholder="np. Piniata Jednorożec">
+    <input type="text" name="inventory_name" class="inventory-name" maxlength="120" value="{escape(name)}" placeholder="np. Piniata Jednorożec" enterkeyhint="next">
   </label>
   <label>
     Ilość
-    <input type="number" name="inventory_qty" class="inventory-qty" min="1" max="500" value="{escape(qty)}" placeholder="1">
+    <input type="number" name="inventory_qty" class="inventory-qty" min="1" max="500" value="{escape(qty)}" placeholder="1" inputmode="numeric" enterkeyhint="next">
   </label>
   <label class="full">
     Opis
-    <input type="text" name="inventory_description" class="inventory-description" maxlength="300" value="{escape(description)}" placeholder="Jak ma wyglądać zestaw / motyw">
+    <input type="text" name="inventory_description" class="inventory-description" maxlength="300" value="{escape(description)}" placeholder="Jak ma wyglądać zestaw / motyw" enterkeyhint="done">
   </label>
   <button type="button" class="button secondary remove-inventory-line" aria-label="Usuń pozycję">Usuń</button>
 </div>
@@ -15539,63 +15693,131 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
     # Merge upcoming + due unique by line id, prefer due list for status display.
     seen: set[int] = set()
     issue_rows: list[DbRow] = []
-    for row in due + issues:
+    for row in due + issues + inventory.list_manual_issue_lines():
         line_id = int(row["id"])
         if line_id in seen:
             continue
         seen.add(line_id)
         issue_rows.append(row)
 
+    category_chips = ['<button type="button" class="is-active" data-inventory-category="">Wszystkie</button>']
+    for key in INVENTORY_CATEGORIES:
+        label = INVENTORY_CATEGORY_LABELS.get(key, key)
+        category_chips.append(
+            f'<button type="button" data-inventory-category="{escape(key)}">{escape(label)}</button>'
+        )
+    filters_markup = f"""
+<div class="inventory-filters" data-inventory-filters>
+  <input type="search" class="inventory-filters__search" placeholder="Szukaj po nazwie, opisie, EAN…" autocomplete="off" data-inventory-search aria-label="Szukaj w inwenturze">
+  <div class="inventory-filter-chips" role="group" aria-label="Kategorie inwentury">
+    {"".join(category_chips)}
+  </div>
+</div>
+"""
+
     item_cards = []
     for item in items:
-        category = INVENTORY_CATEGORY_LABELS.get(str(item.get("category")), item.get("category"))
+        item_id = int(item["id"])
+        category_key = str(item.get("category") or "")
+        category = INVENTORY_CATEGORY_LABELS.get(category_key, category_key)
         description = str(item.get("description") or "").strip()
         ean = str(item.get("ean") or "").strip()
+        name = str(item.get("name") or "")
+        qty = int(item.get("qty_available") or 0)
         desc_html = f'<p class="inventory-card__meta">{escape(description)}</p>' if description else ""
         ean_html = f'<p class="inventory-card__ean">EAN {escape(ean)}</p>' if ean else ""
+        search_blob = " ".join(part for part in [category, name, description, ean] if part).lower()
         item_cards.append(
             f"""
-<article class="inventory-card">
+<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-search="{escape(search_blob)}">
   <div class="inventory-card__head">
     <span class="inventory-card__kicker">{escape(category)}</span>
-    <span class="inventory-card__qty" title="Wolne sztuki">{escape(item.get("qty_available", 0))}</span>
+    <span class="inventory-card__qty" title="Wolne sztuki">{escape(qty)}</span>
   </div>
-  <h3 class="inventory-card__title">{escape(item.get("name"))}</h3>
+  <h3 class="inventory-card__title">{escape(name)}</h3>
   {desc_html}
   {ean_html}
+  <details class="inventory-edit">
+    <summary>Edytuj pozycję</summary>
+    <form class="inventory-edit-form" method="post" action="/inventory/item/update?day={escape(day_q)}">
+      <input type="hidden" name="item_id" value="{item_id}">
+      <label>
+        Kategoria
+        <select name="category" required>{render_inventory_category_options(category_key)}</select>
+      </label>
+      <label>
+        Stan
+        <input type="number" name="qty_available" min="0" max="5000" value="{escape(qty)}" required inputmode="numeric">
+      </label>
+      <label class="full">
+        Nazwa
+        <input type="text" name="name" maxlength="120" value="{escape(name)}" required autocomplete="off">
+      </label>
+      <label class="full">
+        Kod EAN
+        <input type="text" name="ean" maxlength="32" value="{escape(ean)}" inputmode="numeric" pattern="[0-9]*" autocomplete="off">
+      </label>
+      <label class="full">
+        Opis
+        <input type="text" name="description" maxlength="300" value="{escape(description)}" autocomplete="off">
+      </label>
+      <div class="inventory-edit-actions">
+        <button type="submit">Zapisz zmiany</button>
+      </div>
+    </form>
+  </details>
 </article>
 """
         )
     items_markup = (
-        f'<div class="inventory-list">{"".join(item_cards)}</div>'
+        f'<div class="inventory-list" data-inventory-list>{"".join(item_cards)}</div>'
         if item_cards
-        else '<p class="inventory-empty">Brak pozycji w katalogu. Dodaj stan poniżej.</p>'
+        else '<p class="inventory-empty" data-inventory-empty>Brak pozycji w katalogu. Dodaj stan poniżej.</p>'
     )
 
     shop_cards = []
     for line in shopping:
-        start = format_date(line.get("reservation_start_at"))
-        child = line.get("birthday_child_name") or "—"
-        reservation_id = int(line["reservation_id"])
+        start = format_date(line.get("reservation_start_at")) if line.get("reservation_start_at") else ""
+        child = line.get("birthday_child_name") or ""
+        reservation_id = line.get("reservation_id")
+        is_manual = reservation_id is None
         line_id = int(line["id"])
         purchased = int(line.get("purchased") or 0)
         action_value = "0" if purchased else "1"
         action_label = "Cofnij zakup" if purchased else "Zakupiono"
         status_class = "is-bought" if purchased else "is-todo"
         status_label = "Zakupione" if purchased else "Do zamówienia"
-        category = INVENTORY_CATEGORY_LABELS.get(str(line.get("category")), line.get("category"))
+        category_key = str(line.get("category") or "")
+        category = INVENTORY_CATEGORY_LABELS.get(category_key, category_key)
         description = str(line.get("description") or "").strip()
-        meta_bits = [str(category), f"× {line.get('qty_to_order')}"]
+        name = str(line.get("name") or "")
+        qty_to_order = int(line.get("qty_to_order") or 0)
+        kicker = "Ręczne" if is_manual else f"{start} · {child or '—'}"
+        meta_bits = [str(category), f"× {qty_to_order}"]
         if description:
             meta_bits.append(description)
+        banquet_link = ""
+        if not is_manual and reservation_id is not None:
+            banquet_link = (
+                f'<a class="button secondary" href="{escape(link_for("organizer", day, edit=int(reservation_id)))}">Bankiet</a>'
+            )
+        remove_form = ""
+        if is_manual:
+            remove_form = f"""
+    <form method="post" action="/inventory/shopping/delete?day={escape(day_q)}">
+      <input type="hidden" name="line_id" value="{line_id}">
+      <button type="submit" class="button secondary">Usuń</button>
+    </form>
+"""
+        search_blob = " ".join(part for part in [category, name, description, kicker, "zakupy"] if part).lower()
         shop_cards.append(
             f"""
-<article class="inventory-card">
+<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-search="{escape(search_blob)}">
   <div class="inventory-card__head">
-    <span class="inventory-card__kicker">{escape(start)} · {escape(child)}</span>
+    <span class="inventory-card__kicker">{escape(kicker)}</span>
     <span class="inventory-status {status_class}">{status_label}</span>
   </div>
-  <h3 class="inventory-card__title">{escape(line.get("name"))}</h3>
+  <h3 class="inventory-card__title">{escape(name)}</h3>
   <p class="inventory-card__meta">{escape(" · ".join(meta_bits))}</p>
   <div class="inventory-actions">
     <form method="post" action="/inventory/purchase?day={escape(day_q)}">
@@ -15603,43 +15825,89 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
       <input type="hidden" name="purchased" value="{action_value}">
       <button type="submit" class="{'button secondary' if purchased else ''}">{action_label}</button>
     </form>
-    <a class="button secondary" href="{escape(link_for('organizer', day, edit=reservation_id))}">Bankiet</a>
+    {banquet_link}
+    {remove_form}
   </div>
+  <details class="inventory-edit">
+    <summary>Edytuj pozycję</summary>
+    <form class="inventory-edit-form" method="post" action="/inventory/line/update?day={escape(day_q)}">
+      <input type="hidden" name="line_id" value="{line_id}">
+      <input type="hidden" name="source" value="shopping">
+      <label>
+        Kategoria
+        <select name="category" required>{render_inventory_category_options(category_key)}</select>
+      </label>
+      <label>
+        Ilość
+        <input type="number" name="qty_to_order" min="1" max="500" value="{escape(qty_to_order)}" required inputmode="numeric">
+      </label>
+      <label class="full">
+        Nazwa
+        <input type="text" name="name" maxlength="120" value="{escape(name)}" required autocomplete="off">
+      </label>
+      <label class="full">
+        Opis
+        <input type="text" name="description" maxlength="300" value="{escape(description)}" autocomplete="off">
+      </label>
+      <div class="inventory-edit-actions">
+        <button type="submit">Zapisz zmiany</button>
+      </div>
+    </form>
+  </details>
 </article>
 """
         )
     shopping_markup = (
-        f'<div class="inventory-list">{"".join(shop_cards)}</div>'
+        f'<div class="inventory-list" data-inventory-list>{"".join(shop_cards)}</div>'
         if shop_cards
-        else '<p class="inventory-empty">Lista zakupów jest pusta.</p>'
+        else '<p class="inventory-empty" data-inventory-empty>Lista zakupów jest pusta.</p>'
     )
 
     issue_cards = []
     for line in issue_rows:
-        start = format_date(line.get("reservation_start_at"))
-        child = line.get("birthday_child_name") or "—"
-        reservation_id = int(line["reservation_id"])
+        start = format_date(line.get("reservation_start_at")) if line.get("reservation_start_at") else ""
+        child = line.get("birthday_child_name") or ""
+        reservation_id = line.get("reservation_id")
+        is_manual = reservation_id is None
         line_id = int(line["id"])
         issued = int(line.get("issued") or 0)
         status_class = "is-issued" if issued else "is-open"
         status_label = "Wydano" if issued else "Do wydania"
         action_value = "0" if issued else "1"
         action_label = "Cofnij wydanie" if issued else "Wydaj"
-        category = INVENTORY_CATEGORY_LABELS.get(str(line.get("category")), line.get("category"))
+        category_key = str(line.get("category") or "")
+        category = INVENTORY_CATEGORY_LABELS.get(category_key, category_key)
         description = str(line.get("description") or "").strip()
-        meta_bits = [str(category), f"× {line.get('qty')}"]
+        name = str(line.get("name") or "")
+        qty = int(line.get("qty") or 0)
+        kicker = "Ręczne" if is_manual else f"{start} · {child or '—'}"
+        meta_bits = [str(category), f"× {qty}"]
         if description:
             meta_bits.append(description)
         if int(line.get("qty_to_order") or 0) > 0:
             meta_bits.append("zakupione" if int(line.get("purchased") or 0) else "czekamy na zakup")
+        banquet_link = ""
+        if not is_manual and reservation_id is not None:
+            banquet_link = (
+                f'<a class="button secondary" href="{escape(link_for("organizer", day, edit=int(reservation_id)))}">Bankiet</a>'
+            )
+        remove_form = ""
+        if is_manual:
+            remove_form = f"""
+    <form method="post" action="/inventory/shopping/delete?day={escape(day_q)}">
+      <input type="hidden" name="line_id" value="{line_id}">
+      <button type="submit" class="button secondary">Usuń</button>
+    </form>
+"""
+        search_blob = " ".join(part for part in [category, name, description, kicker, "wydania"] if part).lower()
         issue_cards.append(
             f"""
-<article class="inventory-card">
+<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-search="{escape(search_blob)}">
   <div class="inventory-card__head">
-    <span class="inventory-card__kicker">{escape(start)} · {escape(child)}</span>
+    <span class="inventory-card__kicker">{escape(kicker)}</span>
     <span class="inventory-status {status_class}">{status_label}</span>
   </div>
-  <h3 class="inventory-card__title">{escape(line.get("name"))}</h3>
+  <h3 class="inventory-card__title">{escape(name)}</h3>
   <p class="inventory-card__meta">{escape(" · ".join(meta_bits))}</p>
   <div class="inventory-actions">
     <form method="post" action="/inventory/issue?day={escape(day_q)}">
@@ -15647,15 +15915,42 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
       <input type="hidden" name="issued" value="{action_value}">
       <button type="submit" class="{'button secondary' if issued else ''}">{action_label}</button>
     </form>
-    <a class="button secondary" href="{escape(link_for('organizer', day, edit=reservation_id))}">Bankiet</a>
+    {banquet_link}
+    {remove_form}
   </div>
+  <details class="inventory-edit">
+    <summary>Edytuj pozycję</summary>
+    <form class="inventory-edit-form" method="post" action="/inventory/line/update?day={escape(day_q)}">
+      <input type="hidden" name="line_id" value="{line_id}">
+      <input type="hidden" name="source" value="issue">
+      <label>
+        Kategoria
+        <select name="category" required>{render_inventory_category_options(category_key)}</select>
+      </label>
+      <label>
+        Ilość
+        <input type="number" name="qty" min="1" max="500" value="{escape(qty)}" required inputmode="numeric">
+      </label>
+      <label class="full">
+        Nazwa
+        <input type="text" name="name" maxlength="120" value="{escape(name)}" required autocomplete="off">
+      </label>
+      <label class="full">
+        Opis
+        <input type="text" name="description" maxlength="300" value="{escape(description)}" autocomplete="off">
+      </label>
+      <div class="inventory-edit-actions">
+        <button type="submit">Zapisz zmiany</button>
+      </div>
+    </form>
+  </details>
 </article>
 """
         )
     issues_markup = (
-        f'<div class="inventory-list">{"".join(issue_cards)}</div>'
+        f'<div class="inventory-list" data-inventory-list>{"".join(issue_cards)}</div>'
         if issue_cards
-        else '<p class="inventory-empty">Brak wydań w najbliższych dniach.</p>'
+        else '<p class="inventory-empty" data-inventory-empty>Brak wydań w najbliższych dniach.</p>'
     )
 
     items_count = len(items)
@@ -15664,6 +15959,56 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
     items_count_label = f"{items_count} pozycji" if items_count != 1 else "1 pozycja"
     shopping_count_label = f"{shopping_count} pozycji" if shopping_count != 1 else "1 pozycja"
     issues_count_label = f"{issues_count} pozycji" if issues_count != 1 else "1 pozycja"
+
+    shopping_add_form = f"""
+<details class="inventory-add-block" id="inventory-shopping-add" open>
+  <summary>Dodaj ręcznie do listy zakupów</summary>
+  <form class="inventory-add-form" method="post" action="/inventory/shopping/add?day={escape(day_q)}">
+    <label>
+      Kategoria
+      <select name="category" required>{render_inventory_category_options()}</select>
+    </label>
+    <label>
+      Nazwa
+      <input type="text" name="name" maxlength="120" required placeholder="np. Balony pastelowe" autocomplete="off">
+    </label>
+    <label>
+      Ilość
+      <input type="number" name="qty" min="1" max="500" value="1" required inputmode="numeric">
+    </label>
+    <label class="full">
+      Opis
+      <input type="text" name="description" maxlength="300" placeholder="Opcjonalny opis" autocomplete="off">
+    </label>
+    <button type="submit" class="inventory-add-submit">Dodaj do zakupów</button>
+  </form>
+</details>
+"""
+
+    issues_add_form = f"""
+<details class="inventory-add-block" id="inventory-issues-add" open>
+  <summary>Dodaj ręcznie do wydań</summary>
+  <form class="inventory-add-form" method="post" action="/inventory/issue/add?day={escape(day_q)}">
+    <label>
+      Kategoria
+      <select name="category" required>{render_inventory_category_options()}</select>
+    </label>
+    <label>
+      Nazwa
+      <input type="text" name="name" maxlength="120" required placeholder="np. Piniata na dziś" autocomplete="off">
+    </label>
+    <label>
+      Ilość
+      <input type="number" name="qty" min="1" max="500" value="1" required inputmode="numeric">
+    </label>
+    <label class="full">
+      Opis
+      <input type="text" name="description" maxlength="300" placeholder="Opcjonalny opis" autocomplete="off">
+    </label>
+    <button type="submit" class="inventory-add-submit">Dodaj do wydań</button>
+  </form>
+</details>
+"""
 
     add_form = f"""
 <div class="inventory-add-block" id="inventory-add">
@@ -15751,13 +16096,14 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
       <a href="#inventory-shopping">Zakupy{f' ({shopping_count})' if shopping_count else ''}</a>
       <a href="#inventory-issues">Wydania{f' ({issues_count})' if issues_count else ''}</a>
     </nav>
+    {filters_markup}
   </section>
 
   <section class="role-board inventory-board" id="inventory-stock">
     <div class="section-head">
       <div>
         <h2>Stan magazynu</h2>
-        <p class="subtitle">Wolne sztuki dostępne do rezerwacji na bankiety. Skanuj EAN telefonem, by dodać stan.</p>
+        <p class="subtitle">Wolne sztuki dostępne do rezerwacji na bankiety. Edytuj pozycje ręcznie lub skanuj EAN.</p>
       </div>
       <span class="count">{escape(items_count_label)}</span>
     </div>
@@ -15771,12 +16117,13 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
     <div class="section-head">
       <div>
         <h2>Lista zakupów</h2>
-        <p class="subtitle">Pozycje brakujące w stanie — oznacz ręcznie jako zakupione.</p>
+        <p class="subtitle">Pozycje brakujące w stanie oraz ręczne zakupy — oznacz jako zakupione.</p>
       </div>
       <span class="count">{escape(shopping_count_label)}</span>
     </div>
     <div class="inventory-body">
       {shopping_markup}
+      {shopping_add_form}
     </div>
   </section>
 
@@ -15784,16 +16131,18 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
     <div class="section-head">
       <div>
         <h2>Wydania</h2>
-        <p class="subtitle">W dniu bankietu pozycje oznaczają się automatycznie jako wydane. Możesz cofnąć status ręcznie.</p>
+        <p class="subtitle">W dniu bankietu pozycje oznaczają się automatycznie jako wydane. Możesz dodać i edytować ręcznie.</p>
       </div>
       <span class="count">{escape(issues_count_label)}</span>
     </div>
     <div class="inventory-body">
       {issues_markup}
+      {issues_add_form}
     </div>
   </section>
 </div>
 {inventory_scan_script()}
+{inventory_filters_script()}
 """
     return page_template(
         content,
@@ -16040,6 +16389,57 @@ def inventory_scan_script() -> str:
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopScanner();
   });
+})();
+</script>
+"""
+
+
+def inventory_filters_script() -> str:
+    return """
+<script>
+(() => {
+  const root = document.querySelector("[data-inventory-filters]");
+  if (!root) return;
+  const searchInput = root.querySelector("[data-inventory-search]");
+  const chips = Array.from(root.querySelectorAll("[data-inventory-category]"));
+  const cards = Array.from(document.querySelectorAll("[data-inventory-card]"));
+  let activeCategory = "";
+
+  function applyFilters() {
+    const query = String(searchInput?.value || "").trim().toLowerCase();
+    cards.forEach((card) => {
+      const category = card.getAttribute("data-category") || "";
+      const haystack = card.getAttribute("data-search") || "";
+      const categoryOk = !activeCategory || category === activeCategory;
+      const searchOk = !query || haystack.includes(query);
+      card.hidden = !(categoryOk && searchOk);
+    });
+    document.querySelectorAll("[data-inventory-list]").forEach((list) => {
+      const visible = list.querySelectorAll("[data-inventory-card]:not([hidden])").length;
+      let empty = list.parentElement?.querySelector("[data-inventory-filter-empty]");
+      if (visible === 0) {
+        if (!empty) {
+          empty = document.createElement("p");
+          empty.className = "inventory-empty";
+          empty.setAttribute("data-inventory-filter-empty", "");
+          empty.textContent = "Brak pozycji dla wybranego filtra.";
+          list.insertAdjacentElement("afterend", empty);
+        }
+        empty.hidden = false;
+      } else if (empty) {
+        empty.hidden = true;
+      }
+    });
+  }
+
+  chips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      activeCategory = chip.getAttribute("data-inventory-category") || "";
+      chips.forEach((other) => other.classList.toggle("is-active", other === chip));
+      applyFilters();
+    });
+  });
+  searchInput?.addEventListener("input", applyFilters);
 })();
 </script>
 """
@@ -16940,15 +17340,15 @@ def room_plan_script() -> str:
         </label>
         <label>
           Nazwa
-          <input type="text" name="inventory_name" class="inventory-name" maxlength="120" placeholder="np. Piniata Jednorożec">
+          <input type="text" name="inventory_name" class="inventory-name" maxlength="120" placeholder="np. Piniata Jednorożec" enterkeyhint="next">
         </label>
         <label>
           Ilość
-          <input type="number" name="inventory_qty" class="inventory-qty" min="1" max="500" value="1" placeholder="1">
+          <input type="number" name="inventory_qty" class="inventory-qty" min="1" max="500" value="1" placeholder="1" inputmode="numeric" enterkeyhint="next">
         </label>
         <label class="full">
           Opis
-          <input type="text" name="inventory_description" class="inventory-description" maxlength="300" placeholder="Jak ma wyglądać zestaw / motyw">
+          <input type="text" name="inventory_description" class="inventory-description" maxlength="300" placeholder="Jak ma wyglądać zestaw / motyw" enterkeyhint="done">
         </label>
         <button type="button" class="button secondary remove-inventory-line" aria-label="Usuń pozycję">Usuń</button>
       `;
@@ -17062,9 +17462,36 @@ def room_plan_script() -> str:
   bindLocationRanges();
 
   form.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && event.target.tagName !== "TEXTAREA") {
-      event.preventDefault();
+    if (event.key !== "Enter" && event.keyCode !== 13) return;
+    if (event.target.tagName === "TEXTAREA") return;
+    event.preventDefault();
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const inventoryBlock = target.closest(".inventory-lines-block");
+    if (!inventoryBlock || !target.matches("input, select")) return;
+    // Visual reading order: left → right within a row, then down to the next row.
+    const rowTolerance = 16;
+    const fields = Array.from(
+      inventoryBlock.querySelectorAll("input:not([type='hidden']), select")
+    )
+      .filter((el) => !el.disabled && el.offsetParent !== null)
+      .sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        if (Math.abs(ra.top - rb.top) > rowTolerance) return ra.top - rb.top;
+        return ra.left - rb.left;
+      });
+    const index = fields.indexOf(target);
+    if (index === -1) return;
+    if (index < fields.length - 1) {
+      const next = fields[index + 1];
+      next.focus();
+      if (next.matches("input") && typeof next.select === "function") {
+        try { next.select(); } catch (_) {}
+      }
+      return;
     }
+    addInventoryBtn?.focus();
   });
 
   form.addEventListener("submit", (event) => {
@@ -17924,6 +18351,140 @@ class ReservationHandler(BaseHTTPRequestHandler):
                 message = "Produkt zapisany z kodem EAN. Stan zaktualizowany."
             self.redirect(
                 "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message})
+            )
+            return
+
+        if parsed.path == "/inventory/item/update":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            raw_id = str(data.get("item_id", "") or "")
+            try:
+                qty_available = int(str(data.get("qty_available", "0") or "0"))
+            except ValueError:
+                qty_available = -1
+            ok = raw_id.isdigit() and inventory.update_inventory_item(
+                int(raw_id),
+                category=str(data.get("category", "") or ""),
+                name=str(data.get("name", "") or ""),
+                description=str(data.get("description", "") or ""),
+                ean=str(data.get("ean", "") or ""),
+                qty_available=qty_available,
+                role=work_role,
+            )
+            message = "Zapisano zmiany pozycji." if ok else "Nie udało się zapisać pozycji."
+            self.redirect("/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message}))
+            return
+
+        if parsed.path == "/inventory/shopping/add":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            try:
+                qty = int(str(data.get("qty", "0") or "0"))
+            except ValueError:
+                qty = 0
+            line_id = inventory.add_manual_shopping_item(
+                category=str(data.get("category", "") or ""),
+                name=str(data.get("name", "") or ""),
+                description=str(data.get("description", "") or ""),
+                qty=qty,
+                role=work_role,
+            )
+            message = "Dodano pozycję do listy zakupów." if line_id else "Nie udało się dodać do listy zakupów."
+            self.redirect(
+                "/inwentura?"
+                + urlencode({"day": day_query(selected_day(day)), "message": message})
+                + "#inventory-shopping"
+            )
+            return
+
+        if parsed.path == "/inventory/issue/add":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            try:
+                qty = int(str(data.get("qty", "0") or "0"))
+            except ValueError:
+                qty = 0
+            line_id = inventory.add_manual_issue_item(
+                category=str(data.get("category", "") or ""),
+                name=str(data.get("name", "") or ""),
+                description=str(data.get("description", "") or ""),
+                qty=qty,
+                role=work_role,
+            )
+            message = "Dodano pozycję do wydań." if line_id else "Nie udało się dodać do wydań."
+            self.redirect(
+                "/inwentura?"
+                + urlencode({"day": day_query(selected_day(day)), "message": message})
+                + "#inventory-issues"
+            )
+            return
+
+        if parsed.path == "/inventory/shopping/delete":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            raw_id = str(data.get("line_id", "") or "")
+            existing = inventory.get_line(int(raw_id)) if raw_id.isdigit() else None
+            was_shopping = bool(existing and int(existing.get("qty_to_order") or 0) > 0)
+            ok = raw_id.isdigit() and inventory.delete_manual_line(int(raw_id), role=work_role)
+            message = "Usunięto ręczną pozycję." if ok else "Nie udało się usunąć pozycji."
+            anchor = "#inventory-shopping" if was_shopping else "#inventory-issues"
+            self.redirect(
+                "/inwentura?"
+                + urlencode({"day": day_query(selected_day(day)), "message": message})
+                + anchor
+            )
+            return
+
+        if parsed.path == "/inventory/line/update":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            raw_id = str(data.get("line_id", "") or "")
+            source = str(data.get("source", "") or "")
+            qty = None
+            qty_to_order = None
+            try:
+                if "qty" in data and str(data.get("qty") or "").strip() != "":
+                    qty = int(str(data.get("qty") or "0"))
+            except ValueError:
+                qty = None
+            try:
+                if "qty_to_order" in data and str(data.get("qty_to_order") or "").strip() != "":
+                    qty_to_order = int(str(data.get("qty_to_order") or "0"))
+            except ValueError:
+                qty_to_order = None
+            ok = raw_id.isdigit() and inventory.update_inventory_line(
+                int(raw_id),
+                category=str(data.get("category", "") or ""),
+                name=str(data.get("name", "") or ""),
+                description=str(data.get("description", "") or ""),
+                qty=qty,
+                qty_to_order=qty_to_order,
+                role=work_role,
+            )
+            message = "Zapisano zmiany pozycji." if ok else "Nie udało się zapisać pozycji."
+            anchor = "#inventory-shopping" if source == "shopping" else "#inventory-issues"
+            self.redirect(
+                "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message}) + anchor
             )
             return
 

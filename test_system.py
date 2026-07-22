@@ -891,8 +891,64 @@ def test_inventory_flow() -> None:
             ok("GET /inwentura", "sekcje widoczne")
         else:
             fail("GET /inwentura", f"status={status}")
+        if status == 200 and 'data-inventory-filters' in html and "Edytuj pozycję" in html:
+            ok("GET /inwentura — filtry i edycja")
+        elif status == 200:
+            fail("GET /inwentura — filtry i edycja", "brak filtrów/edycji w HTML")
     except Exception as exc:
         fail("GET /inwentura", str(exc))
+
+    if inv.update_inventory_item(
+        item_id,
+        category="balloons",
+        name="Balony Testowe Inwentura",
+        description="zaktualizowany opis",
+        qty_available=4,
+        role="manager",
+    ):
+        updated = inv.get_inventory_item(item_id)
+        if updated and int(updated["qty_available"]) == 4 and "zaktualizowany" in str(updated.get("description")):
+            ok("Ręczna edycja pozycji stanu")
+        else:
+            fail("Ręczna edycja pozycji stanu", str(updated))
+    else:
+        fail("Ręczna edycja pozycji stanu")
+
+    manual_line = inv.add_manual_shopping_item(
+        category="pinata",
+        name="Piniata Ręczna Test",
+        description="lista zakupów",
+        qty=3,
+        role="manager",
+    )
+    if manual_line:
+        shop = inv.list_shopping_lines()
+        found = next((row for row in shop if int(row["id"]) == int(manual_line)), None)
+        if found and found.get("reservation_id") is None and int(found.get("qty_to_order") or 0) == 3:
+            ok("Ręczne dodanie do listy zakupów")
+        else:
+            fail("Ręczne dodanie do listy zakupów", str(found))
+        if inv.update_inventory_line(
+            int(manual_line),
+            category="pinata",
+            name="Piniata Ręczna Test",
+            description="edytowane",
+            qty_to_order=5,
+            role="manager",
+        ):
+            edited = inv.get_line(int(manual_line))
+            if edited and int(edited.get("qty_to_order") or 0) == 5:
+                ok("Ręczna edycja pozycji zakupów")
+            else:
+                fail("Ręczna edycja pozycji zakupów", str(edited))
+        else:
+            fail("Ręczna edycja pozycji zakupów")
+        if inv.delete_manual_shopping_line(int(manual_line), role="manager"):
+            ok("Usunięcie ręcznej pozycji zakupów")
+        else:
+            fail("Usunięcie ręcznej pozycji zakupów")
+    else:
+        fail("Ręczne dodanie do listy zakupów")
 
 
 def print_summary() -> None:
