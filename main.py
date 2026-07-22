@@ -9949,10 +9949,11 @@ def staff_assignment_script() -> str:
     try {
       const response = await fetch(form.action, {
         method: "POST",
-        body: new FormData(form),
+        body: new URLSearchParams(new FormData(form)),
         credentials: "same-origin",
         headers: {
           Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
           "X-Requested-With": "ikids-assign",
         },
       });
