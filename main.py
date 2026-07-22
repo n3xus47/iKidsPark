@@ -40,6 +40,8 @@ from ikidspark_config import (
     CAKE_CANDLE_TYPES,
     DAY_FILTERS,
     EMPTY_LOCATION,
+    INVENTORY_CATEGORIES,
+    INVENTORY_CATEGORY_LABELS,
     LEGACY_ADULT_LOCATION_RENAMES,
     LEGACY_CHILD_LOCATION_RENAMES,
     LOCATION_GROUPS,
@@ -73,6 +75,7 @@ from ikidspark_config import (
     format_table_range,
 )
 from ikidspark_export import build_csv_response
+import ikidspark_inventory as inventory
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -281,6 +284,8 @@ def create_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
         ON reservation_history(reservation_id, created_at)
         """
     )
+    for statement in inventory.inventory_schema_sql(use_sqlite=USE_LOCAL_SQLITE):
+        conn.execute(statement)
 
 
 def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None:
@@ -309,6 +314,20 @@ def ensure_current_schema(conn: psycopg.Connection | sqlite3.Connection) -> None
         else:
             conn.execute(f"ALTER TABLE reservations ADD COLUMN IF NOT EXISTS {column} {definition}")
 
+    inventory_columns = table_columns(conn, "inventory_items")
+    if inventory_columns and "ean" not in inventory_columns:
+        if USE_LOCAL_SQLITE:
+            conn.execute("ALTER TABLE inventory_items ADD COLUMN ean TEXT NOT NULL DEFAULT ''")
+        else:
+            conn.execute("ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS ean TEXT NOT NULL DEFAULT ''")
+        inventory_columns = table_columns(conn, "inventory_items")
+    if inventory_columns and "ean" in inventory_columns:
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_items_ean
+            ON inventory_items(ean) WHERE ean != ''
+            """
+        )
 
 def migrate_location_names(conn: psycopg.Connection | sqlite3.Connection) -> None:
     for old_name, new_name in LEGACY_CHILD_LOCATION_RENAMES.items():
@@ -324,10 +343,13 @@ def migrate_location_names(conn: psycopg.Connection | sqlite3.Connection) -> Non
 
 
 def init_db() -> None:
+    inventory.bind_db(db_rows=db_rows, db_one=db_one, execute=execute, now_iso=now_iso)
     with connect() as conn:
         create_schema(conn)
         ensure_current_schema(conn)
         migrate_location_names(conn)
+        for statement in inventory.inventory_schema_sql(use_sqlite=USE_LOCAL_SQLITE):
+            conn.execute(statement)
 
 
 def now_iso() -> str:
@@ -361,6 +383,9 @@ def execute(query: str, params: tuple = ()) -> int:
         return 0
 
 
+inventory.bind_db(db_rows=db_rows, db_one=db_one, execute=execute, now_iso=now_iso)
+
+
 def escape(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -385,6 +410,10 @@ def can_assign_waiter(role: str) -> bool:
 
 def can_assign_animator(role: str) -> bool:
     return normalize_role(role) == "animators"
+
+
+def can_manage_inventory(role: str) -> bool:
+    return normalize_role(role) in {"organizer", "manager"}
 
 
 def normalize_day(day: str | None) -> str:
@@ -636,10 +665,9 @@ def cake_image_markup(row: DbRow | dict[str, object]) -> str:
 
 
 def cake_kitchen_panel(row: DbRow | dict[str, object]) -> str:
-    """50/50 kitchen layout: category/value list left, cake photo right."""
-    specs: list[tuple[str, str]] = [
-        ("Motyw", str(row.get("cake_theme") or "").strip() or "(brak)"),
-    ]
+    """Collapsible 50/50 kitchen layout: category/value list left, cake photo right."""
+    theme = str(row.get("cake_theme") or "").strip() or "(brak)"
+    specs: list[tuple[str, str]] = [("Motyw", theme)]
     specs.extend(cake_detail_pairs(row))
     serving = format_service_window(row.get("cake_at"), SERVICE_DURATIONS["cake_at"])
     if serving:
@@ -656,10 +684,16 @@ def cake_kitchen_panel(row: DbRow | dict[str, object]) -> str:
         else '<div class="kitchen-cake-photo-empty" aria-hidden="true">Brak zdjęcia</div>'
     )
     return f"""
-      <div class="kitchen-cake-layout">
-        <dl class="kitchen-cake-specs">{specs_markup}</dl>
-        <div class="kitchen-cake-photo-col">{photo_markup}</div>
-      </div>
+      <details class="kitchen-cake-fold">
+        <summary class="kitchen-cake-fold-summary">
+          <span class="kitchen-cake-fold-title">Szczegóły i zdjęcie</span>
+          <span class="kitchen-cake-fold-theme">{escape(theme)}</span>
+        </summary>
+        <div class="kitchen-cake-layout">
+          <dl class="kitchen-cake-specs">{specs_markup}</dl>
+          <div class="kitchen-cake-photo-col">{photo_markup}</div>
+        </div>
+      </details>
     """
 
 
@@ -1351,6 +1385,13 @@ def validate_reservation(
 
     notes = parse_optional_free_text(data, errors, "notes", "Uwagi", maximum=1000)
 
+    raw_inventory_lines = inventory.parse_inventory_lines_payload(data) if not is_table else []
+    inventory_lines, inventory_errors = inventory.validate_inventory_form_lines(
+        raw_inventory_lines,
+        is_table=is_table,
+    )
+    errors.update(inventory_errors)
+
     form_animations = [{"type": item["type"], "at": item["at"]} for item in animations]
     if animation_enabled and not form_animations and parsed_animations:
         form_animations = [
@@ -1419,6 +1460,7 @@ def validate_reservation(
         "cooperation_enabled": 1 if cooperation_enabled else 0,
         "status": status,
         "cancellation_reason": cancellation_reason,
+        "inventory_lines": inventory_lines,
     }
 
     capacity = ROOM_CAPACITY.get(child_location)
@@ -1549,6 +1591,21 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
         action = "cancelled" if previous and previous["status"] != "cancelled" and values["status"] == "cancelled" else "updated"
         if updated:
             record_history(int(reservation_id), action, role, updated)
+        party_day = None
+        start_at = str(values.get("start_at") or "")
+        if len(start_at) >= 10:
+            try:
+                party_day = date.fromisoformat(start_at[:10])
+            except ValueError:
+                party_day = None
+        inventory.sync_reservation_inventory(
+            int(reservation_id),
+            list(values.get("inventory_lines") or []),
+            role=role,
+            status=str(values.get("status") or "active"),
+            party_day=party_day,
+            today=current_app_date(),
+        )
         return int(reservation_id)
 
     new_id = execute(
@@ -1574,6 +1631,21 @@ def save_reservation(values: dict[str, object], role: str = "manager") -> int:
     row = get_reservation(new_id)
     if row:
         record_history(new_id, "created", role, row)
+    party_day = None
+    start_at = str(values.get("start_at") or "")
+    if len(start_at) >= 10:
+        try:
+            party_day = date.fromisoformat(start_at[:10])
+        except ValueError:
+            party_day = None
+    inventory.sync_reservation_inventory(
+        new_id,
+        list(values.get("inventory_lines") or []),
+        role=role,
+        status=str(values.get("status") or "active"),
+        party_day=party_day,
+        today=current_app_date(),
+    )
     return new_id
 
 
@@ -1819,6 +1891,7 @@ def delete_reservation(reservation_id: int) -> bool:
     existing = get_reservation(reservation_id)
     if existing is None:
         return False
+    inventory.release_reservation_inventory(reservation_id, role="organizer", keep_purchased=False)
     execute("DELETE FROM reservation_history WHERE reservation_id = ?", (reservation_id,))
     execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
     return True
@@ -3415,7 +3488,8 @@ def page_template(
     logo_src = logo_asset_url()
     classes = []
     is_schedules = "page-schedules" in (page_class or "")
-    if page_role == "home" and not is_schedules:
+    is_inventory = "page-inventory" in (page_class or "")
+    if page_role == "home" and not is_schedules and not is_inventory:
         classes.append("page-home")
         classes.append("page-home-landing")
     if page_class:
@@ -5785,7 +5859,7 @@ def page_template(
 
     .hub-choice {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 14px;
       margin-top: 22px;
     }}
@@ -5838,12 +5912,398 @@ def page_template(
       line-height: 1;
     }}
 
+    .inventory-lines-block {{
+      display: grid;
+      gap: 12px;
+    }}
+
+    .inventory-line-row {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--soft);
+    }}
+
+    .inventory-line-row .full {{
+      grid-column: 1 / -1;
+    }}
+
+    .inventory-line-row .remove-inventory-line {{
+      justify-self: start;
+    }}
+
+    .inventory-page {{
+      display: grid;
+      gap: 16px;
+      min-width: 0;
+    }}
+
+    .inventory-board {{
+      overflow: hidden;
+    }}
+
+    .inventory-board > .section-head {{
+      margin: 0;
+    }}
+
+    .inventory-board--intro > .section-head {{
+      align-items: center;
+      border-radius: 18px;
+      border-bottom: 1px solid var(--line);
+    }}
+
+    .inventory-jump {{
+      display: none;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 18px 18px;
+      background: #ffffff;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }}
+
+    .inventory-jump::-webkit-scrollbar {{
+      display: none;
+    }}
+
+    .inventory-jump a {{
+      flex: 1 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--soft);
+      color: var(--ink);
+      font-size: 0.84rem;
+      font-weight: 800;
+      text-decoration: none;
+      white-space: nowrap;
+    }}
+
+    .inventory-jump a:hover {{
+      border-color: var(--brand);
+      color: var(--brand-dark);
+      background: rgba(19, 155, 215, 0.08);
+    }}
+
+    .inventory-body {{
+      display: grid;
+      gap: 12px;
+      padding: 14px 16px 16px;
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 18px 18px;
+      background:
+        linear-gradient(180deg, rgba(19, 155, 215, 0.04), rgba(122, 154, 18, 0.05)),
+        #ffffff;
+      min-width: 0;
+    }}
+
+    .inventory-list {{
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }}
+
+    @media (min-width: 720px) {{
+      .inventory-list {{
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      }}
+    }}
+
+    @media (max-width: 860px) {{
+      .inventory-add-form {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+
+    .inventory-card {{
+      display: grid;
+      gap: 8px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #ffffff;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+      min-width: 0;
+    }}
+
+    .inventory-card__head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }}
+
+    .inventory-card__kicker {{
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      line-height: 1.25;
+      text-transform: uppercase;
+    }}
+
+    .inventory-card__title {{
+      margin: 0;
+      color: var(--ink);
+      font-size: 1.05rem;
+      font-weight: 900;
+      line-height: 1.25;
+      word-break: break-word;
+    }}
+
+    .inventory-card__meta {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 700;
+      line-height: 1.35;
+      word-break: break-word;
+    }}
+
+    .inventory-card__qty {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2.4rem;
+      min-height: 2.4rem;
+      padding: 4px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(122, 154, 18, 0.28);
+      background: rgba(122, 154, 18, 0.12);
+      color: var(--ink);
+      font-size: 1.05rem;
+      font-weight: 900;
+      line-height: 1;
+      flex-shrink: 0;
+    }}
+
+    .inventory-empty {{
+      margin: 0;
+      padding: 18px 14px;
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 700;
+      text-align: center;
+      line-height: 1.4;
+    }}
+
+    .inventory-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 2px;
+    }}
+
+    .inventory-actions form {{
+      padding: 0;
+      margin: 0;
+      display: contents;
+    }}
+
+    .inventory-actions button,
+    .inventory-actions .button {{
+      flex: 1 1 auto;
+      min-width: 0;
+    }}
+
+    .inventory-add-block {{
+      display: grid;
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #ffffff;
+    }}
+
+    .inventory-add-block__title {{
+      margin: 0;
+      color: var(--ink);
+      font-size: 0.76rem;
+      font-weight: 900;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }}
+
+    .inventory-scan-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }}
+
+    .inventory-scan-status {{
+      margin: 0;
+      min-height: 1.2em;
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 700;
+    }}
+
+    .inventory-scan-status.is-ok {{
+      color: #166534;
+    }}
+
+    .inventory-scan-status.is-error {{
+      color: var(--danger);
+    }}
+
+    .inventory-scan-overlay {{
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: none;
+      grid-template-rows: auto 1fr auto;
+      background: rgba(0, 0, 0, 0.88);
+      color: #fff;
+      padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
+    }}
+
+    .inventory-scan-overlay.is-open {{
+      display: grid;
+    }}
+
+    .inventory-scan-overlay__head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 4px 4px 12px;
+    }}
+
+    .inventory-scan-overlay__head h3 {{
+      margin: 0;
+      font-size: 1.05rem;
+    }}
+
+    .inventory-scan-overlay__body {{
+      position: relative;
+      min-height: 0;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #111;
+    }}
+
+    .inventory-scan-overlay__body video,
+    .inventory-scan-overlay__body #inventory-scan-reader {{
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      min-height: 280px;
+    }}
+
+    .inventory-scan-overlay__hint {{
+      margin: 12px 4px 0;
+      text-align: center;
+      font-size: 0.9rem;
+      opacity: 0.9;
+    }}
+
+    .inventory-new-ean {{
+      display: none;
+      gap: 10px;
+      padding: 12px;
+      border: 1px dashed rgba(19, 155, 215, 0.45);
+      border-radius: 12px;
+      background: rgba(19, 155, 215, 0.06);
+    }}
+
+    .inventory-new-ean.is-open {{
+      display: grid;
+    }}
+
+    .inventory-new-ean__title {{
+      margin: 0;
+      font-size: 0.9rem;
+      font-weight: 800;
+      color: var(--brand-dark);
+    }}
+
+    .inventory-card__ean {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.02em;
+    }}
+
+    .inventory-add-form {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.4fr) minmax(5.5rem, 0.55fr);
+      gap: 10px;
+      align-items: end;
+      padding: 0;
+      margin: 0;
+    }}
+
+    .inventory-add-form .full {{
+      grid-column: 1 / -1;
+    }}
+
+    .inventory-add-form .inventory-add-submit {{
+      grid-column: 1 / -1;
+      justify-self: start;
+    }}
+
+    .inventory-status {{
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 0.78rem;
+      font-weight: 900;
+      line-height: 1.2;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }}
+
+    .inventory-status.is-issued {{
+      background: #e8f7ee;
+      border-color: #8dcf9f;
+      color: #166534;
+    }}
+
+    .inventory-status.is-open {{
+      background: #fff7e8;
+      border-color: #f0c36d;
+      color: #92400e;
+    }}
+
+    .inventory-status.is-bought {{
+      background: rgba(19, 155, 215, 0.1);
+      border-color: rgba(19, 155, 215, 0.28);
+      color: var(--brand-dark);
+    }}
+
+    .inventory-status.is-todo {{
+      background: #fff7e8;
+      border-color: #f0c36d;
+      color: #92400e;
+    }}
+
     html:has(body.page-home) {{
       overflow: hidden;
       height: 100%;
     }}
 
-    html:has(body.page-schedules) {{
+    html:has(body.page-schedules),
+    html:has(body.page-inventory) {{
       overflow-y: auto;
       overflow-x: clip;
       height: auto;
@@ -5855,7 +6315,8 @@ def page_template(
       overscroll-behavior: none;
     }}
 
-    body.page-schedules {{
+    body.page-schedules,
+    body.page-inventory {{
       overflow-y: auto;
       overflow-x: clip;
       height: auto;
@@ -5867,7 +6328,8 @@ def page_template(
       overflow: hidden;
     }}
 
-    body.page-schedules main {{
+    body.page-schedules main,
+    body.page-inventory main {{
       overflow-x: clip;
       overflow-y: visible;
       min-width: 0;
@@ -6401,6 +6863,10 @@ def page_template(
       color: #9333ea;
     }}
 
+    .metric-icon-bankiety {{
+      color: #0d9488;
+    }}
+
     .metric-icon-warsztaty {{
       color: #65a30d;
     }}
@@ -6720,12 +7186,127 @@ def page_template(
       width: 100%;
     }}
 
+    .kitchen-cake-fold {{
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfbfb;
+      overflow: hidden;
+    }}
+
+    .kitchen-cake-fold-summary {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 42px;
+      padding: 10px 12px;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }}
+
+    .kitchen-cake-fold-summary::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .kitchen-cake-fold-summary::after {{
+      content: "+";
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 1.1rem;
+      font-weight: 900;
+      line-height: 1;
+    }}
+
+    .kitchen-cake-fold[open] > .kitchen-cake-fold-summary {{
+      border-bottom: 1px solid var(--line);
+      background: #ffffff;
+    }}
+
+    .kitchen-cake-fold[open] > .kitchen-cake-fold-summary::after {{
+      content: "−";
+    }}
+
+    .kitchen-cake-fold-title {{
+      color: var(--brand-dark);
+      font-size: 0.86rem;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+
+    .kitchen-cake-fold-theme {{
+      min-width: 0;
+      margin-left: auto;
+      color: var(--ink);
+      font-size: 0.88rem;
+      font-weight: 800;
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+
     .kitchen-cake-layout {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) max-content;
       gap: 12px 14px;
-      margin-top: 8px;
+      margin: 0;
+      padding: 12px;
       align-items: start;
+      background: #ffffff;
+    }}
+
+    @media (max-width: 640px) {{
+      .kitchen-card {{
+        overflow: hidden;
+        min-width: 0;
+      }}
+
+      .role-card .kitchen-task--cake {{
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: center;
+        min-width: 0;
+      }}
+
+      .role-card .kitchen-task--cake .task-detail {{
+        display: contents;
+      }}
+
+      .role-card .kitchen-task--cake .task-label {{
+        min-width: 0;
+      }}
+
+      .role-card .kitchen-task--cake .kitchen-cake-fold {{
+        grid-column: 1 / -1;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        margin-top: 10px;
+      }}
+
+      .kitchen-cake-layout {{
+        grid-template-columns: minmax(0, 1fr);
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+      }}
+
+      .kitchen-cake-specs,
+      .kitchen-cake-photo-col {{
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+      }}
+
+      .kitchen-cake-photo {{
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+      }}
     }}
 
     .kitchen-cake-specs {{
@@ -7238,7 +7819,7 @@ def page_template(
       }}
 
       .metrics {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
       }}
     }}
 
@@ -7349,8 +7930,81 @@ def page_template(
       }}
 
       .hub-choice {{
+        grid-template-columns: 1fr;
         gap: 12px;
         margin-top: 18px;
+      }}
+
+      .inventory-line-row,
+      .inventory-add-form {{
+        grid-template-columns: 1fr;
+      }}
+
+      .inventory-page {{
+        gap: 12px;
+      }}
+
+      .inventory-jump {{
+        display: flex;
+        border-radius: 0 0 16px 16px;
+      }}
+
+      .inventory-board--intro > .section-head {{
+        border-radius: 16px 16px 0 0;
+        border-bottom: 0;
+        align-items: stretch;
+      }}
+
+      .inventory-board--intro > .section-head .button {{
+        width: 100%;
+      }}
+
+      .inventory-board[id] {{
+        scroll-margin-top: 12px;
+      }}
+
+      .inventory-card {{
+        padding: 12px;
+        border-radius: 12px;
+        gap: 6px;
+      }}
+
+      .inventory-card__head {{
+        align-items: center;
+      }}
+
+      .inventory-card__qty {{
+        min-width: 2.15rem;
+        min-height: 2.15rem;
+        font-size: 0.98rem;
+      }}
+
+      .inventory-body {{
+        padding: 12px;
+        border-radius: 0 0 16px 16px;
+        gap: 10px;
+      }}
+
+      .inventory-card__title {{
+        font-size: 1rem;
+      }}
+
+      .inventory-add-block {{
+        padding: 12px;
+        border-radius: 12px;
+      }}
+
+      .inventory-add-form .inventory-add-submit,
+      .inventory-actions button,
+      .inventory-actions .button {{
+        width: 100%;
+        justify-self: stretch;
+      }}
+
+      .inventory-actions {{
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 8px;
       }}
 
       .hub-choice__btn {{
@@ -7602,7 +8256,35 @@ def page_template(
       }}
 
       .metrics {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 12px;
+      }}
+
+      .metric {{
+        gap: 4px;
+        padding: 8px 6px;
+        border-radius: 12px;
+      }}
+
+      .metric-icon {{
+        width: 22px;
+        height: 22px;
+      }}
+
+      .metric-icon svg {{
+        width: 22px;
+        height: 22px;
+      }}
+
+      .metric strong {{
+        font-size: 1.05rem;
+        margin-bottom: 2px;
+      }}
+
+      .metric .muted {{
+        font-size: 0.68rem;
+        line-height: 1.15;
       }}
 
       .location-panel {{
@@ -8037,7 +8719,6 @@ def render_organizer_tools(role: str, day: str) -> str:
           </span>
         </button>
       </div>
-      <a class="button secondary" href="/schema?role={escape(role)}&day={escape(day)}">Struktura bazy</a>
       <a class="button secondary" href="/export">Eksport CSV</a>
     </div>
   </div>
@@ -8081,7 +8762,7 @@ def render_organizer_tools(role: str, day: str) -> str:
 
 def normalize_hub(hub: str | None) -> str:
     value = str(hub or "").strip().lower()
-    return value if value in {"urodziny", "grafiki"} else ""
+    return value if value in {"urodziny", "grafiki", "inwentura"} else ""
 
 
 def hub_home_href(day: str, hub: str = "") -> str:
@@ -8109,9 +8790,15 @@ def default_urodziny_href(day: str) -> str:
     return link_for("manager", day_q)
 
 
+def default_inwentura_href(day: str) -> str:
+    day_q = day_query(selected_day(normalize_day(day)))
+    return "/inwentura?" + urlencode({"day": day_q})
+
+
 def render_hub_choice(day: str) -> str:
     urodziny_href = default_urodziny_href(day)
     grafiki_href = default_grafiki_href(day)
+    inwentura_href = default_inwentura_href(day)
     return f"""
 <nav class="hub-choice" aria-label="Wybór sekcji">
   <a class="hub-choice__btn" href="{escape(urodziny_href)}" aria-label="Urodziny">
@@ -8119,8 +8806,12 @@ def render_hub_choice(day: str) -> str:
       <path d="M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8"/>
       <path d="M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1"/>
       <path d="M2 21h20"/>
-      <path d="M7 8v3M12 8v3M17 8v3"/>
-      <path d="M7 4h.01M12 4h.01M17 4h.01"/>
+      <path d="M7 8v3"/>
+      <path d="M12 8v3"/>
+      <path d="M17 8v3"/>
+      <path d="M7 4h.01"/>
+      <path d="M12 4h.01"/>
+      <path d="M17 4h.01"/>
     </svg>
     <span class="hub-choice__label">Urodziny</span>
   </a>
@@ -8131,6 +8822,14 @@ def render_hub_choice(day: str) -> str:
       <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>
     </svg>
     <span class="hub-choice__label">Grafiki</span>
+  </a>
+  <a class="hub-choice__btn" href="{escape(inwentura_href)}" aria-label="Inwentura">
+    <svg class="hub-choice__icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+      <path d="M3.3 7 12 12l8.7-5"/>
+      <path d="M12 22V12"/>
+    </svg>
+    <span class="hub-choice__label">Inwentura</span>
   </a>
 </nav>
 """
@@ -8369,6 +9068,7 @@ def default_form_values(target_day: date) -> dict[str, object]:
         "cooperation_enabled": 0,
         "status": "active",
         "cancellation_reason": "",
+        "inventory_lines": [],
     }
 
 
@@ -8378,6 +9078,7 @@ def row_to_form_values(row: DbRow) -> dict[str, object]:
     values["party_start_time"] = format_time(row["start_at"])
     values["birthday_children"] = birthday_children_from_row(row)
     values["animations"] = animations_for_form(row)
+    values["inventory_lines"] = inventory.form_lines_from_reservation(int(row["id"]))
     for field in (
         "animation_at",
         "cake_at",
@@ -8677,9 +9378,10 @@ LOGISTICS_CHIP_ICONS = {
 METRIC_ICONS = {
     "bankiety": (
         '<svg class="metric-svg" viewBox="0 0 24 24" aria-hidden="true">'
-        '<path d="M8 2v4"/><path d="M16 2v4"/>'
-        '<rect x="3" y="4" width="18" height="18" rx="2"/>'
-        '<path d="M3 10h18"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/>'
+        '<path d="m16 2-2.3 2.3a3 3 0 0 0 0 4.2l1.8 1.8a3 3 0 0 0 4.2 0L22 8"/>'
+        '<path d="M15 15 3.3 3.3a4.2 4.2 0 0 0 0 6l7.3 7.3c.7.7 2 .7 2.8 0L15 15Zm0 0 7 7"/>'
+        '<path d="m2.1 21.8 6.4-6.3"/>'
+        '<path d="m19 5-7 7"/>'
         "</svg>"
     ),
     "guests": (
@@ -8698,7 +9400,7 @@ METRIC_ICONS = {
 
 
 def render_metric(value: int, label: str, icon_key: str, href: str = "") -> str:
-    icon_class = f" metric-icon-{icon_key}" if icon_key in {"animacje", "warsztaty", "torty", "piniaty"} else ""
+    icon_class = f" metric-icon-{icon_key}" if icon_key in {"bankiety", "animacje", "warsztaty", "torty", "piniaty"} else ""
     tag = "a" if href else "div"
     href_attr = f' href="{escape(href)}"' if href else ""
     return (
@@ -9782,6 +10484,79 @@ def split_svg_label(label: str) -> list[str]:
     return [" ".join(parts[:midpoint]), " ".join(parts[midpoint:])]
 
 
+def render_inventory_category_options(current: object = "") -> str:
+    options = ['<option value="">Kategoria</option>']
+    for key in INVENTORY_CATEGORIES:
+        options.append(
+            f'<option value="{escape(key)}"{selected(current, key)}>{escape(INVENTORY_CATEGORY_LABELS[key])}</option>'
+        )
+    return "\n".join(options)
+
+
+def render_inventory_catalog_options(category: str = "", current_item_id: object = "") -> str:
+    items = inventory.list_inventory_items()
+    options = ['<option value="">Nowa pozycja / wybierz z katalogu</option>']
+    for item in items:
+        if category and str(item.get("category")) != category:
+            continue
+        item_id = str(item.get("id"))
+        label = f'{INVENTORY_CATEGORY_LABELS.get(str(item.get("category")), "")}: {item.get("name")} (wolne: {item.get("qty_available", 0)})'
+        options.append(
+            f'<option value="{escape(item_id)}" data-category="{escape(item.get("category"))}" '
+            f'data-name="{escape(item.get("name"))}" data-description="{escape(item.get("description") or "")}"'
+            f"{selected(str(current_item_id), item_id)}>{escape(label)}</option>"
+        )
+    return "\n".join(options)
+
+
+def render_inventory_line_row(line: dict[str, object] | None = None) -> str:
+    line = line or {}
+    category = str(line.get("category") or "")
+    item_id = str(line.get("item_id") or "")
+    name = str(line.get("name") or "")
+    qty = str(line.get("qty") or "")
+    description = str(line.get("description") or "")
+    return f"""
+<div class="inventory-line-row">
+  <label>
+    Kategoria
+    <select name="inventory_category" class="inventory-category">{render_inventory_category_options(category)}</select>
+  </label>
+  <label>
+    Katalog
+    <select name="inventory_item_id" class="inventory-item-id">{render_inventory_catalog_options(category, item_id)}</select>
+  </label>
+  <label>
+    Nazwa
+    <input type="text" name="inventory_name" class="inventory-name" maxlength="120" value="{escape(name)}" placeholder="np. Piniata Jednorożec">
+  </label>
+  <label>
+    Ilość
+    <input type="number" name="inventory_qty" class="inventory-qty" min="1" max="500" value="{escape(qty)}" placeholder="1">
+  </label>
+  <label class="full">
+    Opis
+    <input type="text" name="inventory_description" class="inventory-description" maxlength="300" value="{escape(description)}" placeholder="Jak ma wyglądać zestaw / motyw">
+  </label>
+  <button type="button" class="button secondary remove-inventory-line" aria-label="Usuń pozycję">Usuń</button>
+</div>
+"""
+
+
+def render_inventory_lines_fields(values: dict[str, object], errors: dict[str, str]) -> str:
+    lines = values.get("inventory_lines") or []
+    if not isinstance(lines, list):
+        lines = []
+    rows = "".join(render_inventory_line_row(line if isinstance(line, dict) else {}) for line in lines)
+    return f"""
+<div class="inventory-lines-block">
+  <div id="inventory-lines-list">{rows}</div>
+  <button type="button" class="button secondary" id="add-inventory-line">+ Dodaj pozycję inwentury</button>
+  {error_for(errors, "inventory_lines")}
+</div>
+"""
+
+
 def render_form(
     values: dict[str, object],
     errors: dict[str, str],
@@ -9955,6 +10730,12 @@ def render_form(
           {render_service_option(values, errors, "mascot_enabled", "mascot_at", "Maskotka", SERVICE_DURATIONS["mascot_at"], render_mascot_type_select(values, errors))}
           {render_service_option(values, errors, "balloons_enabled", "balloons_at", "Balony", None, render_balloons_description_input(values, errors), show_time=False)}
         </div>
+      </div>
+
+      <div class="form-category wide banquet-only">
+        <h3 class="category-title">Pozycje inwentury</h3>
+        <p class="subtitle location-hint">Piniata, balony lub zestaw tematyczny — wybierz z katalogu albo dodaj nową pozycję do zamówienia.</p>
+        {render_inventory_lines_fields(values, errors)}
       </div>
 
       <div class="form-category wide">
@@ -10761,6 +11542,14 @@ SCHEDULE_ROLE_ABBREVIATIONS: dict[str, str] = {
 
 SCHEDULE_POSITION_SPECIAL_ABBREVIATIONS: dict[str, str] = {
     "szef kuchni": "SK",
+    "soue szef": "SS",
+    "sou chef": "SS",
+    "sous chef": "SS",
+    "soue": "SS",
+    "cukiernik": "CU",
+    "pizza": "PZ",
+    "kucharz": "KR",
+    "pomoc kuchenna": "PKU",
     "kierownik zmiany": "ADM",
     "organizator urodzin": "OU",
     "pracownia tworcza": "PK",
@@ -10789,6 +11578,11 @@ SCHEDULE_POSITION_ABBREV_TO_ROLE: dict[str, str] = {
     abbrev.upper(): role for role, abbrev in SCHEDULE_ROLE_ABBREVIATIONS.items()
 }
 SCHEDULE_POSITION_ABBREV_TO_ROLE["SK"] = "Kuchnia"
+SCHEDULE_POSITION_ABBREV_TO_ROLE["SS"] = "Kuchnia"
+SCHEDULE_POSITION_ABBREV_TO_ROLE["CU"] = "Kuchnia"
+SCHEDULE_POSITION_ABBREV_TO_ROLE["PZ"] = "Kuchnia"
+SCHEDULE_POSITION_ABBREV_TO_ROLE["KR"] = "Kuchnia"
+SCHEDULE_POSITION_ABBREV_TO_ROLE["PKU"] = "Kuchnia"
 
 
 def shift_has_bar_marker(value: object) -> bool:
@@ -11565,11 +12359,13 @@ def render_grafik_mobile_month_calendar(
         if people > 0:
             classes.append("has-shifts")
         count_html = (
-            f'<span class="cal-day-count">{people}</span>' if people > 0 else ""
+            f'<span class="cal-day-count" data-overview-count="{people}">{people}</span>'
+            if people > 0
+            else '<span class="cal-day-count" data-overview-count="0" hidden></span>'
         )
         day_cells.append(
             f'<button type="button" class="{" ".join(classes)}" data-date="{escape(iso)}" '
-            f'aria-label="{abbr} {dd}">'
+            f'data-people-count="{people}" aria-label="{abbr} {dd}">'
             f'<span class="cal-day-num">{dd}</span>'
             f"{count_html}"
             f"</button>"
@@ -11579,214 +12375,57 @@ def render_grafik_mobile_month_calendar(
         '<div class="grafiki-mobile-month-cal" aria-label="Kalendarz miesiąca">'
         f'<div class="grafiki-mobile-cal-weekdays">{weekday_headers}</div>'
         f'<div class="grafiki-mobile-cal-grid">{padding}{"".join(day_cells)}</div>'
-        '<p class="grafiki-mobile-cal-legend muted">Cyfra pod dniem — liczba osób na zmianie</p>'
+        '<p class="grafiki-mobile-cal-legend muted" data-cal-legend>'
+        "Cyfra pod dniem — liczba osób na zmianie"
+        "</p>"
         "</div>"
-    )
-
-
-def _employee_has_month_shifts(
-    name: str,
-    date_columns: list[dict[str, object]],
-    shifts_by_date: dict[str, dict[str, dict[str, str]]],
-) -> bool:
-    for day in date_columns:
-        iso = str(day.get("date") or "")
-        row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
-        if not isinstance(row_shifts, dict):
-            continue
-        cell = row_shifts.get(name, {})
-        if not isinstance(cell, dict):
-            continue
-        if schedule_shift_is_work(str(cell.get("shift") or "").strip()):
-            return True
-    return False
-
-
-def render_grafik_employee_month_card(
-    emp: dict[str, object],
-    *,
-    date_columns: list[dict[str, object]],
-    shifts_by_date: dict[str, dict[str, dict[str, str]]],
-    hours_by_emp: dict[str, float],
-    day_meta: dict[str, dict[str, object]],
-    empty_label: str = "brak zmian w tym miesiącu",
-    active: bool = False,
-) -> str:
-    name = str(emp.get("name") or "")
-    display_name = str(emp.get("display_name") or name)
-    position = str(emp.get("position") or "")
-    position_full = str(emp.get("position_full") or "")
-    total_hours = format_schedule_total(hours_by_emp.get(name, 0.0))
-
-    shift_items: list[str] = []
-    for day in date_columns:
-        iso = str(day.get("date") or "")
-        row_shifts = shifts_by_date.get(iso, {}) if isinstance(shifts_by_date, dict) else {}
-        if not isinstance(row_shifts, dict):
-            continue
-        cell = row_shifts.get(name, {})
-        if not isinstance(cell, dict):
-            continue
-        shift = str(cell.get("shift") or "").strip()
-        if not schedule_shift_is_work(shift):
-            continue
-        hours = str(cell.get("hours") or "").strip()
-        meta = day_meta.get(iso, {})
-        abbr = escape(str(meta.get("abbr") or ""))
-        dd = escape(str(meta.get("dd") or ""))
-        hours_label = f"{escape(hours)}h" if hours else ""
-        hours_html = f'<span class="shift-hours">{hours_label}</span>' if hours_label else ""
-        shift_items.append(
-            "<li>"
-            f'<button type="button" class="grafiki-emp-shift" data-date="{escape(iso)}" '
-            f'data-employee="{escape(name)}">'
-            f'<span class="shift-day-label">{abbr} {dd}</span>'
-            f'<span class="shift-value">{escape(shift)}</span>'
-            f"{hours_html}"
-            f"</button>"
-            "</li>"
-        )
-
-    shifts_html = (
-        f'<ul class="grafiki-emp-shifts">{"".join(shift_items)}</ul>'
-        if shift_items
-        else f'<p class="grafiki-emp-empty muted">{escape(empty_label)}</p>'
-    )
-    short_name = schedule_grafik_short_name(display_name)
-    name_title = display_name
-    if position_full or position:
-        name_title = f"{display_name} · {position_full or position}"
-    name_cell_html = schedule_grafik_name_cell_html(
-        short_name,
-        name_title=name_title,
-        position=position,
-        position_full=position_full,
-        employee_name=name,
-        wrap_class="emp-name-wrap emp-name-wrap--card",
-        watermark_mode="full",
-    )
-    hidden_attr = "" if active else " hidden"
-    active_class = " is-active" if active else ""
-    return (
-        f'<article class="grafiki-emp-card{active_class}" data-employee="{escape(name)}"{hidden_attr}>'
-        '<header class="grafiki-emp-card-head">'
-        '<div class="grafiki-emp-card-identity">'
-        f"{name_cell_html}"
-        "</div>"
-        f'<span class="grafiki-emp-total">{escape(total_hours)}h</span>'
-        "</header>"
-        f"{shifts_html}"
-        "</article>"
     )
 
 
 def render_grafik_mobile_month_employee_picker(
     employee_list: list[dict[str, object]],
-    *,
-    selected_name: str = "",
 ) -> str:
+    """Rozwijana lista pracowników w stylu przypisania kelnera/animatora."""
     sorted_employees = sorted(
         employee_list,
         key=lambda emp: normalize_search_text(str(emp.get("display_name") or emp.get("name") or "")),
     )
     options: list[str] = []
-    selected_display = ""
     for emp in sorted_employees:
         name = str(emp.get("name") or "")
         display_name = str(emp.get("display_name") or name)
-        if name == selected_name:
-            selected_display = display_name
+        if not name:
+            continue
         options.append(
-            '<li class="grafiki-emp-option" role="option" '
-            f'data-employee="{escape(name)}" data-search="{escape(normalize_search_text(display_name))}" '
-            f'aria-selected="{"true" if name == selected_name else "false"}">'
-            f"{escape(display_name)}"
-            "</li>"
+            f"""
+            <button type="button" class="animator-assign__option" data-staff-option
+              data-employee="{escape(name)}"
+              data-display-name="{escape(display_name)}"
+              data-search="{escape(normalize_search_text(display_name))}">
+              <span class="animator-assign__avatar" aria-hidden="true">{escape(staff_initials(display_name))}</span>
+              <span class="animator-assign__option-name">{escape(display_name)}</span>
+            </button>
+            """
         )
     if not options:
         return ""
-    return (
-        '<div class="grafiki-month-emp-picker">'
-        '<label class="grafiki-emp-picker-label" for="grafik-emp-search">Pracownik</label>'
-        '<div class="grafiki-emp-combobox">'
-        '<input type="search" id="grafik-emp-search" class="grafiki-emp-search" '
-        'placeholder="Szukaj po imieniu i nazwisku…" autocomplete="off" '
-        'role="combobox" aria-expanded="false" aria-controls="grafik-emp-options" '
-        'aria-autocomplete="list" '
-        f'value="{escape(selected_display)}">'
-        '<button type="button" class="grafiki-emp-combobox-toggle" '
-        'aria-label="Rozwiń listę pracowników" aria-expanded="false" aria-controls="grafik-emp-options">'
-        '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">'
-        '<path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" '
-        'stroke-linecap="round" stroke-linejoin="round"></path>'
-        "</svg>"
-        "</button>"
-        f'<ul id="grafik-emp-options" class="grafiki-emp-options" role="listbox" hidden>'
-        f'{"".join(options)}'
-        "</ul>"
-        "</div>"
-        "</div>"
-    )
-
-
-def render_grafik_mobile_month_employees(
-    employee_list: list[dict[str, object]],
-    date_columns: list[dict[str, object]],
-    shifts_by_date: dict[str, dict[str, dict[str, str]]],
-    hours_by_emp: dict[str, float],
-    *,
-    empty_label: str = "brak zmian w tym miesiącu",
-) -> str:
-    """Wybór pracownika + jego rozpiska na miesiąc (zamiast długiej listy kart)."""
-    if not employee_list:
-        return ""
-
-    day_meta = {
-        str(day.get("date") or ""): day
-        for day in date_columns
-        if isinstance(day, dict) and day.get("date")
-    }
-
-    sorted_employees = sorted(
-        employee_list,
-        key=lambda emp: normalize_search_text(str(emp.get("display_name") or emp.get("name") or "")),
-    )
-    default_name = ""
-    for emp in sorted_employees:
-        name = str(emp.get("name") or "")
-        if _employee_has_month_shifts(name, date_columns, shifts_by_date):
-            default_name = name
-            break
-    if not default_name and sorted_employees:
-        default_name = str(sorted_employees[0].get("name") or "")
-
-    cards: list[str] = []
-    for emp in sorted_employees:
-        name = str(emp.get("name") or "")
-        cards.append(
-            render_grafik_employee_month_card(
-                emp,
-                date_columns=date_columns,
-                shifts_by_date=shifts_by_date,
-                hours_by_emp=hours_by_emp,
-                day_meta=day_meta,
-                empty_label=empty_label,
-                active=name == default_name,
-            )
-        )
-
-    picker_html = render_grafik_mobile_month_employee_picker(
-        sorted_employees,
-        selected_name=default_name,
-    )
-    return (
-        '<div class="grafiki-mobile-month-employees" aria-label="Zmiany pracowników">'
-        f"{picker_html}"
-        '<div class="grafiki-month-emp-detail" id="grafik-emp-detail">'
-        f'{"".join(cards)}'
-        "</div>"
-        "</div>"
-    )
+    return f"""
+      <div class="animator-assign grafiki-month-emp-assign" data-month-emp-picker>
+        <div class="grafiki-month-emp-combobox">
+          <label class="animator-assign__search grafiki-month-emp-search">
+            <span class="visually-hidden">Szukaj pracownika</span>
+            <input type="search" placeholder="Szukaj pracownika…" autocomplete="off"
+              role="combobox" aria-expanded="false" aria-controls="grafik-month-emp-list"
+              aria-autocomplete="list" data-month-emp-filter>
+          </label>
+          <div class="animator-assign__sheet grafiki-month-emp-sheet" id="grafik-month-emp-list" data-month-emp-sheet hidden>
+            <div class="animator-assign__list" data-month-emp-list>
+              {"".join(options)}
+            </div>
+          </div>
+        </div>
+      </div>
+    """
 
 
 def render_grafik_mobile_month(
@@ -11797,19 +12436,15 @@ def render_grafik_mobile_month(
     hours_by_emp: dict[str, float],
     people_by_date: dict[str, int],
 ) -> str:
+    del shifts_by_date, hours_by_emp  # używane po stronie JS z window.grafikShiftsData
     calendar_html = render_grafik_mobile_month_calendar(date_columns, people_by_date)
-    employees_html = render_grafik_mobile_month_employees(
-        employee_list,
-        date_columns,
-        shifts_by_date,
-        hours_by_emp,
-    )
-    if not calendar_html and not employees_html:
+    picker_html = render_grafik_mobile_month_employee_picker(employee_list)
+    if not calendar_html and not picker_html:
         return ""
     return (
         '<section class="grafiki-mobile-month" aria-label="Grafik miesięczny — widok mobilny">'
+        f"{picker_html}"
         f"{calendar_html}"
-        f"{employees_html}"
         "</section>"
     )
 
@@ -12346,10 +12981,10 @@ def grafik4600_assets() -> str:
     width: 100%;
     min-height: 44px;
     padding: 6px 8px;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: #ffffff;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .grafiki-layout .schedule-period-label {
@@ -13017,22 +13652,90 @@ def grafik4600_assets() -> str:
     cursor: pointer;
   }
 
+  #grafik[data-view="month"] {
+    table-layout: fixed;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    font-size: 0.62rem;
+  }
+
+  #grafik[data-view="month"] th,
+  #grafik[data-view="month"] td {
+    padding: 3px 1px;
+  }
+
   #grafik[data-view="month"] thead .col-date {
-    min-width: 38px;
+    min-width: 0;
+    width: auto;
+    padding: 4px 0;
+  }
+
+  #grafik[data-view="month"] thead .col-date .date-dd {
+    font-size: 0.68rem;
+  }
+
+  #grafik[data-view="month"] thead .col-date .date-abbr {
+    font-size: 0.5rem;
   }
 
   #grafik[data-view="month"] td.slot {
-    min-width: 40px;
-    max-width: 54px;
-    white-space: normal;
-    line-height: 1.15;
-    word-break: break-word;
-    hyphens: auto;
+    min-width: 0;
+    max-width: none;
+    width: auto;
+    white-space: nowrap;
+    word-break: normal;
+    overflow-wrap: normal;
+    hyphens: none;
+    font-size: 0.58rem;
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+    padding: 2px 0;
   }
 
   #grafik[data-view="month"] .col-name {
-    min-width: 132px;
-    max-width: 180px;
+    min-width: 0;
+    width: 7.2rem;
+    max-width: 7.2rem;
+    padding: 4px 6px;
+    font-size: 0.66rem;
+  }
+
+  #grafik[data-view="month"] .col-name .emp-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #grafik[data-view="month"] .col-summary {
+    min-width: 0;
+    width: 2.2rem;
+    max-width: 2.2rem;
+    padding: 3px 1px;
+    font-size: 0.6rem;
+  }
+
+  #grafik[data-view="month"] td.slot.custom-shift {
+    padding: 1px;
+  }
+
+  #grafik[data-view="month"] td.slot.custom-shift .shift-chip {
+    padding: 2px 1px;
+    border-radius: 4px;
+    white-space: nowrap;
+    font-size: inherit;
+    letter-spacing: inherit;
+    line-height: inherit;
+  }
+
+  .page-schedules .grafiki-table-panel .table-wrap:has(#grafik[data-view="month"]) {
+    overflow-x: hidden;
+  }
+
+  body.page-schedules main {
+    max-width: none;
+    padding-left: 10px;
+    padding-right: 10px;
   }
 
   .grafiki-table td.slot.custom-shift {
@@ -13470,14 +14173,43 @@ def grafik4600_assets() -> str:
     background: color-mix(in srgb, var(--brand) 10%, #f3f3f3);
   }
 
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day,
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.off-day,
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.has-shifts,
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.off-day.has-shifts {
+    background: #fafafa;
+    border-color: transparent;
+    color: var(--ink);
+    box-shadow: none;
+  }
+
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.is-emp-work {
+    background: color-mix(in srgb, #3b82f6 22%, white);
+    border-color: color-mix(in srgb, #3b82f6 42%, transparent);
+    color: #1e3a8a;
+  }
+
   .grafiki-mobile-cal-day.today {
     background: #e6f4ea;
     box-shadow: none;
   }
 
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.today:not(.is-emp-work):not(.is-selected-day) {
+    background: #e6f4ea;
+  }
+
   .grafiki-mobile-cal-day.is-selected-day {
     outline: none;
     background: #fef7e0;
+  }
+
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.is-selected-day:not(.is-emp-work) {
+    background: #fef7e0;
+  }
+
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.is-emp-work.is-selected-day {
+    background: color-mix(in srgb, #3b82f6 18%, #fef7e0);
+    border-color: color-mix(in srgb, #3b82f6 50%, transparent);
   }
 
   .grafiki-mobile-cal-day .cal-day-num {
@@ -13495,6 +14227,15 @@ def grafik4600_assets() -> str:
     font-variant-numeric: tabular-nums;
   }
 
+  .grafiki-mobile-month.is-emp-filtered .grafiki-mobile-cal-day.is-emp-work .cal-day-count {
+    color: #1e3a8a;
+    font-size: 0.52rem;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .grafiki-mobile-cal-legend {
     margin: 2px 0 0;
     font-size: 0.72rem;
@@ -13502,267 +14243,76 @@ def grafik4600_assets() -> str:
     line-height: 1.3;
   }
 
-  .grafiki-mobile-month-employees {
+  .grafiki-month-emp-assign {
     display: grid;
-    gap: 10px;
-  }
-
-  .grafiki-month-emp-picker {
-    display: grid;
-    gap: 6px;
-  }
-
-  .grafiki-emp-picker-label {
-    font-size: 0.72rem;
-    font-weight: 800;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-
-  .grafiki-emp-combobox {
+    gap: 8px;
+    justify-items: center;
     position: relative;
-    display: flex;
-    align-items: stretch;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: #ffffff;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    z-index: 20;
+    margin-top: 6px;
   }
 
-  .grafiki-emp-search {
-    flex: 1 1 auto;
-    min-width: 0;
+  .grafiki-month-emp-combobox {
+    position: relative;
+    width: 100%;
+    max-width: 22rem;
+  }
+
+  .grafiki-month-emp-search {
+    display: block;
+    width: 100%;
+  }
+
+  .grafiki-month-emp-search input {
+    width: 100%;
     min-height: 44px;
-    padding: 0 12px;
-    border: 0;
-    border-radius: 12px 0 0 12px;
-    background: transparent;
-    font: inherit;
-    font-size: 0.88rem;
-    font-weight: 700;
-    color: var(--ink);
+    box-sizing: border-box;
+    text-align: center;
   }
 
-  .grafiki-emp-search::placeholder {
-    color: color-mix(in srgb, var(--muted) 88%, white);
-    font-weight: 600;
+  .grafiki-month-emp-search input::placeholder {
+    text-align: center;
   }
 
-  .grafiki-emp-search:focus {
-    outline: none;
-  }
-
-  .grafiki-emp-combobox:focus-within {
-    outline: 2px solid var(--brand);
-    outline-offset: 1px;
-  }
-
-  .grafiki-emp-combobox-toggle {
-    appearance: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 44px;
-    flex: 0 0 auto;
-    margin: 0;
-    padding: 0;
-    border: 0;
-    border-left: 1px solid var(--line);
-    border-radius: 0 12px 12px 0;
-    background: #fafafa;
-    color: var(--ink);
-    cursor: pointer;
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
-  }
-
-  .grafiki-emp-combobox-toggle:hover {
-    background: #f3f3f3;
-  }
-
-  .grafiki-emp-options {
+  .grafiki-month-emp-assign .grafiki-month-emp-sheet {
     position: absolute;
     top: calc(100% + 6px);
     left: 0;
     right: 0;
-    z-index: 30;
-    max-height: min(260px, 42vh);
-    overflow-y: auto;
+    width: 100%;
+    z-index: 40;
+  }
+
+  .grafiki-month-emp-sheet.is-ported {
+    position: fixed;
     margin: 0;
-    padding: 4px;
-    list-style: none;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: #ffffff;
-    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.12);
-  }
-
-  .grafiki-emp-options[hidden] {
-    display: none;
-  }
-
-  .grafiki-emp-option {
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 0.86rem;
-    font-weight: 700;
-    line-height: 1.2;
-    color: var(--ink);
-    cursor: pointer;
-  }
-
-  .grafiki-emp-option[hidden] {
-    display: none;
-  }
-
-  .grafiki-emp-option:hover,
-  .grafiki-emp-option.is-highlighted {
-    background: color-mix(in srgb, var(--brand) 10%, white);
-  }
-
-  .grafiki-emp-option[aria-selected="true"] {
-    background: color-mix(in srgb, var(--brand) 14%, white);
-    color: var(--brand-dark);
-  }
-
-  .grafiki-month-emp-detail {
+    z-index: 16000;
+    box-sizing: border-box;
     display: grid;
-    gap: 10px;
+    overflow: hidden;
   }
 
-  .grafiki-emp-card[hidden] {
+  .grafiki-month-emp-assign .grafiki-month-emp-sheet[hidden],
+  .grafiki-month-emp-sheet.is-ported[hidden] {
     display: none !important;
   }
 
-  .grafiki-emp-card {
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: #ffffff;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-    overflow: hidden;
+  .grafiki-month-emp-sheet .animator-assign__list,
+  .grafiki-month-emp-assign .animator-assign__list {
+    max-height: none;
+    height: 100%;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
-  .grafiki-emp-card-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--line);
-    background: #fafafa;
+  .grafiki-month-emp-assign .animator-assign__option[hidden],
+  .grafiki-month-emp-sheet .animator-assign__option[hidden] {
+    display: none !important;
   }
 
-  .grafiki-emp-card-identity {
-    display: grid;
-    gap: 2px;
-    min-width: 0;
-    flex: 1 1 auto;
-  }
-
-  .emp-name-wrap--card .emp-name {
-    font-size: 0.9rem;
-    font-weight: 900;
-  }
-
-  .emp-name-wrap--card .emp-position {
-    font-size: clamp(0.95em, 5vw, 1.35em);
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .grafiki-emp-card .emp-name {
-    font-size: 0.9rem;
-    font-weight: 900;
-    line-height: 1.2;
-    overflow-wrap: anywhere;
-  }
-
-  .grafiki-emp-card .emp-position {
-    margin-top: 0;
-  }
-
-  .grafiki-emp-total {
-    flex: 0 0 auto;
-    font-size: 0.84rem;
-    font-weight: 900;
-    color: var(--brand-dark);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-
-  .grafiki-emp-shifts {
-    display: grid;
-    gap: 6px;
-    list-style: none;
-    margin: 0;
-    padding: 8px 10px 10px;
-  }
-
-  .grafiki-emp-shift {
-    appearance: none;
-    display: grid;
-    grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 8px 10px;
-    width: 100%;
-    padding: 9px 10px;
-    margin: 0;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: #ffffff;
-    color: var(--ink);
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
-    transition: background 0.12s ease, border-color 0.12s ease;
-  }
-
-  .grafiki-emp-shift:hover {
-    background: #f8f8f8;
-  }
-
-  .grafiki-emp-shift.is-selected-day {
-    outline: 2px solid var(--orange);
-    outline-offset: -1px;
-    background: color-mix(in srgb, var(--orange) 10%, white);
-    border-color: color-mix(in srgb, var(--orange) 45%, var(--line));
-  }
-
-  .grafiki-emp-shift .shift-day-label {
-    font-size: 0.76rem;
-    font-weight: 800;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.02em;
-    white-space: nowrap;
-  }
-
-  .grafiki-emp-shift .shift-value {
-    font-size: 0.88rem;
-    font-weight: 900;
-    color: var(--brand-dark);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-
-  .grafiki-emp-shift .shift-hours {
-    font-size: 0.76rem;
-    font-weight: 800;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    justify-self: end;
-  }
-
-  .grafiki-emp-empty {
-    margin: 0;
-    padding: 8px 12px 12px;
-    font-size: 0.84rem;
+  .grafiki-month-emp-assign .animator-assign__option.is-selected,
+  .grafiki-month-emp-sheet .animator-assign__option.is-selected {
+    background: color-mix(in srgb, var(--brand) 14%, white);
   }
 
   @media (max-width: 900px) {
@@ -13832,6 +14382,7 @@ def grafik4600_assets() -> str:
       display: grid;
       gap: 12px;
       width: 100%;
+      padding-top: 10px;
       padding-left: max(14px, env(safe-area-inset-left, 0px));
       padding-right: max(14px, env(safe-area-inset-right, 0px));
       box-sizing: border-box;
@@ -13991,9 +14542,9 @@ def grafik4600_assets() -> str:
     }
 
     #grafik[data-view="week"] .col-name {
-      width: 18%;
+      width: 24%;
       min-width: 0;
-      max-width: 18%;
+      max-width: 24%;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -14001,15 +14552,32 @@ def grafik4600_assets() -> str:
     }
 
     #grafik[data-view="week"] thead .col-name {
-      font-size: 0.58rem;
+      font-size: 0.52rem;
       padding-left: max(8px, env(safe-area-inset-left, 0px));
       text-transform: none;
       letter-spacing: 0;
     }
 
     #grafik[data-view="week"] tbody .col-name {
-      padding: 8px 6px 8px max(8px, env(safe-area-inset-left, 0px));
-      font-size: 0.66rem;
+      padding: 6px 4px 6px max(6px, env(safe-area-inset-left, 0px));
+      font-size: 0.54rem;
+      letter-spacing: -0.02em;
+    }
+
+    #grafik[data-view="week"] .col-name .emp-name {
+      display: block;
+      font-size: inherit;
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #grafik[data-view="week"] .col-name .emp-position {
+      font-size: 1.35em;
+      opacity: 0.28;
     }
 
     #grafik[data-view="week"] thead .col-date {
@@ -14244,16 +14812,22 @@ def grafik4600_script() -> str:
 
   function initMobileMonthEmployeePicker() {
     const section = document.querySelector(".grafiki-mobile-month");
-    if (!section) return;
+    const picker = section?.querySelector("[data-month-emp-picker]");
+    if (!section || !picker) return;
 
-    const input = section.querySelector("#grafik-emp-search");
-    const list = section.querySelector("#grafik-emp-options");
-    const toggle = section.querySelector(".grafiki-emp-combobox-toggle");
-    const cards = section.querySelectorAll(".grafiki-emp-card[data-employee]");
-    if (!input || !list || !cards.length) return;
+    const combobox = picker.querySelector(".grafiki-month-emp-combobox") || picker;
+    const filterInput = picker.querySelector("[data-month-emp-filter]");
+    let sheet = picker.querySelector("[data-month-emp-sheet]");
+    const legend = section.querySelector("[data-cal-legend]");
+    const dayButtons = Array.from(section.querySelectorAll(".grafiki-mobile-cal-day[data-date]"));
+    const shiftsByDate = window.grafikShiftsData || {};
+    let selectedEmployee = "";
+    let selectedDisplayName = "";
+    let placeRaf = 0;
 
-    const options = Array.from(list.querySelectorAll(".grafiki-emp-option"));
-    let highlightIndex = -1;
+    function options() {
+      return Array.from((sheet || picker).querySelectorAll("[data-staff-option][data-employee]"));
+    }
 
     function normalizeSearch(value) {
       return String(value || "")
@@ -14265,108 +14839,226 @@ def grafik4600_script() -> str:
         .trim();
     }
 
-    function visibleOptions() {
-      return options.filter((opt) => !opt.hidden);
+    function isWorkShift(shift) {
+      const value = String(shift || "").trim();
+      return Boolean(value) && !/^(?:-|\.|x|w|wolne|u|urlop|\?)$/i.test(value);
     }
 
-    function openList() {
-      list.hidden = false;
-      input.setAttribute("aria-expanded", "true");
-      toggle?.setAttribute("aria-expanded", "true");
+    function isOpen() {
+      return Boolean(sheet) && !sheet.hidden;
     }
 
-    function closeList() {
-      list.hidden = true;
-      input.setAttribute("aria-expanded", "false");
-      toggle?.setAttribute("aria-expanded", "false");
-      options.forEach((opt) => opt.classList.remove("is-highlighted"));
-      highlightIndex = -1;
+    function bottomMenuOffset() {
+      const tabBar = document.querySelector(".tabs");
+      if (tabBar) {
+        const rect = tabBar.getBoundingClientRect();
+        if (rect.height > 0 && rect.top < window.innerHeight) {
+          return Math.ceil(window.innerHeight - rect.top) + 8;
+        }
+      }
+      return 96;
     }
 
-    function showEmployee(employeeId) {
-      if (!employeeId) return;
-      cards.forEach((card) => {
-        const match = card.getAttribute("data-employee") === employeeId;
-        card.hidden = !match;
-        card.classList.toggle("is-active", match);
+    function placeSheet() {
+      if (!sheet || !filterInput) return;
+      const trigger = filterInput.getBoundingClientRect();
+      const width = Math.min(Math.max(trigger.width, 240), window.innerWidth - 16);
+      let left = trigger.left + (trigger.width - width) / 2;
+      if (left < 8) left = 8;
+      if (left + width > window.innerWidth - 8) {
+        left = Math.max(8, window.innerWidth - width - 8);
+      }
+      const top = trigger.bottom + 6;
+      const available = Math.max(160, window.innerHeight - top - bottomMenuOffset());
+      if (sheet.parentElement !== document.body) {
+        document.body.appendChild(sheet);
+      }
+      sheet.classList.add("is-ported");
+      sheet.style.top = `${top}px`;
+      sheet.style.left = `${left}px`;
+      sheet.style.right = "auto";
+      sheet.style.width = `${width}px`;
+      sheet.style.maxHeight = `${available}px`;
+      sheet.style.height = `${available}px`;
+    }
+
+    function restoreSheet() {
+      if (!sheet) return;
+      sheet.classList.remove("is-ported");
+      sheet.style.top = "";
+      sheet.style.left = "";
+      sheet.style.right = "";
+      sheet.style.width = "";
+      sheet.style.maxHeight = "";
+      sheet.style.height = "";
+      if (sheet.parentElement !== combobox) {
+        combobox.appendChild(sheet);
+      }
+    }
+
+    function openPicker() {
+      if (!sheet) return;
+      sheet.hidden = false;
+      filterInput?.setAttribute("aria-expanded", "true");
+      placeSheet();
+      filterOptions();
+    }
+
+    function closePicker({ clearQuery = true } = {}) {
+      if (placeRaf) {
+        cancelAnimationFrame(placeRaf);
+        placeRaf = 0;
+      }
+      if (sheet) {
+        sheet.hidden = true;
+        restoreSheet();
+      }
+      filterInput?.setAttribute("aria-expanded", "false");
+      if (clearQuery && filterInput) {
+        filterInput.value = selectedDisplayName;
+      }
+      options().forEach((opt) => {
+        opt.hidden = false;
       });
-      options.forEach((opt) => {
-        const selected = opt.getAttribute("data-employee") === employeeId;
-        opt.setAttribute("aria-selected", selected ? "true" : "false");
-        if (selected) input.value = opt.textContent.trim();
-      });
-      closeList();
     }
 
     function filterOptions() {
-      const query = normalizeSearch(input.value);
-      options.forEach((opt) => {
+      const query = normalizeSearch(filterInput?.value || "");
+      const selectedNorm = normalizeSearch(selectedDisplayName);
+      const effectiveQuery = query && query !== selectedNorm ? query : "";
+      options().forEach((opt) => {
         const hay = opt.getAttribute("data-search") || normalizeSearch(opt.textContent);
-        opt.hidden = Boolean(query) && !hay.includes(query);
-        opt.classList.remove("is-highlighted");
+        opt.hidden = Boolean(effectiveQuery) && !hay.includes(effectiveQuery);
       });
-      highlightIndex = -1;
     }
 
-    function selectHighlighted() {
-      const visible = visibleOptions();
-      if (highlightIndex < 0 || highlightIndex >= visible.length) return false;
-      showEmployee(visible[highlightIndex].getAttribute("data-employee"));
-      return true;
+    function paintCalendar(employeeId) {
+      const filtered = Boolean(employeeId);
+      section.classList.toggle("is-emp-filtered", filtered);
+      picker.classList.toggle("is-assigned", filtered);
+
+      dayButtons.forEach((day) => {
+        const iso = day.getAttribute("data-date") || "";
+        const countEl = day.querySelector(".cal-day-count");
+        const peopleCount = Number(day.getAttribute("data-people-count") || "0");
+        day.classList.remove("is-emp-work");
+
+        if (!filtered) {
+          day.classList.toggle("has-shifts", peopleCount > 0);
+          if (countEl) {
+            if (peopleCount > 0) {
+              countEl.hidden = false;
+              countEl.textContent = String(peopleCount);
+            } else {
+              countEl.hidden = true;
+              countEl.textContent = "";
+            }
+          }
+          return;
+        }
+
+        day.classList.remove("has-shifts");
+        const cell = (shiftsByDate[iso] || {})[employeeId] || {};
+        const shift = String(cell.shift || "").trim();
+        const works = isWorkShift(shift);
+        day.classList.toggle("is-emp-work", works);
+        if (countEl) {
+          if (works) {
+            countEl.hidden = false;
+            countEl.textContent = shift;
+          } else {
+            countEl.hidden = true;
+            countEl.textContent = "";
+          }
+        }
+      });
+
+      if (legend) {
+        legend.textContent = filtered
+          ? "Niebieskie dni — przedział godzin pracy wybranej osoby"
+          : "Cyfra pod dniem — liczba osób na zmianie";
+      }
     }
 
-    input.addEventListener("input", () => {
-      filterOptions();
-      openList();
-    });
-    input.addEventListener("focus", () => {
-      filterOptions();
-      openList();
-    });
-    input.addEventListener("keydown", (event) => {
-      const visible = visibleOptions();
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        if (list.hidden) openList();
-        highlightIndex = Math.min(highlightIndex + 1, Math.max(visible.length - 1, 0));
-        visible.forEach((opt, idx) => opt.classList.toggle("is-highlighted", idx === highlightIndex));
-      } else if (event.key === "ArrowUp") {
-        event.preventDefault();
-        highlightIndex = Math.max(highlightIndex - 1, 0);
-        visible.forEach((opt, idx) => opt.classList.toggle("is-highlighted", idx === highlightIndex));
-      } else if (event.key === "Enter") {
-        if (!list.hidden && selectHighlighted()) event.preventDefault();
-      } else if (event.key === "Escape") {
-        closeList();
+    function clearSelection() {
+      selectedEmployee = "";
+      selectedDisplayName = "";
+      options().forEach((opt) => {
+        opt.classList.remove("is-selected");
+        opt.setAttribute("aria-selected", "false");
+      });
+      if (filterInput) filterInput.value = "";
+      paintCalendar("");
+    }
+
+    function selectEmployee(employeeId, option) {
+      if (!employeeId || !option) {
+        clearSelection();
+        closePicker({ clearQuery: false });
+        return;
+      }
+
+      selectedEmployee = employeeId;
+      selectedDisplayName = option.getAttribute("data-display-name") || option.textContent.trim();
+      options().forEach((opt) => {
+        const match = opt.getAttribute("data-employee") === selectedEmployee;
+        opt.classList.toggle("is-selected", match);
+        opt.setAttribute("aria-selected", match ? "true" : "false");
+      });
+      if (filterInput) filterInput.value = selectedDisplayName;
+      paintCalendar(selectedEmployee);
+      closePicker({ clearQuery: false });
+    }
+
+    filterInput?.addEventListener("focus", () => {
+      openPicker();
+      if (selectedDisplayName && filterInput.value === selectedDisplayName) {
+        filterInput.select();
       }
     });
-
-    toggle?.addEventListener("click", () => {
-      if (list.hidden) {
-        filterOptions();
-        openList();
-        input.focus();
-      } else {
-        closeList();
-      }
+    filterInput?.addEventListener("click", () => {
+      openPicker();
     });
-
-    list.addEventListener("click", (event) => {
-      const opt = event.target.closest(".grafiki-emp-option");
-      if (!opt || opt.hidden) return;
-      showEmployee(opt.getAttribute("data-employee"));
+    filterInput?.addEventListener("input", () => {
+      if (!normalizeSearch(filterInput.value) && selectedEmployee) {
+        clearSelection();
+      }
+      openPicker();
+      filterOptions();
+    });
+    filterInput?.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closePicker();
+        filterInput.blur();
+      }
     });
 
     document.addEventListener("click", (event) => {
-      if (!section.contains(event.target)) closeList();
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const opt = target.closest("[data-month-emp-sheet] [data-staff-option][data-employee]");
+      if (opt && sheet && sheet.contains(opt) && !opt.hidden) {
+        event.preventDefault();
+        selectEmployee(opt.getAttribute("data-employee") || "", opt);
+        return;
+      }
+      if (!isOpen()) return;
+      if (picker.contains(target) || (sheet && sheet.contains(target))) return;
+      closePicker();
     });
 
-    const activeCard = section.querySelector(".grafiki-emp-card.is-active");
-    if (activeCard) {
-      const activeId = activeCard.getAttribute("data-employee");
-      const activeOpt = options.find((opt) => opt.getAttribute("data-employee") === activeId);
-      if (activeOpt) input.value = activeOpt.textContent.trim();
-    }
+    window.addEventListener("resize", () => {
+      if (!isOpen()) return;
+      placeSheet();
+    }, { passive: true });
+    window.addEventListener("scroll", () => {
+      if (!isOpen()) return;
+      if (placeRaf) cancelAnimationFrame(placeRaf);
+      placeRaf = requestAnimationFrame(() => {
+        placeRaf = 0;
+        placeSheet();
+      });
+    }, { passive: true, capture: true });
   }
 
   function initPanel() {
@@ -14542,7 +15234,7 @@ def grafik4600_script() -> str:
       table.querySelectorAll("[data-date]").forEach((node) => {
         node.classList.toggle("is-selected-day", node.getAttribute("data-date") === iso);
       });
-      document.querySelectorAll(".grafiki-mobile-cal-day, .grafiki-emp-shift").forEach((node) => {
+      document.querySelectorAll(".grafiki-mobile-cal-day").forEach((node) => {
         node.classList.toggle("is-selected-day", node.getAttribute("data-date") === iso);
       });
       const selectedCalDay = document.querySelector(`.grafiki-mobile-cal-day[data-date="${iso}"]`);
@@ -14830,6 +15522,526 @@ def render_schedules_page(
     )
 
 
+def render_inventory_page(day: str = "today", message: str = "") -> bytes:
+    day = normalize_day(day)
+    today = current_app_date()
+    inventory.auto_issue_due_lines(today=today, role="system")
+    home_href = hub_home_href(day)
+    day_q = day_query(selected_day(day))
+    items = inventory.list_inventory_items()
+    shopping = inventory.list_shopping_lines()
+    issues = inventory.list_upcoming_lines(today=today, days=21)
+    due = inventory.list_issue_lines(today=today)
+
+    # Merge upcoming + due unique by line id, prefer due list for status display.
+    seen: set[int] = set()
+    issue_rows: list[DbRow] = []
+    for row in due + issues:
+        line_id = int(row["id"])
+        if line_id in seen:
+            continue
+        seen.add(line_id)
+        issue_rows.append(row)
+
+    item_cards = []
+    for item in items:
+        category = INVENTORY_CATEGORY_LABELS.get(str(item.get("category")), item.get("category"))
+        description = str(item.get("description") or "").strip()
+        ean = str(item.get("ean") or "").strip()
+        desc_html = f'<p class="inventory-card__meta">{escape(description)}</p>' if description else ""
+        ean_html = f'<p class="inventory-card__ean">EAN {escape(ean)}</p>' if ean else ""
+        item_cards.append(
+            f"""
+<article class="inventory-card">
+  <div class="inventory-card__head">
+    <span class="inventory-card__kicker">{escape(category)}</span>
+    <span class="inventory-card__qty" title="Wolne sztuki">{escape(item.get("qty_available", 0))}</span>
+  </div>
+  <h3 class="inventory-card__title">{escape(item.get("name"))}</h3>
+  {desc_html}
+  {ean_html}
+</article>
+"""
+        )
+    items_markup = (
+        f'<div class="inventory-list">{"".join(item_cards)}</div>'
+        if item_cards
+        else '<p class="inventory-empty">Brak pozycji w katalogu. Dodaj stan poniżej.</p>'
+    )
+
+    shop_cards = []
+    for line in shopping:
+        start = format_date(line.get("reservation_start_at"))
+        child = line.get("birthday_child_name") or "—"
+        reservation_id = int(line["reservation_id"])
+        line_id = int(line["id"])
+        purchased = int(line.get("purchased") or 0)
+        action_value = "0" if purchased else "1"
+        action_label = "Cofnij zakup" if purchased else "Zakupiono"
+        status_class = "is-bought" if purchased else "is-todo"
+        status_label = "Zakupione" if purchased else "Do zamówienia"
+        category = INVENTORY_CATEGORY_LABELS.get(str(line.get("category")), line.get("category"))
+        description = str(line.get("description") or "").strip()
+        meta_bits = [str(category), f"× {line.get('qty_to_order')}"]
+        if description:
+            meta_bits.append(description)
+        shop_cards.append(
+            f"""
+<article class="inventory-card">
+  <div class="inventory-card__head">
+    <span class="inventory-card__kicker">{escape(start)} · {escape(child)}</span>
+    <span class="inventory-status {status_class}">{status_label}</span>
+  </div>
+  <h3 class="inventory-card__title">{escape(line.get("name"))}</h3>
+  <p class="inventory-card__meta">{escape(" · ".join(meta_bits))}</p>
+  <div class="inventory-actions">
+    <form method="post" action="/inventory/purchase?day={escape(day_q)}">
+      <input type="hidden" name="line_id" value="{line_id}">
+      <input type="hidden" name="purchased" value="{action_value}">
+      <button type="submit" class="{'button secondary' if purchased else ''}">{action_label}</button>
+    </form>
+    <a class="button secondary" href="{escape(link_for('organizer', day, edit=reservation_id))}">Bankiet</a>
+  </div>
+</article>
+"""
+        )
+    shopping_markup = (
+        f'<div class="inventory-list">{"".join(shop_cards)}</div>'
+        if shop_cards
+        else '<p class="inventory-empty">Lista zakupów jest pusta.</p>'
+    )
+
+    issue_cards = []
+    for line in issue_rows:
+        start = format_date(line.get("reservation_start_at"))
+        child = line.get("birthday_child_name") or "—"
+        reservation_id = int(line["reservation_id"])
+        line_id = int(line["id"])
+        issued = int(line.get("issued") or 0)
+        status_class = "is-issued" if issued else "is-open"
+        status_label = "Wydano" if issued else "Do wydania"
+        action_value = "0" if issued else "1"
+        action_label = "Cofnij wydanie" if issued else "Wydaj"
+        category = INVENTORY_CATEGORY_LABELS.get(str(line.get("category")), line.get("category"))
+        description = str(line.get("description") or "").strip()
+        meta_bits = [str(category), f"× {line.get('qty')}"]
+        if description:
+            meta_bits.append(description)
+        if int(line.get("qty_to_order") or 0) > 0:
+            meta_bits.append("zakupione" if int(line.get("purchased") or 0) else "czekamy na zakup")
+        issue_cards.append(
+            f"""
+<article class="inventory-card">
+  <div class="inventory-card__head">
+    <span class="inventory-card__kicker">{escape(start)} · {escape(child)}</span>
+    <span class="inventory-status {status_class}">{status_label}</span>
+  </div>
+  <h3 class="inventory-card__title">{escape(line.get("name"))}</h3>
+  <p class="inventory-card__meta">{escape(" · ".join(meta_bits))}</p>
+  <div class="inventory-actions">
+    <form method="post" action="/inventory/issue?day={escape(day_q)}">
+      <input type="hidden" name="line_id" value="{line_id}">
+      <input type="hidden" name="issued" value="{action_value}">
+      <button type="submit" class="{'button secondary' if issued else ''}">{action_label}</button>
+    </form>
+    <a class="button secondary" href="{escape(link_for('organizer', day, edit=reservation_id))}">Bankiet</a>
+  </div>
+</article>
+"""
+        )
+    issues_markup = (
+        f'<div class="inventory-list">{"".join(issue_cards)}</div>'
+        if issue_cards
+        else '<p class="inventory-empty">Brak wydań w najbliższych dniach.</p>'
+    )
+
+    items_count = len(items)
+    shopping_count = len(shopping)
+    issues_count = len(issue_rows)
+    items_count_label = f"{items_count} pozycji" if items_count != 1 else "1 pozycja"
+    shopping_count_label = f"{shopping_count} pozycji" if shopping_count != 1 else "1 pozycja"
+    issues_count_label = f"{issues_count} pozycji" if issues_count != 1 else "1 pozycja"
+
+    add_form = f"""
+<div class="inventory-add-block" id="inventory-add">
+  <p class="inventory-add-block__title">Dodaj / dolicz stan</p>
+  <div class="inventory-scan-row">
+    <button type="button" class="button" id="inventory-scan-start">Skanuj kod kreskowy</button>
+  </div>
+  <p class="inventory-scan-status" id="inventory-scan-status" aria-live="polite"></p>
+  <div class="inventory-new-ean" id="inventory-new-ean" hidden>
+    <p class="inventory-new-ean__title">Nowy produkt — podaj nazwę</p>
+    <form class="inventory-add-form" method="post" action="/inventory/item?day={escape(day_q)}" id="inventory-new-ean-form">
+      <input type="hidden" name="ean" id="inventory-new-ean-code" value="">
+      <label>
+        Kategoria
+        <select name="category" required>{render_inventory_category_options()}</select>
+      </label>
+      <label>
+        Nazwa
+        <input type="text" name="name" maxlength="120" required placeholder="Nazwa produktu" autocomplete="off">
+      </label>
+      <label>
+        Ilość
+        <input type="number" name="qty" min="1" max="500" value="1" required inputmode="numeric">
+      </label>
+      <label class="full">
+        Opis
+        <input type="text" name="description" maxlength="300" placeholder="Opcjonalny opis" autocomplete="off">
+      </label>
+      <p class="inventory-card__ean full" id="inventory-new-ean-label"></p>
+      <div class="inventory-scan-row full">
+        <button type="submit" class="inventory-add-submit">Utwórz i dodaj</button>
+        <button type="button" class="button secondary" id="inventory-new-ean-cancel">Anuluj</button>
+      </div>
+    </form>
+  </div>
+  <form class="inventory-add-form" method="post" action="/inventory/item?day={escape(day_q)}" id="inventory-manual-form">
+    <label>
+      Kategoria
+      <select name="category" required>{render_inventory_category_options()}</select>
+    </label>
+    <label>
+      Nazwa
+      <input type="text" name="name" maxlength="120" required placeholder="np. Balony podstawowe" autocomplete="off">
+    </label>
+    <label>
+      Ilość
+      <input type="number" name="qty" min="1" max="500" value="1" required inputmode="numeric">
+    </label>
+    <label class="full">
+      Kod EAN / kreskowy
+      <input type="text" name="ean" maxlength="32" inputmode="numeric" pattern="[0-9]*" placeholder="Opcjonalnie — skan lub wpis" autocomplete="off">
+    </label>
+    <label class="full">
+      Opis
+      <input type="text" name="description" maxlength="300" placeholder="Opcjonalny opis" autocomplete="off">
+    </label>
+    <button type="submit" class="inventory-add-submit">Dodaj / dolicz stan</button>
+  </form>
+</div>
+<div class="inventory-scan-overlay" id="inventory-scan-overlay" hidden aria-hidden="true">
+  <div class="inventory-scan-overlay__head">
+    <h3>Skanuj produkt</h3>
+    <button type="button" class="button secondary" id="inventory-scan-close">Zamknij</button>
+  </div>
+  <div class="inventory-scan-overlay__body">
+    <div id="inventory-scan-reader"></div>
+  </div>
+  <p class="inventory-scan-overlay__hint">Skieruj kamerę na kod kreskowy. Znany kod doliczy stan; nowy poprosi o nazwę.</p>
+</div>
+"""
+
+    content = f"""
+<div class="toolbar">{render_date_toolbar("home", day, hub="inwentura")}</div>
+<div class="inventory-page">
+  <section class="role-board inventory-board inventory-board--intro">
+    <div class="section-head">
+      <div>
+        <h2>Inwentura</h2>
+        <p class="subtitle">Stan magazynu, lista zakupów i wydania na bankiety.</p>
+      </div>
+      <a class="button secondary" href="{escape(home_href)}">← Strona główna</a>
+    </div>
+    <nav class="inventory-jump" aria-label="Sekcje inwentury">
+      <a href="#inventory-stock">Stan</a>
+      <a href="#inventory-shopping">Zakupy{f' ({shopping_count})' if shopping_count else ''}</a>
+      <a href="#inventory-issues">Wydania{f' ({issues_count})' if issues_count else ''}</a>
+    </nav>
+  </section>
+
+  <section class="role-board inventory-board" id="inventory-stock">
+    <div class="section-head">
+      <div>
+        <h2>Stan magazynu</h2>
+        <p class="subtitle">Wolne sztuki dostępne do rezerwacji na bankiety. Skanuj EAN telefonem, by dodać stan.</p>
+      </div>
+      <span class="count">{escape(items_count_label)}</span>
+    </div>
+    <div class="inventory-body">
+      {items_markup}
+      {add_form}
+    </div>
+  </section>
+
+  <section class="role-board inventory-board" id="inventory-shopping">
+    <div class="section-head">
+      <div>
+        <h2>Lista zakupów</h2>
+        <p class="subtitle">Pozycje brakujące w stanie — oznacz ręcznie jako zakupione.</p>
+      </div>
+      <span class="count">{escape(shopping_count_label)}</span>
+    </div>
+    <div class="inventory-body">
+      {shopping_markup}
+    </div>
+  </section>
+
+  <section class="role-board inventory-board" id="inventory-issues">
+    <div class="section-head">
+      <div>
+        <h2>Wydania</h2>
+        <p class="subtitle">W dniu bankietu pozycje oznaczają się automatycznie jako wydane. Możesz cofnąć status ręcznie.</p>
+      </div>
+      <span class="count">{escape(issues_count_label)}</span>
+    </div>
+    <div class="inventory-body">
+      {issues_markup}
+    </div>
+  </section>
+</div>
+{inventory_scan_script()}
+"""
+    return page_template(
+        content,
+        message=message,
+        role="home",
+        day=day,
+        page_class="page-inventory",
+        logo_href=home_href,
+        hub="inwentura",
+    )
+
+
+def inventory_scan_script() -> str:
+    return """
+<script>
+(() => {
+  const startBtn = document.getElementById("inventory-scan-start");
+  const closeBtn = document.getElementById("inventory-scan-close");
+  const overlay = document.getElementById("inventory-scan-overlay");
+  const reader = document.getElementById("inventory-scan-reader");
+  const statusEl = document.getElementById("inventory-scan-status");
+  const newBlock = document.getElementById("inventory-new-ean");
+  const newCode = document.getElementById("inventory-new-ean-code");
+  const newLabel = document.getElementById("inventory-new-ean-label");
+  const newCancel = document.getElementById("inventory-new-ean-cancel");
+  if (!startBtn || !overlay || !reader) return;
+
+  let html5QrCode = null;
+  let detector = null;
+  let videoEl = null;
+  let stream = null;
+  let rafId = 0;
+  let busy = false;
+  let lastCode = "";
+  let lastAt = 0;
+
+  function setStatus(text, kind) {
+    if (!statusEl) return;
+    statusEl.textContent = text || "";
+    statusEl.classList.toggle("is-ok", kind === "ok");
+    statusEl.classList.toggle("is-error", kind === "error");
+  }
+
+  function showNewProduct(ean) {
+    if (!newBlock || !newCode || !newLabel) return;
+    newBlock.hidden = false;
+    newBlock.classList.add("is-open");
+    newCode.value = ean;
+    newLabel.textContent = "EAN " + ean;
+    const nameInput = newBlock.querySelector('input[name="name"]');
+    if (nameInput) {
+      nameInput.focus();
+    }
+  }
+
+  function hideNewProduct() {
+    if (!newBlock) return;
+    newBlock.hidden = true;
+    newBlock.classList.remove("is-open");
+    if (newCode) newCode.value = "";
+    if (newLabel) newLabel.textContent = "";
+  }
+
+  async function postScan(ean) {
+    const body = new URLSearchParams();
+    body.set("ean", ean);
+    body.set("qty", "1");
+    const response = await fetch("/inventory/scan", {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "X-Requested-With": "ikids-assign",
+      },
+      body,
+    });
+    return response.json();
+  }
+
+  async function handleCode(raw) {
+    const digits = String(raw || "").replace(/\\D/g, "");
+    if (digits.length < 8 || digits.length > 14) return;
+    const now = Date.now();
+    if (digits === lastCode && now - lastAt < 1800) return;
+    if (busy) return;
+    busy = true;
+    lastCode = digits;
+    lastAt = now;
+    try {
+      const data = await postScan(digits);
+      if (!data || !data.ok) {
+        setStatus((data && data.message) || "Błąd skanu.", "error");
+        return;
+      }
+      if (data.status === "increased") {
+        const name = (data.item && data.item.name) || "produkt";
+        const qty = data.item && data.item.qty_available;
+        setStatus("Dodano +1: " + name + (qty != null ? " (stan: " + qty + ")" : ""), "ok");
+        window.setTimeout(() => { window.location.reload(); }, 700);
+        return;
+      }
+      if (data.status === "unknown") {
+        await stopScanner();
+        setStatus("Nowy kod — podaj nazwę produktu.", "error");
+        showNewProduct(data.ean || digits);
+        return;
+      }
+      setStatus((data && data.message) || "Nie udało się zeskanować.", "error");
+    } catch (err) {
+      setStatus("Brak połączenia ze skanerem.", "error");
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function stopNative() {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      stream = null;
+    }
+    if (videoEl) {
+      videoEl.remove();
+      videoEl = null;
+    }
+    detector = null;
+  }
+
+  async function stopHtml5() {
+    if (!html5QrCode) return;
+    try {
+      if (html5QrCode.isScanning) await html5QrCode.stop();
+    } catch (_) {}
+    try {
+      await html5QrCode.clear();
+    } catch (_) {}
+    html5QrCode = null;
+  }
+
+  async function stopScanner() {
+    await stopNative();
+    await stopHtml5();
+    overlay.classList.remove("is-open");
+    overlay.hidden = true;
+    overlay.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = "";
+  }
+
+  async function loadHtml5Qrcode() {
+    if (window.Html5Qrcode) return true;
+    await new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js";
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("html5-qrcode"));
+      document.head.appendChild(script);
+    });
+    return Boolean(window.Html5Qrcode);
+  }
+
+  async function startNative() {
+    if (!("BarcodeDetector" in window) || !navigator.mediaDevices?.getUserMedia) {
+      return false;
+    }
+    const formats = [
+      "ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "qr_code",
+    ];
+    try {
+      detector = new window.BarcodeDetector({ formats });
+    } catch (_) {
+      try {
+        detector = new window.BarcodeDetector();
+      } catch (_) {
+        return false;
+      }
+    }
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: "environment" } },
+    });
+    videoEl = document.createElement("video");
+    videoEl.setAttribute("playsinline", "true");
+    videoEl.muted = true;
+    videoEl.autoplay = true;
+    videoEl.srcObject = stream;
+    reader.replaceChildren(videoEl);
+    await videoEl.play();
+
+    const tick = async () => {
+      if (!detector || !videoEl) return;
+      try {
+        if (videoEl.readyState >= 2) {
+          const codes = await detector.detect(videoEl);
+          if (codes && codes.length) {
+            const value = codes[0].rawValue || "";
+            if (value) await handleCode(value);
+          }
+        }
+      } catch (_) {}
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return true;
+  }
+
+  async function startHtml5() {
+    await loadHtml5Qrcode();
+    reader.replaceChildren();
+    html5QrCode = new window.Html5Qrcode("inventory-scan-reader");
+    await html5QrCode.start(
+      { facingMode: "environment" },
+      { fps: 10, qrbox: { width: 260, height: 140 }, aspectRatio: 1.777 },
+      (decoded) => { handleCode(decoded); },
+      () => {}
+    );
+    return true;
+  }
+
+  async function startScanner() {
+    hideNewProduct();
+    setStatus("Uruchamianie kamery…");
+    overlay.hidden = false;
+    overlay.classList.add("is-open");
+    overlay.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+    reader.replaceChildren();
+    try {
+      const okNative = await startNative();
+      if (!okNative) await startHtml5();
+      setStatus("Celuj w kod kreskowy.");
+    } catch (err) {
+      await stopScanner();
+      setStatus("Brak dostępu do kamery (wymagane HTTPS / uprawnienia).", "error");
+    }
+  }
+
+  startBtn.addEventListener("click", () => { startScanner(); });
+  if (closeBtn) closeBtn.addEventListener("click", () => { stopScanner(); });
+  if (newCancel) newCancel.addEventListener("click", () => { hideNewProduct(); setStatus(""); });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopScanner();
+  });
+})();
+</script>
+"""
+
+
 def render_schema_summary() -> str:
     fields = [
         "reservations.id",
@@ -14852,6 +16064,7 @@ def render_schema_summary() -> str:
         "status / cancellation_reason",
         "created_at / updated_at",
         "reservation_history z pełnym snapshotem JSON",
+        "inventory_items / inventory_lines / inventory_movements",
     ]
     return f"""
 <section>
@@ -14947,7 +16160,8 @@ def render_home(
 
 
 def room_plan_script() -> str:
-    return """
+    catalog_options = render_inventory_catalog_options().replace("\\", "\\\\").replace("`", "\\`")
+    script = """
 <script>
 (() => {
   const form = document.getElementById("reservation-form");
@@ -15666,6 +16880,81 @@ def room_plan_script() -> str:
     bindBirthdayChildren();
   }
 
+  const inventoryList = document.getElementById("inventory-lines-list");
+  const addInventoryBtn = document.getElementById("add-inventory-line");
+  const inventoryCatalogOptions = `INVENTORY_CATALOG_OPTIONS`;
+
+  function bindInventoryRow(row) {
+    const categorySelect = row.querySelector(".inventory-category");
+    const itemSelect = row.querySelector(".inventory-item-id");
+    const nameInput = row.querySelector(".inventory-name");
+    const descriptionInput = row.querySelector(".inventory-description");
+    const removeBtn = row.querySelector(".remove-inventory-line");
+    itemSelect?.addEventListener("change", () => {
+      const option = itemSelect.selectedOptions[0];
+      if (!option || !option.value) return;
+      if (categorySelect && option.dataset.category) categorySelect.value = option.dataset.category;
+      if (nameInput && option.dataset.name) nameInput.value = option.dataset.name;
+      if (descriptionInput && option.dataset.description && !descriptionInput.value) {
+        descriptionInput.value = option.dataset.description;
+      }
+    });
+    categorySelect?.addEventListener("change", () => {
+      if (!itemSelect) return;
+      const selectedId = itemSelect.value;
+      Array.from(itemSelect.options).forEach((option) => {
+        if (!option.value) return;
+        const match = !categorySelect.value || option.dataset.category === categorySelect.value;
+        option.hidden = !match;
+        if (!match && option.value === selectedId) itemSelect.value = "";
+      });
+    });
+    categorySelect?.dispatchEvent(new Event("change"));
+    removeBtn?.addEventListener("click", () => row.remove());
+  }
+
+  function bindInventoryLines() {
+    inventoryList?.querySelectorAll(".inventory-line-row").forEach((row) => bindInventoryRow(row));
+  }
+
+  if (addInventoryBtn && inventoryList) {
+    addInventoryBtn.addEventListener("click", () => {
+      const row = document.createElement("div");
+      row.className = "inventory-line-row";
+      row.innerHTML = `
+        <label>
+          Kategoria
+          <select name="inventory_category" class="inventory-category">
+            <option value="">Kategoria</option>
+            <option value="pinata">Piniata</option>
+            <option value="balloons">Balony</option>
+            <option value="themed_set">Zestaw tematyczny</option>
+          </select>
+        </label>
+        <label>
+          Katalog
+          <select name="inventory_item_id" class="inventory-item-id">${inventoryCatalogOptions}</select>
+        </label>
+        <label>
+          Nazwa
+          <input type="text" name="inventory_name" class="inventory-name" maxlength="120" placeholder="np. Piniata Jednorożec">
+        </label>
+        <label>
+          Ilość
+          <input type="number" name="inventory_qty" class="inventory-qty" min="1" max="500" value="1" placeholder="1">
+        </label>
+        <label class="full">
+          Opis
+          <input type="text" name="inventory_description" class="inventory-description" maxlength="300" placeholder="Jak ma wyglądać zestaw / motyw">
+        </label>
+        <button type="button" class="button secondary remove-inventory-line" aria-label="Usuń pozycję">Usuń</button>
+      `;
+      inventoryList.appendChild(row);
+      bindInventoryRow(row);
+    });
+    bindInventoryLines();
+  }
+
   if (addAnimationBtn && animationList) {
     addAnimationBtn.addEventListener("click", () => {
       const duration = animationList.dataset.animationDuration || "60";
@@ -15837,6 +17126,7 @@ def room_plan_script() -> str:
   }
 </style>
 """
+    return script.replace("INVENTORY_CATALOG_OPTIONS", catalog_options)
 
 
 def render_schema_page(role: str = "manager", day: str = "today") -> bytes:
@@ -15981,7 +17271,19 @@ def parse_post(handler: BaseHTTPRequestHandler) -> dict[str, object]:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length).decode("utf-8")
     parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values if key in {"adult_location", "birthday_child_name", "birthday_child_age", "animation_type", "animation_at"} else values[-1] for key, values in parsed.items()}
+    multi_keys = {
+        "adult_location",
+        "birthday_child_name",
+        "birthday_child_age",
+        "animation_type",
+        "animation_at",
+        "inventory_category",
+        "inventory_item_id",
+        "inventory_name",
+        "inventory_qty",
+        "inventory_description",
+    }
+    return {key: values if key in multi_keys else values[-1] for key, values in parsed.items()}
 
 
 def wants_json(handler: BaseHTTPRequestHandler) -> bool:
@@ -16079,6 +17381,9 @@ class ReservationHandler(BaseHTTPRequestHandler):
             hub = normalize_hub(query.get("hub", [""])[0])
             if hub == "grafiki":
                 self.redirect(default_grafiki_href(day, role=role))
+                return
+            if hub == "inwentura":
+                self.redirect(default_inwentura_href(day))
                 return
             if hub == "urodziny" and role == "home":
                 self.redirect(hub_home_href(day))
@@ -16199,6 +17504,11 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.send_bytes(render_schedules_page(role=role, day=day, query=query, navigation=navigation))
             return
 
+        if parsed.path == "/inwentura":
+            message = query.get("message", [""])[0]
+            self.send_bytes(render_inventory_page(day=day, message=message))
+            return
+
         if parsed.path == "/api/shift-report":
             iso_date = query.get("date", [""])[0]
             try:
@@ -16308,7 +17618,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed.path in {"/", "/export", "/schema", "/grafiki", "/api/availability", "/offline"}:
+        if parsed.path in {"/", "/export", "/schema", "/grafiki", "/inwentura", "/api/availability", "/offline"}:
             self.send_response(HTTPStatus.OK)
             self.send_header(
                 "Content-Type",
@@ -16468,6 +17778,140 @@ class ReservationHandler(BaseHTTPRequestHandler):
                 respond_animator(message, ok=True, reservation_id=reservation_id, slot=slot)
             else:
                 respond_animator("Nie udało się zaktualizować animatora.", ok=False, slot=slot)
+            return
+
+        if parsed.path == "/inventory/scan":
+            as_json = wants_json(self)
+
+            def respond_scan(payload: dict[str, object], *, ok: bool = True) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                if as_json:
+                    self.send_bytes(
+                        body,
+                        status=HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST,
+                        content_type="application/json; charset=utf-8",
+                        extra_headers={"Cache-Control": "no-store"},
+                    )
+                    return
+                message = str(payload.get("message") or "")
+                self.redirect(
+                    "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message})
+                )
+
+            if not can_manage_inventory(work_role):
+                respond_scan({"ok": False, "message": "Brak uprawnień do inwentury."}, ok=False)
+                return
+            ean = str(data.get("ean", "") or "")
+            try:
+                qty = int(str(data.get("qty", "1") or "1"))
+            except ValueError:
+                qty = 1
+            result = inventory.scan_ean_add(ean, qty=qty, role=work_role)
+            status = str(result.get("status") or "")
+            if status == "increased":
+                item = result.get("item") if isinstance(result.get("item"), dict) else {}
+                name = str(item.get("name") or "produkt")
+                qty_available = item.get("qty_available")
+                message = f"Dodano +{result.get('qty_added', qty)}: {name}"
+                if qty_available is not None:
+                    message += f" (stan: {qty_available})"
+                respond_scan(
+                    {
+                        "ok": True,
+                        "status": "increased",
+                        "message": message,
+                        "item": item,
+                        "ean": result.get("ean"),
+                        "qty_added": result.get("qty_added", qty),
+                    }
+                )
+                return
+            if status == "unknown":
+                respond_scan(
+                    {
+                        "ok": True,
+                        "status": "unknown",
+                        "ean": result.get("ean"),
+                        "message": "Nowy kod — podaj nazwę produktu.",
+                    }
+                )
+                return
+            respond_scan(
+                {"ok": False, "status": "error", "message": str(result.get("message") or "Błąd skanu.")},
+                ok=False,
+            )
+            return
+
+        if parsed.path == "/inventory/item":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            category = str(data.get("category", "") or "")
+            name = str(data.get("name", "") or "")
+            description = str(data.get("description", "") or "")
+            ean = str(data.get("ean", "") or "")
+            try:
+                qty = int(str(data.get("qty", "0") or "0"))
+            except ValueError:
+                qty = 0
+            item_id = inventory.add_or_increase_item(
+                category=category,
+                name=name,
+                qty=qty,
+                description=description,
+                ean=ean,
+                role=work_role,
+            )
+            if item_id is None:
+                self.redirect(
+                    "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": "Nie udało się dodać pozycji."})
+                )
+                return
+            message = "Stan magazynu zaktualizowany."
+            if inventory.normalize_ean(ean):
+                message = "Produkt zapisany z kodem EAN. Stan zaktualizowany."
+            self.redirect(
+                "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message})
+            )
+            return
+
+        if parsed.path == "/inventory/purchase":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            raw_id = str(data.get("line_id", "") or "")
+            purchased = str(data.get("purchased", "1") or "1") != "0"
+            if not raw_id.isdigit() or not inventory.set_line_purchased(int(raw_id), purchased, role=work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Nie udało się zaktualizować zakupu."})
+                )
+                return
+            message = "Oznaczono jako zakupione." if purchased else "Cofnięto status zakupu."
+            self.redirect("/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message}))
+            return
+
+        if parsed.path == "/inventory/issue":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            raw_id = str(data.get("line_id", "") or "")
+            issued = str(data.get("issued", "1") or "1") != "0"
+            if not raw_id.isdigit() or not inventory.set_line_issued(int(raw_id), issued, role=work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Nie udało się zaktualizować wydania."})
+                )
+                return
+            message = "Oznaczono jako wydane." if issued else "Cofnięto wydanie."
+            self.redirect("/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message}))
             return
 
         payload = json.dumps({"error": "Unsupported route"}, ensure_ascii=False).encode("utf-8")

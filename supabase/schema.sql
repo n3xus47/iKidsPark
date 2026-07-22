@@ -73,3 +73,52 @@ CREATE INDEX IF NOT EXISTS idx_reservations_child_location_time
     ON reservations(child_location, start_at, end_at);
 CREATE INDEX IF NOT EXISTS idx_reservation_history_reservation
     ON reservation_history(reservation_id, created_at);
+
+CREATE TABLE IF NOT EXISTS inventory_items (
+    id BIGSERIAL PRIMARY KEY,
+    category TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    ean TEXT NOT NULL DEFAULT '',
+    qty_available INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inventory_lines (
+    id BIGSERIAL PRIMARY KEY,
+    reservation_id BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    item_id BIGINT REFERENCES inventory_items(id) ON DELETE SET NULL,
+    category TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    qty INTEGER NOT NULL,
+    qty_reserved INTEGER NOT NULL DEFAULT 0,
+    qty_to_order INTEGER NOT NULL DEFAULT 0,
+    purchased INTEGER NOT NULL DEFAULT 0,
+    issued INTEGER NOT NULL DEFAULT 0,
+    cancelled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inventory_movements (
+    id BIGSERIAL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    item_id BIGINT,
+    line_id BIGINT,
+    qty INTEGER NOT NULL DEFAULT 0,
+    changed_by_role TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_items_category
+    ON inventory_items(category, name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_items_ean
+    ON inventory_items(ean) WHERE ean != '';
+CREATE INDEX IF NOT EXISTS idx_inventory_lines_reservation
+    ON inventory_lines(reservation_id, cancelled);
+CREATE INDEX IF NOT EXISTS idx_inventory_lines_shopping
+    ON inventory_lines(cancelled, purchased, qty_to_order);
+

@@ -70,6 +70,52 @@ CREATE TABLE reservation_history (
 );
 ```
 
+### `inventory_items`
+
+Katalog pozycji magazynowych (piniata, balony, zestawy tematyczne) z wolnym stanem.
+
+```sql
+CREATE TABLE inventory_items (
+  id BIGSERIAL PRIMARY KEY,
+  category TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  ean TEXT NOT NULL DEFAULT '',
+  qty_available INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+```
+
+Unikalny indeks częściowy: `ean` (gdy niepusty) — jeden produkt na kod kreskowy.
+
+### `inventory_lines`
+
+Pozycje przypisane do bankietu: rezerwacja ze stanu + ewentualna lista zakupów.
+
+```sql
+CREATE TABLE inventory_lines (
+  id BIGSERIAL PRIMARY KEY,
+  reservation_id BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+  item_id BIGINT REFERENCES inventory_items(id) ON DELETE SET NULL,
+  category TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  qty INT NOT NULL,
+  qty_reserved INT NOT NULL DEFAULT 0,
+  qty_to_order INT NOT NULL DEFAULT 0,
+  purchased INT NOT NULL DEFAULT 0,
+  issued INT NOT NULL DEFAULT 0,
+  cancelled INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+```
+
+### `inventory_movements`
+
+Append-only audyt ruchów (`manual_add`, `reserve`, `release`, `purchase`, `unpurchase`, `issue`, `unissue`).
+
 ## Indeksy i konflikt terminów
 
 Minimalny indeks dla szybkiego sprawdzania konfliktów:

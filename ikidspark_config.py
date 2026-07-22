@@ -99,6 +99,13 @@ CAKE_CANDLE_TYPES = ["cyfra", "zwykla", "wlasna"]
 CAKE_CANDLE_LABELS = {"cyfra": "cyfra", "zwykla": "zwyk\u0142a", "wlasna": "w\u0142asna"}
 MASCOT_TYPES = ["Lew", "Pan Królik", "Pani Królik", "Miś"]
 
+INVENTORY_CATEGORIES = ("pinata", "balloons", "themed_set")
+INVENTORY_CATEGORY_LABELS = {
+    "pinata": "Piniata",
+    "balloons": "Balony",
+    "themed_set": "Zestaw tematyczny",
+}
+
 # Interactive hotspots for the floor plan (asset canvas 1440 x 810; display crops empty margins).
 # Tuple: (number, center_x, center_y, width, height). Numbers 1-6 are party rooms.
 PLAN_HOTSPOTS = [

@@ -150,7 +150,7 @@ def cleanup_previous_test_data() -> None:
     removed = 0
     for row in rows:
         name = row["birthday_child_name"]
-        if "Testow" in name or "Testowy" in name or "Multi" in name or "Konflikt" in name:
+        if "Testow" in name or "Testowy" in name or "Multi" in name or "Konflikt" in name or "Inwentura" in name:
             main.delete_reservation(row["id"])
             removed += 1
     if removed:
@@ -172,6 +172,7 @@ def test_server_endpoints() -> None:
         ("/?role=animators&day=2026-07-18", "Widok animatorów"),
         ("/?role=kitchen&day=2026-07-19", "Widok kuchni"),
         ("/?role=manager&day=2026-07-17", "Widok kierownika"),
+        ("/inwentura", "Strona inwentury"),
         ("/schema", "Strona schematu DB"),
         ("/export", "Eksport CSV"),
         ("/api/availability?date=2026-07-17", "API dostępności"),
@@ -729,6 +730,171 @@ def test_csv_export() -> None:
         fail("Eksport CSV", str(exc))
 
 
+def test_inventory_flow() -> None:
+    section("14. Inwentura — stan, bankiet, zakup, wydanie")
+    inv = main.inventory
+
+    item_id = inv.add_or_increase_item(
+        category="balloons",
+        name="Balony Testowe Inwentura",
+        qty=5,
+        description="zestaw podstawowy",
+        role="organizer",
+    )
+    if not item_id:
+        fail("Dodanie pozycji katalogu")
+        return
+    item = inv.get_inventory_item(item_id)
+    if item and int(item["qty_available"]) == 5:
+        ok("Dodanie pozycji katalogu", "qty_available=5")
+    else:
+        fail("Dodanie pozycji katalogu", f"item={item}")
+
+    day = "2099-01-15"
+    data = base_reservation(
+        day,
+        "1. Biały Dom",
+        "Bar - Stolik 10",
+        "11:00",
+        "Inwentura Testowa",
+        "Rodzic Inwentura",
+    )
+    data["inventory_category"] = ["balloons", "themed_set"]
+    data["inventory_item_id"] = [str(item_id), ""]
+    data["inventory_name"] = ["Balony Testowe Inwentura", "Zestaw Piraci Test"]
+    data["inventory_qty"] = ["8", "2"]
+    data["inventory_description"] = ["mix kolorów", "piracki motyw"]
+    values, errors = main.validate_reservation(data)
+    if errors:
+        fail("Walidacja bankietu z inwenturą", str(errors))
+        return
+    ok("Walidacja bankietu z inwenturą")
+    reservation_id = main.save_reservation(values, role="organizer")
+    created_ids.append(reservation_id)
+    lines = inv.list_lines_for_reservation(reservation_id)
+    if len(lines) != 2:
+        fail("Linie inwentury po zapisie", f"count={len(lines)}")
+        return
+    balloons = next(line for line in lines if line["name"] == "Balony Testowe Inwentura")
+    themed = next(line for line in lines if "Piraci" in str(line["name"]))
+    if int(balloons["qty_reserved"]) == 5 and int(balloons["qty_to_order"]) == 3:
+        ok("Rezerwacja stanu + lista zakupów", "5 reserved / 3 to_order")
+    else:
+        fail(
+            "Rezerwacja stanu + lista zakupów",
+            f"reserved={balloons['qty_reserved']} to_order={balloons['qty_to_order']}",
+        )
+    if int(themed["qty_to_order"]) == 2 and int(themed["qty_reserved"]) == 0:
+        ok("Nowa pozycja tylko do zakupu", "2 to_order")
+    else:
+        fail("Nowa pozycja tylko do zakupu", str(themed))
+
+    item_after = inv.get_inventory_item(item_id)
+    if item_after and int(item_after["qty_available"]) == 0:
+        ok("Stan po rezerwacji", "qty_available=0")
+    else:
+        fail("Stan po rezerwacji", str(item_after))
+
+    if inv.set_line_purchased(int(balloons["id"]), True, role="manager"):
+        ok("Zakupiono")
+    else:
+        fail("Zakupiono")
+
+    # Wydanie ręczne + cofnięcie
+    if inv.set_line_issued(int(balloons["id"]), True, role="manager"):
+        ok("Wydano ręcznie")
+    else:
+        fail("Wydano ręcznie")
+    if inv.set_line_issued(int(balloons["id"]), False, role="manager"):
+        ok("Cofnięcie wydania")
+    else:
+        fail("Cofnięcie wydania")
+
+    # EAN: nowy kod → unknown; utworzenie; kolejny skan → doliczenie
+    ean_code = "5901234123457"
+    scan_unknown = inv.scan_ean_add(ean_code, qty=1, role="organizer")
+    if scan_unknown.get("status") == "unknown" and scan_unknown.get("ean") == ean_code:
+        ok("Skan nieznanego EAN", "status=unknown")
+    else:
+        fail("Skan nieznanego EAN", str(scan_unknown))
+    ean_item_id = inv.add_or_increase_item(
+        category="pinata",
+        name="Piniata EAN Test",
+        qty=2,
+        ean=ean_code,
+        role="organizer",
+    )
+    ean_item = inv.get_inventory_item(ean_item_id) if ean_item_id else None
+    if ean_item and str(ean_item.get("ean")) == ean_code and int(ean_item["qty_available"]) == 2:
+        ok("Utworzenie produktu z EAN", "qty=2")
+    else:
+        fail("Utworzenie produktu z EAN", str(ean_item))
+    scan_known = inv.scan_ean_add(ean_code, qty=1, role="organizer")
+    ean_after = inv.get_inventory_item(ean_item_id) if ean_item_id else None
+    if (
+        scan_known.get("status") == "increased"
+        and ean_after
+        and int(ean_after["qty_available"]) == 3
+    ):
+        ok("Skan znanego EAN dolicza stan", "qty=3")
+    else:
+        fail("Skan znanego EAN dolicza stan", f"scan={scan_known} item={ean_after}")
+
+    # Anulowanie bankietu zwraca stan
+    values["id"] = reservation_id
+    values["status"] = "cancelled"
+    values["cancellation_reason"] = "Test anulowania inwentury"
+    main.save_reservation(values, role="organizer")
+    item_restored = inv.get_inventory_item(item_id)
+    if item_restored and int(item_restored["qty_available"]) == 5:
+        ok("Zwrot stanu po anulowaniu", "qty_available=5")
+    else:
+        fail("Zwrot stanu po anulowaniu", str(item_restored))
+
+    # Auto-issue w dniu bankietu
+    today = main.current_app_date().isoformat()
+    busy = {
+        row["child_location"]
+        for row in main.get_reservations_for_day(main.current_app_date())
+        if row.get("status") == "active"
+    }
+    free_room = next((room for room in main.PARTY_ROOMS if room not in busy), "6. Football")
+    data2 = base_reservation(
+        today,
+        free_room,
+        "Pozostałe stoliki - Stolik 76",
+        "12:00",
+        "Inwentura Dziś",
+        "Rodzic Dziś",
+    )
+    data2["inventory_category"] = ["pinata"]
+    data2["inventory_item_id"] = [""]
+    data2["inventory_name"] = ["Piniata Test Dziś"]
+    data2["inventory_qty"] = ["1"]
+    data2["inventory_description"] = ["auto issue"]
+    values2, errors2 = main.validate_reservation(data2)
+    if errors2:
+        fail("Bankiet dziś z inwenturą", str(errors2))
+        return
+    rid2 = main.save_reservation(values2, role="organizer")
+    created_ids.append(rid2)
+    lines2 = inv.list_lines_for_reservation(rid2)
+    if lines2 and int(lines2[0].get("issued") or 0) == 1:
+        ok("Auto-wydanie w dniu bankietu")
+    else:
+        fail("Auto-wydanie w dniu bankietu", str(lines2))
+
+    try:
+        status, body, _ = http_get("/inwentura")
+        html = body.decode("utf-8", errors="replace")
+        if status == 200 and "Inwentura" in html and "Stan magazynu" in html:
+            ok("GET /inwentura", "sekcje widoczne")
+        else:
+            fail("GET /inwentura", f"status={status}")
+    except Exception as exc:
+        fail("GET /inwentura", str(exc))
+
+
 def print_summary() -> None:
     section("PODSUMOWANIE")
     total = PASS + FAIL
@@ -775,6 +941,7 @@ def main_test() -> int:
     test_multiple_birthday_children()
     test_delete_reservation()
     test_csv_export()
+    test_inventory_flow()
 
     return print_summary()
 
