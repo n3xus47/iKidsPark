@@ -14,7 +14,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py ikidspark_config.py ikidspark_export.py ikidspark_pwa.py ./
+COPY main.py ikidspark_config.py ikidspark_export.py ikidspark_pwa.py ikidspark_inventory.py ./
 COPY logo.png logox221.png pwalogo.png 14.svg ./
 COPY assets ./assets
 COPY supabase ./supabase
