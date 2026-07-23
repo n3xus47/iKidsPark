@@ -457,16 +457,17 @@ def update_inventory_line(
     return True
 
 
-def delete_manual_line(line_id: int, *, role: str = "") -> bool:
+def delete_inventory_line(line_id: int, *, role: str = "") -> bool:
+    """Anuluje pozycję zakupów/wydań (ręczną lub bankietową) i zwraca zarezerwowany stan."""
     line = get_line(line_id)
-    if line is None or line.get("reservation_id") is not None:
+    if line is None or int(line.get("cancelled") or 0):
         return False
-    if int(line.get("cancelled") or 0):
-        return False
+    qty_note = int(line.get("qty_to_order") or line.get("qty") or 0)
+    _release_line(line, role=role, cancel=True)
     _exec(
         """
         UPDATE inventory_lines
-        SET cancelled = 1, qty_to_order = 0, updated_at = ?
+        SET qty_to_order = 0, updated_at = ?
         WHERE id = ?
         """,
         (_ts(), line_id),
@@ -475,15 +476,57 @@ def delete_manual_line(line_id: int, *, role: str = "") -> bool:
         "manual_remove",
         item_id=int(line["item_id"]) if line.get("item_id") else None,
         line_id=line_id,
-        qty=int(line.get("qty_to_order") or line.get("qty") or 0),
+        qty=qty_note,
         role=role,
-        note="Usunięto ręczną pozycję inwentury",
+        note="Usunięto pozycję inwentury",
     )
     return True
 
 
+def delete_manual_line(line_id: int, *, role: str = "") -> bool:
+    """Kompatybilność: usuwa dowolną nieanulowaną linię (nie tylko ręczną)."""
+    return delete_inventory_line(line_id, role=role)
+
+
 def delete_manual_shopping_line(line_id: int, *, role: str = "") -> bool:
-    return delete_manual_line(line_id, role=role)
+    return delete_inventory_line(line_id, role=role)
+
+
+def delete_inventory_item(item_id: int, *, role: str = "") -> bool:
+    """Usuwa pozycję katalogu. Blokuje, gdy jest aktywna linia bankietowa."""
+    item = get_inventory_item(item_id)
+    if item is None:
+        return False
+    banquet_active = _one(
+        """
+        SELECT id
+        FROM inventory_lines
+        WHERE item_id = ? AND cancelled = 0 AND reservation_id IS NOT NULL
+        LIMIT 1
+        """,
+        (item_id,),
+    )
+    if banquet_active is not None:
+        return False
+    manual_lines = _rows(
+        """
+        SELECT *
+        FROM inventory_lines
+        WHERE item_id = ? AND cancelled = 0 AND reservation_id IS NULL
+        """,
+        (item_id,),
+    )
+    for line in manual_lines:
+        delete_inventory_line(int(line["id"]), role=role)
+    _exec("DELETE FROM inventory_items WHERE id = ?", (item_id,))
+    record_movement(
+        "manual_remove",
+        item_id=item_id,
+        qty=int(item.get("qty_available") or 0),
+        role=role,
+        note="Usunięto pozycję ze stanu magazynu",
+    )
+    return True
 
 
 def find_inventory_item(category: str, name: str) -> DbRow | None:

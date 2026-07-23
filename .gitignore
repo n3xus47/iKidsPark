@@ -17,3 +17,5 @@ Android/
 android-local/build/
 android-local/dist/
 android-local/keystore/
+google-service-account.json
+google-service-account.json.bak-invalid

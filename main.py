@@ -967,6 +967,14 @@ def normalize_phone_number(value: str) -> str | None:
     return f"{digits[0:3]} {digits[3:6]} {digits[6:9]}"
 
 
+def format_phone_display(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = normalize_phone_number(raw)
+    return normalized if normalized else raw
+
+
 def parse_phone_field(
     data: dict[str, object],
     errors: dict[str, str],
@@ -2638,10 +2646,13 @@ def link_for(role: str, day: str, **extra: object) -> str:
 
 
 def date_title(target_day: date) -> str:
-    return (
-        f"{WEEKDAY_FULL_LABELS[target_day.weekday()]}, "
-        f"{target_day.day:02d} {MONTH_FULL_LABELS[target_day.month - 1]}"
-    )
+    weekday = WEEKDAY_FULL_LABELS[target_day.weekday()].upper()
+    return f"{weekday} {target_day.strftime('%d.%m.%Y')}"
+
+
+def render_day_heading(day: str | date) -> str:
+    target_day = day if isinstance(day, date) else selected_day(normalize_day(day))
+    return f'<div class="day-heading">{escape(date_title(target_day))}</div>'
 
 
 _BOOT_READY = threading.Event()
@@ -3360,7 +3371,90 @@ def fast_navigation_script() -> str:
         };
       }
 
+      function dayParam(href) {
+        const url = toUrl(href);
+        return url?.searchParams.get("day") || "";
+      }
+
+      function syncDateDayLink(currentLink, nextLink) {
+        if (!currentLink || !nextLink) return;
+        currentLink.className = nextLink.className;
+        currentLink.setAttribute("href", nextLink.getAttribute("href") || currentLink.getAttribute("href") || "#");
+        ["aria-current", "data-selected-day", "data-today-day"].forEach((attr) => {
+          if (nextLink.hasAttribute(attr)) currentLink.setAttribute(attr, nextLink.getAttribute(attr) || "");
+          else currentLink.removeAttribute(attr);
+        });
+      }
+
+      function syncDateStrip(currentToolbar, nextToolbar) {
+        const currentStrip = currentToolbar.querySelector("[data-date-strip]");
+        const nextStrip = nextToolbar.querySelector("[data-date-strip]");
+        if (!currentStrip || !nextStrip) return false;
+
+        const currentDays = [...currentStrip.querySelectorAll("a.date-day")];
+        const nextDays = [...nextStrip.querySelectorAll("a.date-day")];
+        if (!currentDays.length || currentDays.length !== nextDays.length) return false;
+
+        const nextByDay = new Map();
+        for (const link of nextDays) {
+          const key = dayParam(link.href);
+          if (!key || nextByDay.has(key)) return false;
+          nextByDay.set(key, link);
+        }
+        for (const currentLink of currentDays) {
+          const match = nextByDay.get(dayParam(currentLink.href));
+          if (!match) return false;
+          syncDateDayLink(currentLink, match);
+        }
+
+        const currentWeeks = [...currentStrip.querySelectorAll(".date-week")];
+        const nextWeeks = [...nextStrip.querySelectorAll(".date-week")];
+        if (currentWeeks.length !== nextWeeks.length) return false;
+        currentWeeks.forEach((week, index) => {
+          const nextWeek = nextWeeks[index];
+          ["data-month-label", "data-year-label", "data-default-week", "data-active-week"].forEach((attr) => {
+            if (nextWeek.hasAttribute(attr)) week.setAttribute(attr, nextWeek.getAttribute(attr) || "");
+            else week.removeAttribute(attr);
+          });
+        });
+        return true;
+      }
+
+      function syncToolbarTabs(currentToolbar, nextToolbar) {
+        const currentTabs = currentToolbar.querySelector(".tabs");
+        const nextTabs = nextToolbar.querySelector(".tabs");
+        if (currentTabs && nextTabs) {
+          currentTabs.replaceWith(document.importNode(nextTabs, true));
+        } else if (currentTabs && !nextTabs) {
+          currentTabs.remove();
+        } else if (!currentTabs && nextTabs) {
+          currentToolbar.appendChild(document.importNode(nextTabs, true));
+        }
+      }
+
+      function tryPreserveToolbar(currentMain, nextMain, url) {
+        if (url.pathname !== window.location.pathname) return false;
+        const currentToolbar = currentMain.querySelector(":scope > .toolbar");
+        const nextToolbar = nextMain.querySelector(":scope > .toolbar");
+        if (!currentToolbar || !nextToolbar) return false;
+        if (!currentToolbar.querySelector("[data-date-strip]") || !nextToolbar.querySelector("[data-date-strip]")) {
+          return false;
+        }
+        if (!syncDateStrip(currentToolbar, nextToolbar)) return false;
+        syncToolbarTabs(currentToolbar, nextToolbar);
+
+        [...currentMain.children].forEach((child) => {
+          if (child !== currentToolbar) child.remove();
+        });
+        [...nextMain.children].forEach((child) => {
+          if (child.classList?.contains("toolbar")) return;
+          currentMain.appendChild(document.importNode(child, true));
+        });
+        return true;
+      }
+
       function applyPage(html, url, options = {}) {
+        window.IKIDSCloseStaffPickers?.();
         const nextDocument = new DOMParser().parseFromString(html, "text/html");
         const nextMain = nextDocument.querySelector("main");
         const currentMain = document.querySelector("main");
@@ -3371,11 +3465,16 @@ def fast_navigation_script() -> str:
 
         document.title = nextDocument.title || document.title;
         document.body.className = nextDocument.body.className;
-        currentMain.replaceWith(document.importNode(nextMain, true));
+
+        const preservedToolbar = tryPreserveToolbar(currentMain, nextMain, url);
+        if (!preservedToolbar) {
+          currentMain.replaceWith(document.importNode(nextMain, true));
+        }
+
         updateContext(url);
         executeInsertedScripts(document.querySelector("main"));
         window.requestAnimationFrame(() => {
-          window.IKIDSInitDateNavigation?.();
+          if (!preservedToolbar) window.IKIDSInitDateNavigation?.();
           window.IKIDSInitPlanTip?.();
         });
 
@@ -3534,7 +3633,8 @@ def page_template(
       --logo-park: #b4b4b4;
       --logo-park-soft: color-mix(in srgb, var(--logo-park) 22%, white);
       --orange: #f58212;
-      --lime: #7a9a12;
+      --lime: #aec61e;
+      --lime-soft: color-mix(in srgb, var(--lime) 22%, white);
       --accent: #f58212;
       --danger: #dc2626;
       --danger-soft: #fde8e8;
@@ -4178,15 +4278,21 @@ def page_template(
     }}
 
     .date-day.is-today .date-day-surface {{
-      background: var(--logo-park-soft);
+      background: var(--lime-soft);
+      border: 1px solid color-mix(in srgb, var(--lime) 72%, #7a9a12);
+      box-shadow: none;
     }}
 
     .date-day.is-today {{
-      color: var(--ink);
+      color: #5f7408;
     }}
 
     .date-day.is-today .date-day-name {{
-      color: var(--brand);
+      color: #6f8a0c;
+    }}
+
+    .date-day.is-today .date-day-number {{
+      color: #5f7408;
     }}
 
     .date-day.is-today.is-active .date-day-surface {{
@@ -4662,6 +4768,8 @@ def page_template(
       line-height: 1.1;
       cursor: pointer;
       -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
     }}
 
     .plan-block-title:hover,
@@ -4692,7 +4800,7 @@ def page_template(
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface);
-      overflow: hidden;
+      overflow: visible;
       width: 100%;
     }}
 
@@ -4728,6 +4836,108 @@ def page_template(
     .location-picker .plan-wrap {{
       margin-top: 0;
       padding: 0;
+    }}
+
+    .plan-frame {{
+      position: relative;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
+      margin: 0;
+      padding: 6px;
+      background: #ffffff;
+      border: 2px solid #000000;
+      overflow: visible;
+    }}
+
+    .plan-frame-corner {{
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: #000000;
+      pointer-events: none;
+      z-index: 3;
+    }}
+
+    .plan-frame-corner--tl {{
+      top: -2px;
+      left: -2px;
+    }}
+
+    .plan-frame-corner--tr {{
+      top: -2px;
+      right: -2px;
+    }}
+
+    .plan-frame-corner--bl {{
+      bottom: -2px;
+      left: -2px;
+    }}
+
+    .plan-frame-corner--br {{
+      bottom: -2px;
+      right: -2px;
+    }}
+
+    @media (max-width: 640px) {{
+      .plan-block {{
+        width: 100vw;
+        max-width: 100vw;
+        margin-left: calc(50% - 50vw);
+        margin-right: calc(50% - 50vw);
+        background: #ffffff;
+      }}
+
+      .plan-block .plan-frame {{
+        border-left: 0;
+        border-right: 0;
+        border-radius: 0;
+        padding: 8px 0;
+      }}
+
+      .plan-block .plan-frame-corner--tl,
+      .plan-block .plan-frame-corner--bl {{
+        left: 0;
+      }}
+
+      .plan-block .plan-frame-corner--tr,
+      .plan-block .plan-frame-corner--br {{
+        right: 0;
+      }}
+
+      .location-picker .plan-accordion,
+      .plan-accordion.full {{
+        width: 100vw;
+        max-width: 100vw;
+        margin-left: calc(50% - 50vw);
+        margin-right: calc(50% - 50vw);
+        border-left: 0;
+        border-right: 0;
+        border-radius: 0;
+      }}
+
+      .plan-accordion.is-open .location-accordion-body,
+      .plan-accordion.is-open .plan-wrap {{
+        padding-left: 0;
+        padding-right: 0;
+      }}
+
+      .location-picker .plan-frame {{
+        border-left: 0;
+        border-right: 0;
+        padding-left: 0;
+        padding-right: 0;
+      }}
+
+      .location-picker .plan-frame-corner--tl,
+      .location-picker .plan-frame-corner--bl {{
+        left: 0;
+      }}
+
+      .location-picker .plan-frame-corner--tr,
+      .location-picker .plan-frame-corner--br {{
+        right: 0;
+      }}
     }}
 
     .location-hint {{
@@ -4899,12 +5109,13 @@ def page_template(
 
     .day-heading {{
       text-align: center;
-      padding: 16px 18px 8px;
+      padding: 10px 18px 6px;
       color: var(--ink);
-      font-size: clamp(1.75rem, 5vw, 2.5rem);
+      font-size: clamp(0.95rem, 2.8vw, 1.2rem);
       font-weight: 800;
-      letter-spacing: 0.03em;
-      line-height: 1.1;
+      letter-spacing: 0.04em;
+      line-height: 1.15;
+      text-transform: uppercase;
     }}
 
     .stack > .day-heading + .timeline-card {{
@@ -5287,18 +5498,22 @@ def page_template(
 
     .animator-assign__sheet {{
       position: absolute;
-      top: calc(100% + 6px);
+      top: auto;
+      bottom: calc(100% + 6px);
       right: 0;
       left: auto;
       z-index: 14000;
       width: min(300px, 86vw);
       display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
       gap: 8px;
       padding: 10px;
       border: 1px solid var(--line);
       border-radius: 14px;
       background: #ffffff;
       box-shadow: 0 18px 42px rgba(0, 0, 0, 0.2);
+      box-sizing: border-box;
+      overflow: hidden;
     }}
 
     .animator-assign__sheet.is-ported {{
@@ -5306,9 +5521,22 @@ def page_template(
       margin: 0;
     }}
 
+    .animator-assign__sheet.is-ported.is-above-trigger {{
+      left: 8px;
+      right: 8px;
+      width: auto;
+      max-width: none;
+    }}
+
+    .animator-assign__search {{
+      display: block;
+      margin: 0;
+      order: 2;
+    }}
+
     .animator-assign__search input {{
       width: 100%;
-      min-height: 40px;
+      min-height: 44px;
       margin: 0;
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -5316,6 +5544,7 @@ def page_template(
       padding: 0 12px;
       font: inherit;
       font-size: 0.9rem;
+      box-sizing: border-box;
     }}
 
     .animator-assign__search input:focus {{
@@ -5327,9 +5556,16 @@ def page_template(
     .animator-assign__list {{
       display: grid;
       gap: 4px;
+      min-height: 0;
       max-height: 240px;
       overflow-y: auto;
       padding-right: 2px;
+      order: 1;
+      -webkit-overflow-scrolling: touch;
+    }}
+
+    .animator-assign__sheet.is-ported .animator-assign__list {{
+      max-height: none;
     }}
 
     .animator-assign__option-form {{
@@ -5491,6 +5727,9 @@ def page_template(
       padding: 2px 8px;
       font-size: 0.84rem;
       font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
     }}
 
     .profile-guardian-svg {{
@@ -6189,6 +6428,11 @@ def page_template(
       gap: 8px;
     }}
 
+    .inventory-filter-chips--status {{
+      padding-top: 4px;
+      border-top: 1px dashed var(--line);
+    }}
+
     .inventory-filter-chips button {{
       border: 1px solid var(--line);
       background: var(--surface-strong);
@@ -6221,12 +6465,13 @@ def page_template(
     .inventory-edit > summary {{
       cursor: pointer;
       font-weight: 800;
-      font-size: 0.86rem;
+      font-size: 0.9rem;
       color: var(--brand);
       list-style: none;
-      min-height: 36px;
+      min-height: 44px;
       display: inline-flex;
       align-items: center;
+      padding: 0 2px;
     }}
 
     .inventory-edit > summary::-webkit-details-marker {{
@@ -6262,6 +6507,10 @@ def page_template(
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+    }}
+
+    .inventory-edit-form .inventory-edit-actions .button.danger {{
+      margin-left: auto;
     }}
 
     .inventory-add-block {{
@@ -6959,23 +7208,32 @@ def page_template(
       place-items: center;
       text-align: center;
       padding: 16px 18px;
-      border: 1px solid var(--line);
+      border: 2px solid #9a9a9a;
       border-radius: 16px;
       background: #ffffff;
       box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+      -webkit-tap-highlight-color: transparent;
     }}
 
     a.metric {{
       color: inherit;
       text-decoration: none;
       cursor: pointer;
-      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
     }}
 
-    a.metric:hover {{
+    @media (hover: hover) {{
+      .metric:hover {{
+        border-color: #000000;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+        transform: translateY(-1px);
+      }}
+    }}
+
+    .metric:active {{
       border-color: #000000;
-      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
-      transform: translateY(-1px);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
+      transform: translateY(0);
     }}
 
     a.metric:focus-visible {{
@@ -7393,11 +7651,11 @@ def page_template(
 
     .kitchen-cake-layout {{
       display: grid;
-      grid-template-columns: minmax(0, 1fr) max-content;
+      grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.15fr);
       gap: 12px 14px;
       margin: 0;
       padding: 12px;
-      align-items: start;
+      align-items: stretch;
       background: #ffffff;
     }}
 
@@ -7444,11 +7702,12 @@ def page_template(
         min-width: 0;
       }}
 
+      .kitchen-cake-photo-col {{
+        min-height: min(62vw, 340px);
+      }}
+
       .kitchen-cake-photo {{
-        display: block;
-        width: 100%;
-        max-width: 100%;
-        height: auto;
+        max-height: min(78vh, 520px);
       }}
     }}
 
@@ -7491,30 +7750,38 @@ def page_template(
 
     .kitchen-cake-photo-col {{
       margin: 0;
-      padding: 0;
-      border: 0;
-      background: transparent;
-      overflow: visible;
-      line-height: 0;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #f5f5f5;
+      overflow: hidden;
+      min-width: 0;
+      min-height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
     }}
 
     .kitchen-cake-photo {{
       display: block;
       width: auto;
       height: auto;
-      max-width: none;
-      max-height: none;
-      object-fit: unset;
+      max-width: 100%;
+      max-height: min(70vh, 560px);
+      object-fit: contain;
+      object-position: center;
       border: 0;
       background: transparent;
+      margin: 0 auto;
     }}
 
     .kitchen-cake-photo-empty {{
       color: var(--muted);
       font-size: 0.84rem;
       font-weight: 800;
-      text-align: left;
-      padding: 0;
+      text-align: center;
+      padding: 18px 12px;
       line-height: 1.3;
     }}
 
@@ -7735,9 +8002,10 @@ def page_template(
       width: 100%;
       height: auto;
       aspect-ratio: 1378 / 554;
-      border: 1px solid var(--line);
+      border: 0;
       background: #ffffff;
       display: block;
+      vertical-align: top;
     }}
 
     .plan-canvas {{
@@ -8090,6 +8358,14 @@ def page_template(
       .inventory-jump {{
         display: flex;
         border-radius: 0 0 16px 16px;
+      }}
+
+      .inventory-filters {{
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        border-bottom: 1px solid var(--line);
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.04);
       }}
 
       .inventory-board--intro > .section-head {{
@@ -9615,7 +9891,7 @@ def render_role_extra_info(row: DbRow, notes: object = "") -> str:
     room = escape(display_location(row["child_location"]))
     adult = escape(display_locations(row["adult_location"]))
     parent = escape(str(row["parent_name"]))
-    phone = escape(str(row.get("parent_phone") or ""))
+    phone = escape(format_phone_display(row.get("parent_phone") or ""))
     start = escape(format_time(row["start_at"]))
     children_count = escape(row["children_count"])
     adults_count = escape(row["adults_count"])
@@ -9803,13 +10079,13 @@ def render_waiter_assignment(row: DbRow, role: str, day: str) -> str:
             </svg>
           </summary>
           <div class="animator-assign__sheet">
-            <label class="animator-assign__search">
-              <span class="visually-hidden">Szukaj kelnera</span>
-              <input type="search" placeholder="Szukaj po imieniu…" autocomplete="off" data-staff-filter>
-            </label>
             <div class="animator-assign__list" data-staff-list>
               {options or empty_options}
             </div>
+            <label class="animator-assign__search">
+              <span class="visually-hidden">Szukaj kelnera</span>
+              <input type="search" placeholder="Szukaj po imieniu…" autocomplete="off" inputmode="search" enterkeyhint="search" data-staff-filter>
+            </label>
           </div>
         </details>
         """
@@ -9886,13 +10162,13 @@ def render_animator_assignment(row: DbRow, role: str, day: str, slot: str = "ani
             </svg>
           </summary>
           <div class="animator-assign__sheet">
-            <label class="animator-assign__search">
-              <span class="visually-hidden">Szukaj animatora</span>
-              <input type="search" placeholder="Szukaj po imieniu…" autocomplete="off" data-staff-filter>
-            </label>
             <div class="animator-assign__list" data-staff-list>
               {options or empty_options}
             </div>
+            <label class="animator-assign__search">
+              <span class="visually-hidden">Szukaj animatora</span>
+              <input type="search" placeholder="Szukaj po imieniu…" autocomplete="off" inputmode="search" enterkeyhint="search" data-staff-filter>
+            </label>
           </div>
         </details>
         """
@@ -9947,32 +10223,56 @@ def staff_assignment_script() -> str:
       document.body.appendChild(sheet);
     }
     sheet.classList.add("is-ported");
+    sheet.classList.add("is-above-trigger");
+    sheet.classList.remove("is-from-top");
+
+    const viewport = window.visualViewport;
+    const viewHeight = viewport ? viewport.height : window.innerHeight;
+    const viewWidth = viewport ? viewport.width : window.innerWidth;
+    const layoutHeight = window.innerHeight;
     const rect = trigger.getBoundingClientRect();
-    const width = Math.min(300, window.innerWidth - 16);
-    const maxHeight = Math.min(340, window.innerHeight - 16);
-    let left = rect.right - width;
-    if (left < 8) left = 8;
-    if (left + width > window.innerWidth - 8) {
-      left = Math.max(8, window.innerWidth - width - 8);
+    const gap = 6;
+    const coarse = window.matchMedia?.("(pointer: coarse)")?.matches === true
+      || window.matchMedia?.("(max-width: 640px)")?.matches === true;
+
+    const spaceAbove = Math.max(140, rect.top - 8);
+    const maxHeight = Math.min(
+      coarse ? Math.floor(viewHeight * 0.62) : 340,
+      spaceAbove - gap,
+    );
+
+    // Anchor sheet ABOVE the add button (fixed bottom = distance from viewport bottom).
+    const bottom = Math.max(8, layoutHeight - rect.top + gap);
+    if (coarse) {
+      sheet.style.left = "8px";
+      sheet.style.right = "8px";
+      sheet.style.width = "auto";
+    } else {
+      const width = Math.min(300, viewWidth - 16);
+      let left = rect.right - width;
+      if (left < 8) left = 8;
+      if (left + width > viewWidth - 8) {
+        left = Math.max(8, viewWidth - width - 8);
+      }
+      sheet.style.left = left + "px";
+      sheet.style.right = "auto";
+      sheet.style.width = width + "px";
     }
-    let top = rect.bottom + 6;
-    if (top + Math.min(maxHeight, 220) > window.innerHeight - 8) {
-      top = Math.max(8, rect.top - Math.min(maxHeight, 280) - 6);
-    }
-    sheet.style.top = top + "px";
-    sheet.style.left = left + "px";
-    sheet.style.right = "auto";
-    sheet.style.width = width + "px";
-    sheet.style.maxHeight = maxHeight + "px";
+    sheet.style.top = "auto";
+    sheet.style.bottom = bottom + "px";
+    sheet.style.maxHeight = Math.max(140, maxHeight) + "px";
   }
 
   function restoreSheet(picker) {
     const sheet = picker._portedSheet || picker.querySelector(".animator-assign__sheet");
     if (!sheet) return;
     sheet.classList.remove("is-ported");
+    sheet.classList.remove("is-above-trigger");
+    sheet.classList.remove("is-from-top");
     sheet.style.top = "";
     sheet.style.left = "";
     sheet.style.right = "";
+    sheet.style.bottom = "";
     sheet.style.width = "";
     sheet.style.maxHeight = "";
     if (sheet.parentElement !== picker) {
@@ -10065,7 +10365,10 @@ def staff_assignment_script() -> str:
         }
       });
     }
-    window.requestAnimationFrame(() => filter()?.focus());
+    window.requestAnimationFrame(() => {
+      const finePointer = window.matchMedia?.("(pointer: fine)")?.matches === true;
+      if (finePointer) filter()?.focus();
+    });
   }, true);
 
   function repositionOpenSheets() {
@@ -10076,14 +10379,32 @@ def staff_assignment_script() -> str:
 
   window.addEventListener("resize", repositionOpenSheets);
   window.addEventListener("scroll", repositionOpenSheets, true);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", repositionOpenSheets);
+    window.visualViewport.addEventListener("scroll", repositionOpenSheets);
+  }
+
+  function closeAllStaffPickers() {
+    document.querySelectorAll("[data-staff-picker][open]").forEach((node) => {
+      node.open = false;
+    });
+    document.querySelectorAll(".animator-assign__sheet.is-ported").forEach((sheet) => {
+      const picker = sheet._ownerPicker;
+      if (picker instanceof HTMLDetailsElement && picker.isConnected) {
+        restoreSheet(picker);
+        return;
+      }
+      sheet.remove();
+    });
+  }
+
+  window.IKIDSCloseStaffPickers = closeAllStaffPickers;
 
   document.addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (target.closest("[data-staff-assign]") || target.closest(".animator-assign__sheet")) return;
-    document.querySelectorAll("[data-staff-picker][open]").forEach((node) => {
-      node.open = false;
-    });
+    closeAllStaffPickers();
   });
 
   document.addEventListener("submit", async (event) => {
@@ -10171,7 +10492,7 @@ def render_profile_identity(row: DbRow | dict[str, object]) -> str:
 def render_profile_guardian(row: DbRow | dict[str, object]) -> str:
     parent_raw = row["parent_name"] if not isinstance(row, dict) else row.get("parent_name", "")
     parent = escape(str(parent_raw))
-    phone = escape(str(row.get("parent_phone") or ""))
+    phone = escape(format_phone_display(row.get("parent_phone") or ""))
     if not parent:
         return ""
     phone_markup = f'<span class="profile-phone">{phone}</span>' if phone else ""
@@ -10574,13 +10895,19 @@ def render_room_plan(values: dict[str, object], errors: dict[str, str], *, compa
         )
 
     svg_markup = f"""
-        <svg class="room-plan" viewBox="{view_x:.1f} {view_y:.1f} {view_w:.1f} {view_h:.1f}" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
-          <rect class="plan-canvas" x="{view_x:.1f}" y="{view_y:.1f}" width="{view_w:.1f}" height="{view_h:.1f}"></rect>
-          <image class="plan-base" href="{escape(plan_url)}" x="0" y="0" width="1440" height="810" preserveAspectRatio="xMidYMid meet"></image>
-          <g class="plan-objects" aria-label="Stoliki i salki">
-            {''.join(nodes)}
-          </g>
-        </svg>
+        <div class="plan-frame">
+          <span class="plan-frame-corner plan-frame-corner--tl" aria-hidden="true"></span>
+          <span class="plan-frame-corner plan-frame-corner--tr" aria-hidden="true"></span>
+          <span class="plan-frame-corner plan-frame-corner--bl" aria-hidden="true"></span>
+          <span class="plan-frame-corner plan-frame-corner--br" aria-hidden="true"></span>
+          <svg class="room-plan" viewBox="{view_x:.1f} {view_y:.1f} {view_w:.1f} {view_h:.1f}" preserveAspectRatio="xMidYMid meet" aria-label="Plan sali iKids Park">
+            <rect class="plan-canvas" x="{view_x:.1f}" y="{view_y:.1f}" width="{view_w:.1f}" height="{view_h:.1f}"></rect>
+            <image class="plan-base" href="{escape(plan_url)}" x="0" y="0" width="1440" height="810" preserveAspectRatio="xMidYMid meet"></image>
+            <g class="plan-objects" aria-label="Stoliki i salki">
+              {''.join(nodes)}
+            </g>
+          </svg>
+        </div>
 """
 
     if compact:
@@ -10823,7 +11150,7 @@ def render_form(
           </label>
           <label>
             Telefon
-            <input name="parent_phone" id="parent_phone" autocomplete="tel" inputmode="tel" value="{escape(values.get("parent_phone", ""))}" placeholder="np. 500 000 000" required maxlength="20" data-phone-input title="9 cyfr, np. 500 000 000 lub +48 500 000 000">
+            <input name="parent_phone" id="parent_phone" autocomplete="tel" inputmode="tel" value="{escape(format_phone_display(values.get("parent_phone", "")))}" placeholder="500 000 000" required maxlength="16" data-phone-input title="9 cyfr w formacie 500 000 000">
             {error_for(errors, "parent_phone")}
           </label>
           <label>
@@ -10967,11 +11294,12 @@ def render_metrics(rows: list[DbRow], day: str) -> str:
     pinatas = sum(1 for row in active if is_enabled(row, "pinata_enabled"))
     guests = sum(int(row["children_count"]) + int(row["adults_count"]) for row in active)
     current_day_query = day_query(selected_day(day))
+    organizer_link = link_for("organizer", current_day_query)
     animators_link = link_for("animators", current_day_query)
     kitchen_link = link_for("kitchen", current_day_query)
     return f"""
 <div class="metrics">
-  {render_metric(len(active), "bankiety", "bankiety")}
+  {render_metric(len(active), "bankiety", "bankiety", organizer_link)}
   {render_metric(guests, "liczba gości", "guests")}
   {render_metric(animation_count, "animacje", "animacje", animators_link)}
   {render_metric(pinatas, "piniaty", "piniaty", animators_link)}
@@ -10982,9 +11310,6 @@ def render_metrics(rows: list[DbRow], day: str) -> str:
 
 
 def render_manager_view(rows: list[DbRow], role: str, day: str) -> str:
-    target_day = selected_day(day)
-    weekday = WEEKDAY_LABELS[target_day.weekday()]
-    day_label = f"{weekday} · {target_day.strftime('%d.%m')}"
     colors = reservation_color_map(rows)
     if not rows:
         body = '<div class="empty">Brak rezerwacji w wybranym dniu.</div>'
@@ -11004,7 +11329,7 @@ def render_manager_view(rows: list[DbRow], role: str, day: str) -> str:
         body = "".join(cards)
 
     return f"""
-  <div class="day-heading">{escape(day_label)}</div>
+  {render_day_heading(day)}
   {body}
 {staff_assignment_script()}
 """
@@ -11043,7 +11368,10 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
 
     banquets.sort(key=lambda item: (item[0], item[1]["child_location"]))
     if not banquets:
-        return '<section><div class="empty">Brak animacji</div></section>'
+        return f"""
+{render_day_heading(day)}
+<section><div class="empty">Brak animacji</div></section>
+"""
 
     banquet_cards = []
     for _, row, task_items, notes in banquets:
@@ -11075,6 +11403,7 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
 
     task_count = sum(len(task_items) for _, _, task_items, _ in banquets)
     return f"""
+{render_day_heading(day)}
 <section class="role-board animator-board">
   <div class="section-head">
     <div>
@@ -11091,7 +11420,7 @@ def render_animator_view(rows: list[DbRow], role: str, day: str) -> str:
 """
 
 
-def render_kitchen_view(rows: list[DbRow]) -> str:
+def render_kitchen_view(rows: list[DbRow], day: str = "today") -> str:
     active = [row for row in rows if row["status"] == "active"]
     banquet_entries: list[tuple[str, str]] = []
 
@@ -11180,12 +11509,16 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
         )
 
     if not banquet_entries:
-        return '<section><div class="empty">Brak zamówień kuchennych</div></section>'
+        return f"""
+{render_day_heading(day)}
+<section><div class="empty">Brak zamówień kuchennych</div></section>
+"""
 
     banquet_entries.sort(key=lambda item: item[0])
     banquet_cards = [markup for _, markup in banquet_entries]
 
     return f"""
+{render_day_heading(day)}
 <section class="role-board kitchen-board-section">
   <div class="section-head">
     <div>
@@ -11202,9 +11535,6 @@ def render_kitchen_view(rows: list[DbRow]) -> str:
 
 
 def render_organizer_view(rows: list[DbRow], role: str, day: str) -> str:
-    target_day = selected_day(day)
-    weekday = WEEKDAY_LABELS[target_day.weekday()]
-    day_label = f"{weekday} · {target_day.strftime('%d.%m')}"
     colors = reservation_color_map(rows)
     if not rows:
         body = '<div class="empty">Brak rezerwacji w wybranym dniu.</div>'
@@ -11233,11 +11563,12 @@ def render_organizer_view(rows: list[DbRow], role: str, day: str) -> str:
         body = "".join(cards)
 
     return f"""
+{render_day_heading(day)}
 <section class="role-board organizer-board">
   <div class="section-head">
     <div>
       <h2>Rezerwacje dnia</h2>
-      <p class="subtitle">{escape(day_label)} · zarządzanie rezerwacjami, statusami i dodatkami.</p>
+      <p class="subtitle">Zarządzanie rezerwacjami, statusami i dodatkami.</p>
     </div>
     <span class="count">{len(rows)} pozycji</span>
   </div>
@@ -11252,7 +11583,7 @@ def render_role_view(role: str, rows: list[DbRow], day: str) -> str:
     if role == "animators":
         return render_animator_view(rows, role, day)
     if role == "kitchen":
-        return render_kitchen_view(rows)
+        return render_kitchen_view(rows, day)
     if role == "organizer":
         return render_organizer_view(rows, role, day)
     return render_manager_view(rows, role, day)
@@ -15706,12 +16037,21 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
         category_chips.append(
             f'<button type="button" data-inventory-category="{escape(key)}">{escape(label)}</button>'
         )
+    status_chips = """
+  <div class="inventory-filter-chips inventory-filter-chips--status" role="group" aria-label="Status pozycji">
+    <button type="button" class="is-active" data-inventory-status="">Wszystkie</button>
+    <button type="button" data-inventory-status="todo">Do zrobienia</button>
+    <button type="button" data-inventory-status="done">Gotowe</button>
+    <button type="button" data-inventory-status="stock">Tylko stan</button>
+  </div>
+"""
     filters_markup = f"""
 <div class="inventory-filters" data-inventory-filters>
   <input type="search" class="inventory-filters__search" placeholder="Szukaj po nazwie, opisie, EAN…" autocomplete="off" data-inventory-search aria-label="Szukaj w inwenturze">
   <div class="inventory-filter-chips" role="group" aria-label="Kategorie inwentury">
     {"".join(category_chips)}
   </div>
+  {status_chips}
 </div>
 """
 
@@ -15726,10 +16066,10 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
         qty = int(item.get("qty_available") or 0)
         desc_html = f'<p class="inventory-card__meta">{escape(description)}</p>' if description else ""
         ean_html = f'<p class="inventory-card__ean">EAN {escape(ean)}</p>' if ean else ""
-        search_blob = " ".join(part for part in [category, name, description, ean] if part).lower()
+        search_blob = " ".join(part for part in [category, name, description, ean, "stan"] if part).lower()
         item_cards.append(
             f"""
-<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-search="{escape(search_blob)}">
+<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-status="stock" data-search="{escape(search_blob)}">
   <div class="inventory-card__head">
     <span class="inventory-card__kicker">{escape(category)}</span>
     <span class="inventory-card__qty" title="Wolne sztuki">{escape(qty)}</span>
@@ -15738,7 +16078,7 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
   {desc_html}
   {ean_html}
   <details class="inventory-edit">
-    <summary>Edytuj pozycję</summary>
+    <summary>Edytuj / usuń</summary>
     <form class="inventory-edit-form" method="post" action="/inventory/item/update?day={escape(day_q)}">
       <input type="hidden" name="item_id" value="{item_id}">
       <label>
@@ -15763,6 +16103,7 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
       </label>
       <div class="inventory-edit-actions">
         <button type="submit">Zapisz zmiany</button>
+        <button type="submit" class="button danger" formaction="/inventory/item/delete?day={escape(day_q)}" formmethod="post" onclick="return confirm('Usunąć tę pozycję ze stanu magazynu?');">Usuń</button>
       </div>
     </form>
   </details>
@@ -15801,18 +16142,24 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
             banquet_link = (
                 f'<a class="button secondary" href="{escape(link_for("organizer", day, edit=int(reservation_id)))}">Bankiet</a>'
             )
-        remove_form = ""
-        if is_manual:
-            remove_form = f"""
-    <form method="post" action="/inventory/shopping/delete?day={escape(day_q)}">
+        remove_confirm = (
+            "Usunąć tę pozycję z listy zakupów?"
+            if is_manual
+            else "Usunąć pozycję bankietową z listy zakupów? Stan zarezerwowany wróci do magazynu."
+        )
+        remove_form = f"""
+    <form method="post" action="/inventory/shopping/delete?day={escape(day_q)}" onsubmit="return confirm('{remove_confirm}');">
       <input type="hidden" name="line_id" value="{line_id}">
       <button type="submit" class="button secondary">Usuń</button>
     </form>
 """
-        search_blob = " ".join(part for part in [category, name, description, kicker, "zakupy"] if part).lower()
+        status_key = "done" if purchased else "todo"
+        search_blob = " ".join(
+            part for part in [category, name, description, kicker, "zakupy", status_label] if part
+        ).lower()
         shop_cards.append(
             f"""
-<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-search="{escape(search_blob)}">
+<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-status="{status_key}" data-search="{escape(search_blob)}">
   <div class="inventory-card__head">
     <span class="inventory-card__kicker">{escape(kicker)}</span>
     <span class="inventory-status {status_class}">{status_label}</span>
@@ -15891,18 +16238,24 @@ def render_inventory_page(day: str = "today", message: str = "") -> bytes:
             banquet_link = (
                 f'<a class="button secondary" href="{escape(link_for("organizer", day, edit=int(reservation_id)))}">Bankiet</a>'
             )
-        remove_form = ""
-        if is_manual:
-            remove_form = f"""
-    <form method="post" action="/inventory/shopping/delete?day={escape(day_q)}">
+        remove_confirm = (
+            "Usunąć tę pozycję z wydań?"
+            if is_manual
+            else "Usunąć pozycję bankietową z wydań? Stan zarezerwowany wróci do magazynu."
+        )
+        remove_form = f"""
+    <form method="post" action="/inventory/shopping/delete?day={escape(day_q)}" onsubmit="return confirm('{remove_confirm}');">
       <input type="hidden" name="line_id" value="{line_id}">
       <button type="submit" class="button secondary">Usuń</button>
     </form>
 """
-        search_blob = " ".join(part for part in [category, name, description, kicker, "wydania"] if part).lower()
+        status_key = "done" if issued else "todo"
+        search_blob = " ".join(
+            part for part in [category, name, description, kicker, "wydania", status_label] if part
+        ).lower()
         issue_cards.append(
             f"""
-<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-search="{escape(search_blob)}">
+<article class="inventory-card" data-inventory-card data-category="{escape(category_key)}" data-status="{status_key}" data-search="{escape(search_blob)}">
   <div class="inventory-card__head">
     <span class="inventory-card__kicker">{escape(kicker)}</span>
     <span class="inventory-status {status_class}">{status_label}</span>
@@ -16401,18 +16754,29 @@ def inventory_filters_script() -> str:
   const root = document.querySelector("[data-inventory-filters]");
   if (!root) return;
   const searchInput = root.querySelector("[data-inventory-search]");
-  const chips = Array.from(root.querySelectorAll("[data-inventory-category]"));
+  const categoryChips = Array.from(root.querySelectorAll("[data-inventory-category]"));
+  const statusChips = Array.from(root.querySelectorAll("[data-inventory-status]"));
   const cards = Array.from(document.querySelectorAll("[data-inventory-card]"));
   let activeCategory = "";
+  let activeStatus = "";
+
+  function statusOk(cardStatus) {
+    if (!activeStatus) return true;
+    if (activeStatus === "stock") return cardStatus === "stock";
+    if (activeStatus === "todo") return cardStatus === "todo";
+    if (activeStatus === "done") return cardStatus === "done";
+    return true;
+  }
 
   function applyFilters() {
     const query = String(searchInput?.value || "").trim().toLowerCase();
     cards.forEach((card) => {
       const category = card.getAttribute("data-category") || "";
+      const cardStatus = card.getAttribute("data-status") || "";
       const haystack = card.getAttribute("data-search") || "";
       const categoryOk = !activeCategory || category === activeCategory;
       const searchOk = !query || haystack.includes(query);
-      card.hidden = !(categoryOk && searchOk);
+      card.hidden = !(categoryOk && searchOk && statusOk(cardStatus));
     });
     document.querySelectorAll("[data-inventory-list]").forEach((list) => {
       const visible = list.querySelectorAll("[data-inventory-card]:not([hidden])").length;
@@ -16432,10 +16796,17 @@ def inventory_filters_script() -> str:
     });
   }
 
-  chips.forEach((chip) => {
+  categoryChips.forEach((chip) => {
     chip.addEventListener("click", () => {
       activeCategory = chip.getAttribute("data-inventory-category") || "";
-      chips.forEach((other) => other.classList.toggle("is-active", other === chip));
+      categoryChips.forEach((other) => other.classList.toggle("is-active", other === chip));
+      applyFilters();
+    });
+  });
+  statusChips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      activeStatus = chip.getAttribute("data-inventory-status") || "";
+      statusChips.forEach((other) => other.classList.toggle("is-active", other === chip));
       applyFilters();
     });
   });
@@ -16892,13 +17263,23 @@ def room_plan_script() -> str:
     if (normalized !== input.value) input.value = normalized;
   }
 
-  function normalizePhoneText(value) {
+  function formatPhoneGroups(value) {
     let digits = String(value || "").replace(/\\D/g, "");
     if (digits.startsWith("0048")) digits = digits.slice(4);
-    else if (digits.startsWith("48") && digits.length >= 11) digits = digits.slice(2);
-    if (digits.startsWith("0") && digits.length === 10) digits = digits.slice(1);
+    else if (digits.startsWith("48") && digits.length > 9) digits = digits.slice(2);
+    if (digits.startsWith("0") && digits.length > 9) digits = digits.slice(1);
+    digits = digits.slice(0, 9);
+    const parts = [];
+    if (digits.length > 0) parts.push(digits.slice(0, 3));
+    if (digits.length > 3) parts.push(digits.slice(3, 6));
+    if (digits.length > 6) parts.push(digits.slice(6, 9));
+    return { digits, formatted: parts.join(" ") };
+  }
+
+  function normalizePhoneText(value) {
+    const { digits, formatted } = formatPhoneGroups(value);
     if (!/^\\d{9}$/.test(digits) || digits[0] === "0") return null;
-    return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6, 9)}`;
+    return formatted;
   }
 
   function normalizePhoneInput(input) {
@@ -16916,6 +17297,48 @@ def room_plan_script() -> str:
     input.value = normalized;
     input.setCustomValidity("");
     return true;
+  }
+
+  function applyPhoneMask(input) {
+    if (!input) return;
+    const selectionStart = input.selectionStart ?? input.value.length;
+    const digitsBeforeCaret = input.value.slice(0, selectionStart).replace(/\\D/g, "").length;
+    const { formatted } = formatPhoneGroups(input.value);
+    if (formatted === input.value) {
+      input.setCustomValidity("");
+      return;
+    }
+    input.value = formatted;
+    let nextCaret = formatted.length;
+    let seenDigits = 0;
+    for (let index = 0; index < formatted.length; index += 1) {
+      if (/\\d/.test(formatted[index])) {
+        seenDigits += 1;
+        if (seenDigits >= digitsBeforeCaret) {
+          nextCaret = index + 1;
+          break;
+        }
+      }
+    }
+    if (digitsBeforeCaret === 0) nextCaret = 0;
+    try {
+      input.setSelectionRange(nextCaret, nextCaret);
+    } catch (_) {
+      /* ignore */
+    }
+    input.setCustomValidity("");
+  }
+
+  function bindPhoneInput() {
+    const phoneInput = document.getElementById("parent_phone") || form.querySelector("[data-phone-input]");
+    if (!phoneInput || phoneInput.dataset.phoneBound === "1") return;
+    phoneInput.dataset.phoneBound = "1";
+    applyPhoneMask(phoneInput);
+    phoneInput.addEventListener("input", () => applyPhoneMask(phoneInput));
+    phoneInput.addEventListener("blur", () => {
+      normalizePhoneInput(phoneInput);
+      phoneInput.reportValidity();
+    });
   }
 
   function normalizePersonNameInput(input) {
@@ -16936,18 +17359,6 @@ def room_plan_script() -> str:
     }
     input.setCustomValidity("");
     return true;
-  }
-
-  function bindPhoneInput() {
-    const phoneInput = document.getElementById("parent_phone") || form.querySelector("[data-phone-input]");
-    if (!phoneInput) return;
-    phoneInput.addEventListener("blur", () => {
-      normalizePhoneInput(phoneInput);
-      phoneInput.reportValidity();
-    });
-    phoneInput.addEventListener("input", () => {
-      phoneInput.setCustomValidity("");
-    });
   }
 
   function bindPersonNameInputs() {
@@ -18379,6 +18790,27 @@ class ReservationHandler(BaseHTTPRequestHandler):
             self.redirect("/inwentura?" + urlencode({"day": day_query(selected_day(day)), "message": message}))
             return
 
+        if parsed.path == "/inventory/item/delete":
+            if not can_manage_inventory(work_role):
+                self.redirect(
+                    "/inwentura?"
+                    + urlencode({"day": day_query(selected_day(day)), "message": "Brak uprawnień do inwentury."})
+                )
+                return
+            raw_id = str(data.get("item_id", "") or "")
+            ok = raw_id.isdigit() and inventory.delete_inventory_item(int(raw_id), role=work_role)
+            message = (
+                "Usunięto pozycję ze stanu magazynu."
+                if ok
+                else "Nie można usunąć — pozycja jest na aktywnym bankiecie albo nie istnieje."
+            )
+            self.redirect(
+                "/inwentura?"
+                + urlencode({"day": day_query(selected_day(day)), "message": message})
+                + "#inventory-stock"
+            )
+            return
+
         if parsed.path == "/inventory/shopping/add":
             if not can_manage_inventory(work_role):
                 self.redirect(
@@ -18442,7 +18874,7 @@ class ReservationHandler(BaseHTTPRequestHandler):
             existing = inventory.get_line(int(raw_id)) if raw_id.isdigit() else None
             was_shopping = bool(existing and int(existing.get("qty_to_order") or 0) > 0)
             ok = raw_id.isdigit() and inventory.delete_manual_line(int(raw_id), role=work_role)
-            message = "Usunięto ręczną pozycję." if ok else "Nie udało się usunąć pozycji."
+            message = "Usunięto pozycję." if ok else "Nie udało się usunąć pozycji."
             anchor = "#inventory-shopping" if was_shopping else "#inventory-issues"
             self.redirect(
                 "/inwentura?"
